@@ -195,6 +195,84 @@ export function buildBridgeRuntime(): string {
   // unsafeWindow = window (pas de sandboxing dans le WebView)
   window.unsafeWindow = window;
 
+  // --- Bridge des téléchargements custom (Android only) ----------------
+  // Expose window.MovixBridge avec :
+  //   isApp: true            — sentinelle de détection app
+  //   platform: 'android'    — info plateforme
+  //   download: {            — API des téléchargements in-app
+  //     start, pause, resume, cancel, delete, list, get,
+  //     subscribe(cb) → unsubscribe
+  //   }
+  //
+  // Toutes les méthodes retournent une Promise. Le bridge utilise un canal
+  // séparé (MOVIX_DOWNLOAD_* / __MOVIX_DOWNLOAD_RESPONSE) du canal GM_*.
+
+  var _downloadPending = {};
+  var _downloadCounter = 0;
+  function _downloadGenerateId() {
+    return 'dl_' + (++_downloadCounter) + '_' + Date.now();
+  }
+
+  window.addEventListener('__MOVIX_DOWNLOAD_RESPONSE', function(event) {
+    var detail = event.detail;
+    if (!detail || !detail.id) return;
+    var handler = _downloadPending[detail.id];
+    if (handler) {
+      delete _downloadPending[detail.id];
+      if (detail.ok) handler.resolve(detail.payload);
+      else handler.reject(new Error(detail.error || 'Download bridge error'));
+    }
+  });
+
+  function _downloadRequest(type, payload) {
+    return new Promise(function(resolve, reject) {
+      var id = _downloadGenerateId();
+      _downloadPending[id] = { resolve: resolve, reject: reject };
+      sendToNative({ type: type, id: id, payload: payload || null });
+      setTimeout(function() {
+        if (_downloadPending[id]) {
+          delete _downloadPending[id];
+          reject(new Error('Download bridge timeout'));
+        }
+      }, 30000);
+    });
+  }
+
+  var _downloadSubscribers = [];
+  window.addEventListener('__MOVIX_DOWNLOAD_EVENT', function(event) {
+    var detail = event.detail;
+    if (!detail) return;
+    for (var i = 0; i < _downloadSubscribers.length; i++) {
+      try { _downloadSubscribers[i](detail); } catch (e) {}
+    }
+  });
+
+  function downloadSubscribe(cb) {
+    if (typeof cb !== 'function') return function() {};
+    _downloadSubscribers.push(cb);
+    return function() {
+      var idx = _downloadSubscribers.indexOf(cb);
+      if (idx >= 0) _downloadSubscribers.splice(idx, 1);
+    };
+  }
+
+  window.MovixBridge = {
+    isApp: true,
+    platform: 'android',
+    version: 1,
+    download: {
+      start: function(opts) { return _downloadRequest('MOVIX_DOWNLOAD_START', opts); },
+      pause: function(id) { return _downloadRequest('MOVIX_DOWNLOAD_PAUSE', { downloadId: id }); },
+      resume: function(id) { return _downloadRequest('MOVIX_DOWNLOAD_RESUME', { downloadId: id }); },
+      cancel: function(id) { return _downloadRequest('MOVIX_DOWNLOAD_CANCEL', { downloadId: id }); },
+      delete: function(id) { return _downloadRequest('MOVIX_DOWNLOAD_DELETE', { downloadId: id }); },
+      launch: function(id) { return _downloadRequest('MOVIX_DOWNLOAD_LAUNCH', { downloadId: id }); },
+      list: function() { return _downloadRequest('MOVIX_DOWNLOAD_LIST', null); },
+      get: function(id) { return _downloadRequest('MOVIX_DOWNLOAD_GET', { downloadId: id }); },
+      subscribe: downloadSubscribe,
+    },
+  };
+
   console.log('[Movix App] Bridge runtime initialisé');
 })();
 true;

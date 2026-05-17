@@ -16,6 +16,10 @@ import {
   stopCast,
   subscribeCastSessionEvents,
 } from './cast';
+import {
+  handleDownloadBridgeMessage,
+  isDownloadBridgeMessage,
+} from './downloadBridge';
 
 /** Minimal interface required by the shim helpers — satisfied by both WebView and WebViewBrowserRef. */
 interface InjectableRef {
@@ -373,6 +377,12 @@ export async function handleBridgeMessage(
       await handleCastShimMessage(parsed as CastShimRequest, webViewRef);
       return;
     }
+  }
+
+  // Route MOVIX_DOWNLOAD_* vers le bridge des téléchargements custom.
+  if (isDownloadBridgeMessage(parsed)) {
+    await handleDownloadBridgeMessage(parsed, webViewRef);
+    return;
   }
 
   const req = parsed as BridgeRequest;

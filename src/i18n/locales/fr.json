@@ -4253,7 +4253,56 @@
         "name": "BestDebrid",
         "desc": "Lien final obtenu directement côté navigateur"
       }
-    }
+    },
+    "appDownloadBtn": "Télécharger dans l'application",
+    "appDownloadStarting": "Lancement du téléchargement…",
+    "appDownloadAgain": "Relancer dans l'application",
+    "appDownloadStarted": "Téléchargement ajouté à l'application",
+    "appDownloadStartedHint": "Le fichier est en cours de téléchargement dans Movix.",
+    "appDownloadOpenList": "Voir mes téléchargements",
+    "appDownloadUnavailable": "L'application Movix n'est pas détectée.",
+    "appDownloadError": "Le téléchargement n'a pas pu démarrer."
+  },
+  "downloads": {
+    "title": "Mes téléchargements",
+    "subtitle": "Fichiers stockés dans l'application Movix",
+    "backToHome": "Retour à l'accueil",
+    "appOnlyTitle": "Disponible uniquement dans l'application",
+    "appOnlyDesc": "Cette page n'a de sens que dans l'application Android Movix, où les téléchargements sont stockés.",
+    "loading": "Chargement…",
+    "empty": "Aucun téléchargement",
+    "emptyHint": "Lance un téléchargement depuis la page Débrideur pour le retrouver ici.",
+    "activeLabel": "Actifs",
+    "etaPrefix": "ETA",
+    "failedHint": "Un téléchargement a échoué. Utilise le bouton Reprendre pour réessayer.",
+    "fileCountSuffix": "fichier(s)",
+    "unknownTitle": "Titre inconnu",
+    "unknownSeason": "Saison inconnue",
+    "seasonLabel": "Saison {{n}}",
+    "group": {
+      "movie": "Films",
+      "series": "Séries",
+      "animes": "Animés",
+      "misc": "Autres"
+    },
+    "status": {
+      "queued": "En attente",
+      "running": "En cours",
+      "paused": "En pause",
+      "done": "Terminé",
+      "failed": "Échec",
+      "cancelled": "Annulé"
+    },
+    "actions": {
+      "pause": "Mettre en pause",
+      "resume": "Reprendre",
+      "cancel": "Annuler",
+      "delete": "Supprimer",
+      "launch": "Lancer"
+    },
+    "deleteConfirmTitle": "Supprimer ce fichier ?",
+    "deleteConfirmCancel": "Annuler",
+    "deleteConfirmOk": "Supprimer"
   },
   "francetv": {
     "title": "France TV",

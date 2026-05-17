@@ -31,6 +31,13 @@ import AnimatedBorderCard from '../components/ui/animated-border-card';
 import { Button } from '../components/ui/button';
 import { BESTDEBRID_API_BASE, MAIN_API, PROXIES_EMBED_API } from '../config/runtime';
 import { getVipHeaders } from '../utils/vipUtils';
+import {
+  buildDownloadSubFolder,
+  getMovixBridge,
+  isMovixApp,
+  type MovixDownloadMetadata,
+} from '../utils/appBridge';
+import { Smartphone } from 'lucide-react';
 
 // Hébergeurs non supportés
 const unsupportedHosts = [
@@ -283,6 +290,37 @@ const DebridPage: React.FC = () => {
   const isVip = localStorage.getItem('is_vip') === 'true';
   const hasAutoDebrided = useRef(false);
 
+  // Métadonnées film/série/anime propagées par DownloadPage via query string.
+  // Utilisées par le téléchargement in-app (Android) pour ranger correctement
+  // le fichier et afficher de jolies cartes dans /downloads. Stockées une seule
+  // fois au mount (avant que setSearchParams({}) ne les efface).
+  const [mediaContext] = useState<MovixDownloadMetadata>(() => {
+    const out: MovixDownloadMetadata = {};
+    const kind = searchParams.get('kind');
+    if (kind === 'movie' || kind === 'series' || kind === 'animes') out.type = kind;
+    const tmdb = searchParams.get('tmdb');
+    if (tmdb) out.tmdbId = tmdb;
+    const titleParam = searchParams.get('title');
+    if (titleParam) out.title = titleParam;
+    const poster = searchParams.get('poster');
+    if (poster) out.poster = poster;
+    const s = searchParams.get('s');
+    if (s && !Number.isNaN(parseInt(s, 10))) out.season = parseInt(s, 10);
+    const e = searchParams.get('e');
+    if (e && !Number.isNaN(parseInt(e, 10))) out.episode = parseInt(e, 10);
+    const etitle = searchParams.get('etitle');
+    if (etitle) out.episodeTitle = etitle;
+    const lang = searchParams.get('lang');
+    if (lang) out.language = lang;
+    const q = searchParams.get('q');
+    if (q) out.quality = q;
+    return out;
+  });
+
+  const [appDownloadState, setAppDownloadState] = useState<'idle' | 'starting' | 'started' | 'error'>('idle');
+  const [appDownloadError, setAppDownloadError] = useState<string | null>(null);
+  const inApp = isMovixApp();
+
   const providerOptions: DebridProvider[] = ['deepbrid', 'realdebrid', 'bestdebrid'];
   const isSubmitDisabled = isLoading || !url.trim();
 
@@ -458,6 +496,39 @@ const DebridPage: React.FC = () => {
       toast.success(t('download.copied'));
     });
   };
+
+  const handleAppDownload = useCallback(async (debridResult: DebridResult) => {
+    const bridge = getMovixBridge();
+    if (!bridge) {
+      setAppDownloadError(t('debrid.appDownloadUnavailable'));
+      setAppDownloadState('error');
+      return;
+    }
+
+    setAppDownloadState('starting');
+    setAppDownloadError(null);
+    try {
+      const metadata: MovixDownloadMetadata = {
+        ...mediaContext,
+        provider: debridResult.provider,
+        host: debridResult.host,
+        originalLink: url || undefined,
+      };
+      await bridge.download.start({
+        url: debridResult.link,
+        filename: debridResult.filename,
+        subFolder: buildDownloadSubFolder(metadata),
+        metadata,
+      });
+      setAppDownloadState('started');
+      toast.success(t('debrid.appDownloadStarted'));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('debrid.appDownloadError');
+      setAppDownloadError(message);
+      setAppDownloadState('error');
+      toast.error(message);
+    }
+  }, [mediaContext, t, url]);
 
   const formatFileSize = (bytes: number): string => {
     if (!bytes || bytes === 0) return '';
@@ -659,6 +730,37 @@ const DebridPage: React.FC = () => {
                           <Copy className="w-5 h-5" />
                         </button>
                       </div>
+                      {inApp && (
+                        <div className="pt-1">
+                          <button
+                            onClick={() => handleAppDownload(result)}
+                            disabled={appDownloadState === 'starting'}
+                            className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-900/50 disabled:cursor-wait rounded-xl text-white font-medium transition-colors"
+                          >
+                            {appDownloadState === 'starting' ? (
+                              <Loader className="w-5 h-5 animate-spin" />
+                            ) : (
+                              <Smartphone className="w-5 h-5" />
+                            )}
+                            {appDownloadState === 'starting'
+                              ? t('debrid.appDownloadStarting')
+                              : appDownloadState === 'started'
+                                ? t('debrid.appDownloadAgain')
+                                : t('debrid.appDownloadBtn')}
+                          </button>
+                          {appDownloadError && (
+                            <p className="mt-2 text-xs text-red-300">{appDownloadError}</p>
+                          )}
+                          {appDownloadState === 'started' && !appDownloadError && (
+                            <p className="mt-2 text-xs text-indigo-200/70">
+                              {t('debrid.appDownloadStartedHint')}{' '}
+                              <Link to="/downloads" className="underline hover:text-white">
+                                {t('debrid.appDownloadOpenList')}
+                              </Link>
+                            </p>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </AnimatedBorderCard>
                 </motion.div>

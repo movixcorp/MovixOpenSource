@@ -557,7 +557,14 @@ const LinkSelector: React.FC<{
   decodedLink: DecodedLink | null;
   error: string | null;
   queueInfo?: { size: number } | null;
-}> = ({ isOpen, onClose, title, selectedLink, isDecoding, decodedLink, error, queueInfo }) => {
+  // Métadonnées propagées au /debrid pour que le download in-app les retrouve.
+  mediaKind: 'movie' | 'series' | 'animes';
+  tmdbId: string | undefined;
+  posterPath: string | null | undefined;
+  currentSeason?: number;
+  currentEpisode?: number;
+  episodeTitle?: string;
+}> = ({ isOpen, onClose, title, selectedLink, isDecoding, decodedLink, error, queueInfo, mediaKind, tmdbId, posterPath, currentSeason, currentEpisode, episodeTitle }) => {
   const { t, i18n } = useTranslation();
   const [isClosing, setIsClosing] = useState(false);
   const isVipUser = localStorage.getItem('is_vip') === 'true';
@@ -775,7 +782,23 @@ const LinkSelector: React.FC<{
                           <button
                             onClick={() => {
                               const linkUrl = getEmbedUrl(decodedLink!);
-                              if (linkUrl) navigate(`/debrid?link=${encodeURIComponent(linkUrl)}`);
+                              if (!linkUrl) return;
+                              const params = new URLSearchParams({ link: linkUrl });
+                              params.set('kind', mediaKind);
+                              if (tmdbId) params.set('tmdb', tmdbId);
+                              if (title) params.set('title', title);
+                              if (posterPath) params.set('poster', posterPath);
+                              if (mediaKind !== 'movie') {
+                                if (currentSeason != null) params.set('s', String(currentSeason));
+                                if (currentEpisode != null) params.set('e', String(currentEpisode));
+                                if (episodeTitle) params.set('etitle', episodeTitle);
+                              }
+                              const meta = decodedLink?.metadata || selectedLink || {};
+                              const lang = (meta as { language?: string }).language;
+                              const quality = (meta as { quality?: string }).quality;
+                              if (lang) params.set('lang', lang);
+                              if (quality) params.set('q', quality);
+                              navigate(`/debrid?${params.toString()}`);
                             }}
                             className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-yellow-600 hover:bg-yellow-700 rounded-lg text-white text-sm font-medium transition-colors"
                           >
@@ -853,6 +876,12 @@ const DownloadPage: React.FC = () => {
   };
   
   const [tmdbDetails, setTmdbDetails] = useState<TMDBDetails | null>(null);
+  // mediaKind = catégorie utilisée par la page Downloads in-app pour grouper.
+  // - 'movie' : déduit directement du param URL.
+  // - 'series' / 'animes' : lit `title.type` retourné par /api/darkiworld/seasons.
+  const [mediaKind, setMediaKind] = useState<'movie' | 'series' | 'animes'>(
+    type === 'movie' ? 'movie' : 'series',
+  );
   const [seasons, setSeasons] = useState<Season[]>([]);
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [selectedSeason, setSelectedSeason] = useState<number>(1);
@@ -1126,6 +1155,10 @@ const DownloadPage: React.FC = () => {
   const fetchDarkiWorldSeasons = async (titleId: string, page: number = 1, append: boolean = false) => {
     try {
       const response = await axios.get(`${MAIN_API}/api/darkiworld/seasons/${titleId}?page=${page}&perPage=8&mode=auto`);
+      const titleType = response.data?.title?.type;
+      if (titleType === 'animes' || titleType === 'series') {
+        setMediaKind(titleType);
+      }
       if (response.data.success && response.data.pagination) {
         console.log('Pagination seasons:', response.data.pagination);
 
@@ -1811,6 +1844,12 @@ const DownloadPage: React.FC = () => {
           decodedLink={decodedLink}
           error={error}
           queueInfo={queueInfo}
+          mediaKind={mediaKind}
+          tmdbId={id}
+          posterPath={tmdbDetails?.poster_path}
+          currentSeason={selectedDarkiWorldSeason?.number ?? selectedSeason}
+          currentEpisode={selectedDarkiWorldEpisode?.episode_number ?? selectedEpisode}
+          episodeTitle={selectedDarkiWorldEpisode?.name}
         />
         {showAdPopup && (
           <AdFreePlayerAds

@@ -70,6 +70,11 @@ dependencies {
     // Google Cast (Chromecast) — see app/src/main/java/com/movix/app/cast/
     implementation("com.google.android.gms:play-services-cast-framework:21.5.0")
     implementation("androidx.mediarouter:mediarouter:1.7.0")
+
+    // Téléchargements custom — see app/src/main/java/com/movix/app/download/
+    // okhttp est déjà fourni transitivement par react-android mais on l'épingle
+    // pour garantir l'API utilisée par DownloadJob (Range / RandomAccessFile).
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 
 // androidx.legacy:legacy-support-core-utils:1.0.0 (tiré transitivement par

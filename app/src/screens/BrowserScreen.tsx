@@ -18,6 +18,7 @@ import BrowserToolbar from '../components/BrowserToolbar';
 import MiniPill from '../components/MiniPill';
 import MirrorErrorScreen from '../components/MirrorErrorScreen';
 import { startCastShimEventForwarding } from '../services/bridge';
+import { startDownloadEventForwarding } from '../services/downloadBridge';
 import { useBrowserUIPrefs } from '../hooks/useBrowserUIPrefs';
 import { useAddress } from '../context/AddressContext';
 import SettingsScreen from './SettingsScreen';
@@ -73,6 +74,11 @@ export default function BrowserScreen() {
 
   useEffect(() => {
     const unsub = startCastShimEventForwarding(webViewRef);
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    const unsub = startDownloadEventForwarding(webViewRef);
     return unsub;
   }, []);
 

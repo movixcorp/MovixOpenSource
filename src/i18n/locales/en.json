@@ -4253,7 +4253,56 @@
         "name": "BestDebrid",
         "desc": "Final link fetched directly from the browser"
       }
-    }
+    },
+    "appDownloadBtn": "Download in the app",
+    "appDownloadStarting": "Starting download…",
+    "appDownloadAgain": "Restart in the app",
+    "appDownloadStarted": "Download added to the app",
+    "appDownloadStartedHint": "The file is being downloaded inside Movix.",
+    "appDownloadOpenList": "View my downloads",
+    "appDownloadUnavailable": "Movix application not detected.",
+    "appDownloadError": "Could not start the download."
+  },
+  "downloads": {
+    "title": "My downloads",
+    "subtitle": "Files stored inside the Movix app",
+    "backToHome": "Back to home",
+    "appOnlyTitle": "Only available inside the app",
+    "appOnlyDesc": "This page only makes sense inside the Movix Android app, where downloads are stored.",
+    "loading": "Loading…",
+    "empty": "No downloads yet",
+    "emptyHint": "Trigger a download from the Debrider page to find it here.",
+    "activeLabel": "Active",
+    "etaPrefix": "ETA",
+    "failedHint": "A download failed. Use Resume to retry.",
+    "fileCountSuffix": "file(s)",
+    "unknownTitle": "Unknown title",
+    "unknownSeason": "Unknown season",
+    "seasonLabel": "Season {{n}}",
+    "group": {
+      "movie": "Movies",
+      "series": "Series",
+      "animes": "Animes",
+      "misc": "Other"
+    },
+    "status": {
+      "queued": "Queued",
+      "running": "Running",
+      "paused": "Paused",
+      "done": "Done",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "actions": {
+      "pause": "Pause",
+      "resume": "Resume",
+      "cancel": "Cancel",
+      "delete": "Delete",
+      "launch": "Play"
+    },
+    "deleteConfirmTitle": "Delete this file?",
+    "deleteConfirmCancel": "Cancel",
+    "deleteConfirmOk": "Delete"
   },
   "francetv": {
     "title": "France TV",

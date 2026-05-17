@@ -91,6 +91,7 @@ export const ROUTES: RouteEntry[] = [
   { path: '/admin',                   loader: lz(() => import('../pages/AdminPage')) },
   { path: '/download/:type/:id',      loader: lz(() => import('../pages/DownloadPage')) },
   { path: '/debrid',                  loader: lz(() => import('../pages/DebridPage')) },
+  { path: '/downloads',               loader: lz(() => import('../pages/DownloadsPage')) },
   { path: '/roulette',                loader: lz(() => import('../pages/RoulettePage')) },
   { path: '/suggestion',              loader: lz(() => import('../pages/SuggestionPage')) },
   { path: '/extension',               loader: lz(() => import('../pages/ExtensionPage')) },

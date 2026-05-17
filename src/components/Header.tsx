@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import Snowfall from 'react-snowfall';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
-import { Film, Search, Menu, X, Star, Tv2, Users, Clapperboard, Bell, Tv, Lightbulb, Network, List, Radio, Unlock, ChevronDown, ExternalLink, LayoutGrid, Settings, Dices, Sparkles, HelpCircle, Github } from 'lucide-react';
+import { Film, Search, Menu, X, Star, Tv2, Users, Clapperboard, Bell, Tv, Lightbulb, Network, List, Radio, Unlock, ChevronDown, ExternalLink, LayoutGrid, Settings, Dices, Sparkles, HelpCircle, Github, Download as DownloadIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ProfileMenu from './ProfileMenu';
 import NotificationsPopup from './NotificationsPopup';
@@ -11,6 +11,7 @@ import { encodeId } from '../utils/idEncoder';
 
 import { useSearch } from '../context/SearchContext';
 import { isUserVip } from '../utils/authUtils';
+import { isMovixApp, getMovixBridge } from '../utils/appBridge';
 import { useTranslation } from 'react-i18next';
 import { SquareBackground } from './ui/square-background';
 import { APRIL_FOOLS_ADMIN_PATH, isAprilFoolsAdminEnabled } from '../utils/aprilFools';
@@ -69,6 +70,31 @@ const Header: React.FC = () => {
   const [notificationsDisabled, setNotificationsDisabled] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isVip, setIsVip] = useState(false);
+  // Compteur de DL actifs in-app (running/queued/paused). Visible uniquement
+  // dans l'app native ; rafraîchi via subscribe au bridge.
+  const inMovixApp = isMovixApp();
+  const [activeDownloads, setActiveDownloads] = useState(0);
+
+  useEffect(() => {
+    const bridge = getMovixBridge();
+    if (!bridge) return;
+    const computeFromList = async () => {
+      try {
+        const list = await bridge.download.list();
+        const active = list.filter((e) => e.status === 'running' || e.status === 'queued' || e.status === 'paused').length;
+        setActiveDownloads(active);
+      } catch {
+        // bridge offline, on garde la valeur précédente
+      }
+    };
+    computeFromList();
+    const unsub = bridge.download.subscribe((evt) => {
+      if (evt.event === 'state') {
+        computeFromList();
+      }
+    });
+    return unsub;
+  }, []);
 
   const [headerQuery, setHeaderQuery] = useState('');
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -484,6 +510,22 @@ const Header: React.FC = () => {
                 >
                   <Search size={20} />
                 </motion.button>
+
+                {/* Téléchargements in-app (Android uniquement) */}
+                {inMovixApp && (
+                  <Link
+                    to="/downloads"
+                    className="relative flex items-center justify-center p-2 text-gray-400 hover:text-white transition-colors"
+                    title={t('downloads.title')}
+                  >
+                    <DownloadIcon size={20} />
+                    {activeDownloads > 0 && (
+                      <span className="absolute -top-0.5 -right-0.5 bg-indigo-600 text-white text-[10px] rounded-full h-4 min-w-4 flex items-center justify-center px-1 font-bold">
+                        {activeDownloads > 9 ? '9+' : activeDownloads}
+                      </span>
+                    )}
+                  </Link>
+                )}
 
                 {/* Notifications */}
                 {isAuthenticated && !notificationsDisabled && (
