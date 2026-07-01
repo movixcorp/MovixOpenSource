@@ -9,10 +9,94 @@ const router = express.Router();
 const axios = require('axios');
 const crypto = require('crypto');
 const path = require('path');
+const dns = require('dns');
 const fsp = require('fs').promises;
+const { URL } = require('url');
 
 const { safeWriteJsonFile } = require('../utils/safeFile');
 const { CACHE_DIR } = require('../utils/cacheManager');
+
+// === SSRF Protection ===
+// Domaines autorisés explicitement (whitelist). Les domaines non listés
+// seront bloqués si ALLOW_PROXY_WILDCARD n'est pas 'true' dans l'env.
+const ALLOWED_DOMAINS = new Set([
+  // Stream hosters
+  'vmwesa.online', 'vidmoly.net', 'vidmoly.me', 'vidmoly.to',
+  'dropcdn.net', 'dropload.tv',
+  'serversicuro.xyz', 'supervideo.cc',
+  'coflix.bet', 'coflix.si', 'coflix.boo', 'coflix.io', 'coflix.date',
+  'tvdirect.ddns.net', 'darkibox.com',
+  'rivestream.org',
+  'voe.sx', 'voe-unblock.com',
+  'uqload.to', 'uqload.com', 'uqload.co',
+  'vidzy.org',
+  'cinep.stream',
+  'doodstream.com', 'dood.ws',
+  'mangomolo.com',
+  'sibnet.ru',
+  'frembed.com', 'fs-bro.com',
+  'anime-sama.fr',
+  'getromes.space',
+  '1fichier.com',
+  'sendvid.com',
+  'mixdrop.co',
+  'streamvid.net',
+  'gounlimited.to',
+  'mail.ru',
+  'cloud.mail.ru',
+  'ok.ru',
+  'yandex.ru',
+  'yandex.net',
+  // TMDB images (already proxied but keep for safety)
+  'image.tmdb.org',
+  'themoviedb.org',
+  // Default fallback
+  'vmwesa.online',
+]);
+
+// Réseaux privés / métadonnées à bloquer impérativement (SSRF prevention)
+const BLOCKED_IP_PATTERNS = [
+  /^127\./,           // localhost IPv4
+  /^10\./,            // RFC 1918
+  /^172\.(1[6-9]|2\d|3[01])\./, // RFC 1918
+  /^192\.168\./,      // RFC 1918
+  /^169\.254\./,      // Link-local
+  /^0\./,             // Invalid
+  /^100\.(6[4-9]|\d{2,3})\./, // Carrier-grade NAT / AWS metadata
+  /^::1$/,            // localhost IPv6
+  /^fc00:/,           // Unique local address IPv6
+  /^fe80:/,           // Link-local IPv6
+];
+
+function isPrivateIp(ip) {
+  return BLOCKED_IP_PATTERNS.some(pattern => pattern.test(ip));
+}
+
+function isDomainAllowed(hostname) {
+  const lower = hostname.toLowerCase();
+  if (ALLOWED_DOMAINS.has(lower)) return true;
+  // Vérifier les sous-domaines : si x.y.com est la racine, y.com est dans la liste
+  const parts = lower.split('.');
+  for (let i = 1; i < parts.length - 1; i++) {
+    const domain = parts.slice(i).join('.');
+    if (ALLOWED_DOMAINS.has(domain)) return true;
+  }
+  return false;
+}
+
+function resolveAndCheckIp(hostname) {
+  return new Promise((resolve) => {
+    dns.lookup(hostname, { family: 4, all: true }, (err, addresses) => {
+      if (err) {
+        // Échec de résolution DNS => bloquer (protection contre les domaines qui n'existent pas)
+        return resolve(false);
+      }
+      const ips = Array.isArray(addresses) ? addresses.map(a => a.address) : [addresses];
+      const blocked = ips.some(ip => isPrivateIp(ip));
+      resolve(!blocked);
+    });
+  });
+}
 
 // === Routes ===
 
@@ -53,6 +137,35 @@ router.get(/^\/(.*)/, async (req, res) => {
     // Check if the URL starts with http(s)://, if not, prepend https://
     if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
       targetUrl = 'https://' + targetUrl;
+    }
+
+    // === SSRF Protection ===
+    // 1. Vérifier que l'URL a un hostname valide
+    let parsedProxyUrl;
+    try {
+      parsedProxyUrl = new URL(targetUrl);
+    } catch {
+      return res.status(400).json({ error: 'URL invalide' });
+    }
+
+    const hostname = parsedProxyUrl.hostname.toLowerCase();
+
+    // 2. Bloquer les IPs privées directement dans l'URL (ex: http://10.0.0.1/admin)
+    if (isPrivateIp(hostname)) {
+      console.warn(`[PROXY] Blocked private IP request: ${targetUrl}`);
+      return res.status(403).json({ error: 'Accès refusé' });
+    }
+
+    // 3. Vérifier la whitelist de domaines
+    if (!isDomainAllowed(hostname)) {
+      // Si le domaine n'est pas dans la whitelist, on vérifie via DNS qu'il ne
+      // pointe pas vers une IP privée (protection SSRF contre les domaines
+      // malveillants qui résolvent vers des IPs internes)
+      const isSafe = await resolveAndCheckIp(hostname);
+      if (!isSafe) {
+        console.warn(`[PROXY] Blocked SSRF attempt: ${targetUrl}`);
+        return res.status(403).json({ error: 'Domaine non autorisé' });
+      }
     }
 
     // === TVDIRECT SPECIAL HANDLING ===
