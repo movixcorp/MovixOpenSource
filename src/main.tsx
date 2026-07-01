@@ -7,6 +7,7 @@ import App from './App.tsx'
 import axios from 'axios'
 import { api } from './services/api'
 import { registerBlockDetection } from './services/blockDetection'
+import { registerAuthInterceptor } from './services/authInterceptor'
 import './index.css'
 import './styles/light-mode.css'
 
@@ -125,6 +126,10 @@ startMovixConsoleSafetyWarning();
 // since instances created via axios.create() don't inherit from the default.
 registerBlockDetection(axios)
 registerBlockDetection(api)
+
+// Register auth interceptor (JWT refresh on 401) on both instances
+registerAuthInterceptor(axios)
+registerAuthInterceptor(api)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
