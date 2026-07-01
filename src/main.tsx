@@ -7,6 +7,8 @@ import App from './App.tsx'
 import axios from 'axios'
 import { api } from './services/api'
 import { registerBlockDetection } from './services/blockDetection'
+import { registerTmdbProxyInterceptor } from './services/tmdbProxyInterceptor'
+import { MAIN_API } from './config/runtime'
 import './index.css'
 import './styles/light-mode.css'
 
@@ -125,6 +127,10 @@ startMovixConsoleSafetyWarning();
 // since instances created via axios.create() don't inherit from the default.
 registerBlockDetection(axios)
 registerBlockDetection(api)
+
+// Register TMDB proxy interceptor to hide API key from client
+registerTmdbProxyInterceptor(axios, MAIN_API)
+registerTmdbProxyInterceptor(api, MAIN_API)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

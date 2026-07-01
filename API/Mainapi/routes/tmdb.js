@@ -843,6 +843,54 @@ router.get('/SenpaiStream/tv/cache/:tmdbId', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /tmdb-proxy/*  -- Generic proxy to TMDB API (hides API key from client)
+// ---------------------------------------------------------------------------
+router.get('/tmdb-proxy/*', async (req, res) => {
+  try {
+    // Extract the TMDB API path from the wildcard
+    // e.g. /api/tmdb-proxy/genre/movie/list -> genre/movie/list
+    const tmdbPath = req.params[0] || req.url.replace(/^\/+tmdb-proxy\//, '');
+    if (!tmdbPath) {
+      return res.status(400).json({ error: 'TMDB path is required' });
+    }
+
+    // Forward query parameters (except api_key which would be passed by the client)
+    const { api_key, ...forwardParams } = req.query;
+    const params = new URLSearchParams();
+    params.set('api_key', TMDB_API_KEY);
+    params.set('language', forwardParams.language || 'fr-FR');
+    for (const [key, value] of Object.entries(forwardParams)) {
+      if (key !== 'language') {
+        params.set(key, String(value));
+      }
+    }
+
+    const url = `${TMDB_API_URL}/${tmdbPath}?${params.toString()}`;
+    const response = await axios.get(url, {
+      timeout: 10000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Movix/1.0',
+      },
+    });
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5min cache
+    res.json(response.data);
+  } catch (error) {
+    if (error.response) {
+      return res.status(error.response.status).json({
+        error: 'TMDB API error',
+        status: error.response.status,
+      });
+    }
+    console.error('[TMDB Proxy] Error:', error.message);
+    res.status(502).json({ error: 'TMDB proxy failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 module.exports = router;
