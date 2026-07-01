@@ -83,10 +83,8 @@ const AUTH_KEYS = [
   'session_id',
   'discord_auth',
   'discord_user',
-  'discord_token',
   'google_auth',
   'google_user',
-  'google_token',
   'bip39_auth',
   'auth_method',
   'resolved_user_type',
@@ -426,7 +424,8 @@ export function persistResolvedSession(
       isAdmin: Boolean(rawUser?.isAdmin),
       linked: Boolean(payload.account?.linked),
     }));
-    if (options.accessToken) localStorage.setItem('discord_token', options.accessToken);
+    // Ne pas stocker le token OAuth en localStorage (risque XSS)
+    // Le backend stocke déjà ce token côté serveur
   }
 
   if (method === 'google') {
@@ -440,7 +439,8 @@ export function persistResolvedSession(
       picture: rawUser?.picture || DEFAULT_AVATAR,
       linked: Boolean(payload.account?.linked),
     }));
-    if (options.accessToken) localStorage.setItem('google_token', options.accessToken);
+    // Ne pas stocker le token OAuth en localStorage (risque XSS)
+    // Le backend stocke déjà ce token côté serveur
   }
 
   if (method === 'bip39') {
