@@ -125,10 +125,9 @@ function purgeSessionRecord(sessionId, userId, userType) {
 
 async function getAuthIfValid(req) {
   try {
-    const authHeader = req.headers['authorization'] || req.headers['Authorization'];
-    if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) return null;
-    const token = authHeader.split(' ')[1];
-    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+    const token = extractJwtFromRequest(req);
+    if (!token) return null;
+    const payload = verifyJwt(token);
     const { userType, sub: userId, sessionId } = payload;
     const authMethod = AUTH_METHODS.includes(payload?.authMethod)
       ? payload.authMethod
@@ -301,11 +300,43 @@ async function isUploaderOrAdmin(req, res, next) {
   }
 }
 
+/**
+ * Set JWT as an HttpOnly cookie for automatic transmission on same-origin requests.
+ * Cookie options: HttpOnly, Secure, SameSite=Lax, Path=/api, 7-day TTL.
+ */
+function setAuthCookie(res, token) {
+  if (!res || !token) return;
+  res.cookie('auth_token', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/api',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  });
+}
+
+/**
+ * Extract JWT from request: check cookies first, then Authorization header.
+ */
+function extractJwtFromRequest(req) {
+  if (req.cookies && req.cookies.auth_token) {
+    return req.cookies.auth_token;
+  }
+  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+  if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+    return authHeader.split(' ')[1];
+  }
+  return null;
+}
+
 module.exports = {
   JWT_SECRET,
   issueJwt,
+  verifyJwt,
   isAdmin,
   isUploaderOrAdmin,
   getAuthIfValid,
-  updateSessionAccess
+  updateSessionAccess,
+  setAuthCookie,
+  extractJwtFromRequest,
 };

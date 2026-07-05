@@ -13,7 +13,7 @@ const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 
-const { issueJwt, getAuthIfValid } = require('../middleware/auth');
+const { issueJwt, verifyJwt, getAuthIfValid, setAuthCookie, extractJwtFromRequest } = require('../middleware/auth');
 const { getPool } = require('../mysqlPool');
 const { createRedisRateLimitStore } = require('../utils/redisRateLimitStore');
 const { verifyTurnstileFromRequest } = require('../utils/turnstile');
@@ -484,6 +484,7 @@ router.post('/bip39/create', authRateLimit, async (req, res) => {
       },
     });
 
+    setAuthCookie(res, payload.token);
     return res.status(200).json({
       ...payload,
       userId: payload.account.userId,
@@ -526,6 +527,7 @@ router.post('/bip39/login', authRateLimit, async (req, res) => {
       },
     });
 
+    setAuthCookie(res, payload.token);
     return res.status(200).json({
       ...payload,
       userId: payload.account.userId,
@@ -555,6 +557,7 @@ router.post('/discord/verify', authRateLimit, async (req, res) => {
       externalUser: user,
     });
 
+    setAuthCookie(res, payload.token);
     return res.status(200).json(payload);
   } catch (error) {
     console.error('Discord verify error:', error.response?.status || error.message);
@@ -579,6 +582,7 @@ router.post('/google/verify', authRateLimit, async (req, res) => {
       externalUser: user,
     });
 
+    setAuthCookie(res, payload.token);
     return res.status(200).json(payload);
   } catch (error) {
     console.error('Google verify error:', error.response?.status || error.message);
@@ -724,6 +728,60 @@ router.delete('/links/:provider', async (req, res) => {
   } catch (error) {
     console.error('Error unlinking account:', error);
     return res.status(500).json({ success: false, error: 'Erreur lors de la suppression de la liaison' });
+  }
+});
+
+/**
+ * GET /api/auth/session
+ * Retourne les infos de session si le cookie JWT est valide.
+ * Permet au frontend de réhydrater le token en mémoire après un reload.
+ */
+router.get('/session', async (req, res) => {
+  try {
+    const token = extractJwtFromRequest(req);
+    if (!token) {
+      return res.status(401).json({ success: false, error: 'Non authentifié' });
+    }
+
+    let payload;
+    try {
+      payload = verifyJwt(token);
+    } catch {
+      return res.status(401).json({ success: false, error: 'Session expirée' });
+    }
+
+    const { userType, sub: userId, sessionId, authMethod } = payload;
+    if (!['oauth', 'bip39'].includes(userType) || !userId || !sessionId) {
+      return res.status(401).json({ success: false, error: 'Session invalide' });
+    }
+
+    // Vérifier en MySQL
+    const pool = getPool();
+    if (!pool) {
+      return res.status(503).json({ success: false, error: 'Service indisponible' });
+    }
+
+    const [rows] = await pool.execute(
+      'SELECT id FROM user_sessions WHERE id = ? AND user_id = ? AND user_type = ?',
+      [sessionId, userId, userType]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'Session expirée' });
+    }
+
+    // Retourner un nouveau token et les infos de session
+    const newToken = issueJwt(userType, userId, sessionId, authMethod);
+    setAuthCookie(res, newToken);
+
+    return res.json({
+      success: true,
+      token: newToken,
+      session: { userType, userId, sessionId, authMethod },
+    });
+  } catch (error) {
+    console.error('[AUTH] Session error:', error);
+    return res.status(500).json({ success: false, error: 'Erreur interne' });
   }
 });
 

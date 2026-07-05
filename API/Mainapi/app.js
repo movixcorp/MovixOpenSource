@@ -8,6 +8,7 @@ const express = require("express");
 const http = require("http");
 const https = require("https");
 const compression = require("compression");
+const cookieParser = require("cookie-parser");
 
 // Middleware modules
 const corsMiddleware = require("./middleware/cors");
@@ -254,6 +255,9 @@ app.use(domainRestriction);
 
 // 6. Body parsing
 app.use(express.json({ limit: "30mb" })); // Reduced from 1000mb to prevent abuse
+
+// 6b. Cookie parsing (for HttpOnly JWT auth cookie)
+app.use(cookieParser());
 
 // 7. JSON parse error handler (must come right after json parser)
 app.use(jsonParseErrorHandler);
