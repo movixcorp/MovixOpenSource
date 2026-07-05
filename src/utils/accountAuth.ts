@@ -375,6 +375,53 @@ export function clearPendingAuthAction() {
   clearCookie(PENDING_AUTH_ACTION_COOKIE);
 }
 
+/**
+ * Rafraîchit le JWT via l'API /api/auth/refresh
+ * Retourne le nouveau token ou null si le refresh a échoué.
+ */
+let refreshPromise: Promise<string | null> | null = null;
+
+export async function refreshAuthToken(): Promise<string | null> {
+  // Éviter les appels concurrents
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const currentToken = localStorage.getItem('auth_token');
+      if (!currentToken) return null;
+
+      const { MAIN_API } = await import('../config/runtime');
+      const response = await fetch(`${MAIN_API}/api/auth/refresh`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${currentToken}`,
+        },
+        body: JSON.stringify({ token: currentToken }),
+      });
+
+      if (!response.ok) {
+        // Refresh échoué, forcer la déconnexion
+        clearStoredAuthSession();
+        return null;
+      }
+
+      const data = await response.json();
+      if (data?.token) {
+        localStorage.setItem('auth_token', data.token);
+        return data.token;
+      }
+      return null;
+    } catch {
+      return null;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
 export function clearStoredAuthSession() {
   AUTH_KEYS.forEach((key) => localStorage.removeItem(key));
 }

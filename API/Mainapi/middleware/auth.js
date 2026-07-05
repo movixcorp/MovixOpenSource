@@ -28,12 +28,15 @@ if (!JWT_SECRET) {
 }
 
 function issueJwt(userType, userId, sessionId, authMethod = null) {
-  // Issue a token without expiration (no exp claim)
   const payload = { sub: userId, userType, sessionId };
   if (AUTH_METHODS.includes(authMethod)) {
     payload.authMethod = authMethod;
   }
-  return jwt.sign(payload, JWT_SECRET, { algorithm: 'HS256' });
+  return jwt.sign(payload, JWT_SECRET, { algorithm: 'HS256', expiresIn: '24h' });
+}
+
+function verifyJwt(token, options = {}) {
+  return jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], ...options });
 }
 
 function parseStoredAuth(rawValue) {
@@ -128,7 +131,7 @@ async function getAuthIfValid(req) {
     const authHeader = req.headers['authorization'] || req.headers['Authorization'];
     if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) return null;
     const token = authHeader.split(' ')[1];
-    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+    const payload = verifyJwt(token);
     const { userType, sub: userId, sessionId } = payload;
     const authMethod = AUTH_METHODS.includes(payload?.authMethod)
       ? payload.authMethod
@@ -304,6 +307,7 @@ async function isUploaderOrAdmin(req, res, next) {
 module.exports = {
   JWT_SECRET,
   issueJwt,
+  verifyJwt,
   isAdmin,
   isUploaderOrAdmin,
   getAuthIfValid,

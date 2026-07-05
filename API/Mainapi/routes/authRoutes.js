@@ -13,7 +13,7 @@ const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 
-const { issueJwt, getAuthIfValid } = require('../middleware/auth');
+const { issueJwt, verifyJwt, getAuthIfValid } = require('../middleware/auth');
 const { getPool } = require('../mysqlPool');
 const { createRedisRateLimitStore } = require('../utils/redisRateLimitStore');
 const { verifyTurnstileFromRequest } = require('../utils/turnstile');
@@ -724,6 +724,78 @@ router.delete('/links/:provider', async (req, res) => {
   } catch (error) {
     console.error('Error unlinking account:', error);
     return res.status(500).json({ success: false, error: 'Erreur lors de la suppression de la liaison' });
+  }
+});
+
+// Rate limiter pour le refresh token : 5 req/minute
+const refreshRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => {
+    const token = req.body?.token || req.headers['authorization']?.split(' ')[1] || req.ip;
+    return `refresh_${token}`;
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Trop de tentatives de refresh. Réessayez dans une minute.' },
+});
+
+/**
+ * POST /api/auth/refresh
+ * Émet un nouveau JWT si la session MySQL est toujours valide.
+ * Accepte le token actuel (même expiré) dans le body ou l'Authorization header.
+ */
+router.post('/refresh', refreshRateLimit, async (req, res) => {
+  try {
+    const token = req.body?.token || req.headers['authorization']?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, error: 'Token requis' });
+    }
+
+    // Vérifier la signature du token même s'il est expiré
+    let payload;
+    try {
+      payload = verifyJwt(token, { ignoreExpiration: true });
+    } catch (err) {
+      return res.status(401).json({ success: false, error: 'Token invalide' });
+    }
+
+    const { userType, sub: userId, sessionId, authMethod } = payload;
+    if (!['oauth', 'bip39'].includes(userType) || !userId || !sessionId) {
+      return res.status(401).json({ success: false, error: 'Payload token invalide' });
+    }
+
+    // Vérifier que la session existe toujours en MySQL
+    const pool = getPool();
+    if (!pool) {
+      return res.status(503).json({ success: false, error: 'Base de données indisponible' });
+    }
+
+    const [rows] = await pool.execute(
+      'SELECT id FROM user_sessions WHERE id = ? AND user_id = ? AND user_type = ?',
+      [sessionId, userId, userType]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'Session expirée. Veuillez vous reconnecter.' });
+    }
+
+    // Mettre à jour le timestamp d'accès
+    pool.execute(
+      'UPDATE user_sessions SET accessed_at = NOW() WHERE id = ?',
+      [sessionId]
+    ).catch(() => {});
+
+    // Émettre un nouveau JWT
+    const newToken = issueJwt(userType, userId, sessionId, authMethod);
+
+    return res.json({
+      success: true,
+      token: newToken,
+    });
+  } catch (error) {
+    console.error('[AUTH] Refresh error:', error);
+    return res.status(500).json({ success: false, error: 'Erreur interne' });
   }
 });
 
