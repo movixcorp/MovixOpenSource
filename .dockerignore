@@ -11,8 +11,11 @@ build
 .gitattributes
 .github
 
-# === Backends séparés (pas besoin pour le front) ===
-API
+# === Backends (contextes Docker dédiés) ===
+API/Mainapi
+API/proxiesembed
+API/miscs
+API/watchpartyAPI
 extension
 userscript
 wasm

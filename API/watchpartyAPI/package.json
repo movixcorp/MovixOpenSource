@@ -1,0 +1,15 @@
+{
+  "name": "movix-watchparty",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node watchparty.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.3",
+    "uuid": "^11.1.0"
+  }
+}

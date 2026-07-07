@@ -1,0 +1,136 @@
+name: movix
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-movix}
+      MYSQL_USER: ${MYSQL_USER:-movix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - movix-internal
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks:
+      - movix-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  mainapi:
+    build:
+      context: API/Mainapi
+      dockerfile: ../../docker/mainapi/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+      - API/Mainapi/.env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "25565:25565"
+    volumes:
+      - mainapi_cache:/app/cache
+    networks:
+      - movix-internal
+
+  watchparty:
+    build:
+      context: API/watchpartyAPI
+      dockerfile: ../../docker/watchparty/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - API/watchpartyAPI/.env
+    ports:
+      - "25566:25566"
+    volumes:
+      - watchparty_cache:/app/cache
+    networks:
+      - movix-internal
+
+  proxiesembed:
+    build:
+      context: API/proxiesembed
+      dockerfile: ../../docker/proxiesembed/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+      - API/proxiesembed/.env
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "25569:25569"
+    networks:
+      - movix-internal
+
+  bypass403:
+    build:
+      context: API/miscs
+      dockerfile: ../../docker/miscs/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - API/miscs/.env
+    ports:
+      - "25568:25568"
+    networks:
+      - movix-internal
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile.dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mainapi
+      - watchparty
+    networks:
+      - movix-internal
+    volumes:
+      - ./src:/app/src
+      - ./public:/app/public
+      - ./index.html:/app/index.html
+      - ./vite.config.ts:/app/vite.config.ts
+      - ./tailwind.config.js:/app/tailwind.config.js
+      - ./postcss.config.js:/app/postcss.config.js
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./tsconfig.app.json:/app/tsconfig.app.json
+      - ./tsconfig.node.json:/app/tsconfig.node.json
+
+networks:
+  movix-internal:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
+  mainapi_cache:
+  watchparty_cache:

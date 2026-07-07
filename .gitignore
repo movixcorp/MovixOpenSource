@@ -35,10 +35,14 @@ dist/
 build/
 *.log
 
-# Environment files
+# Environment files (secrets — never commit)
 .env
-
-# IDE files
+.env.*
+!.env.example
+!.env.docker.example
+API/**/.env
+API/**/.env.*
+!API/**/.env.example
 .vscode/
 .idea/
 *.swp
@@ -54,10 +58,8 @@ Thumbs.db
 .cache/
 
 # Sensitive files (auto-detected)
-.env
 dist
 node_modules
-.env
 
 # Project runtime caches and local data
 API/cache/
