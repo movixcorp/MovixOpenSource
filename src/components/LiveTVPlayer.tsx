@@ -1619,10 +1619,45 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         };
     }, [clearControlsTimeout, hideControlsTimeout, isFullscreen, isPlaying, isUserPaused, showControls, showSettings]);
 
-    const handleMouseMove = useCallback(() => {
+    const handleMouseMove = useCallback((e?: Event | React.MouseEvent | PointerEvent) => {
+        if (e && 'pointerType' in e && (e as PointerEvent).pointerType === 'touch') return;
         setShowControls(true);
         hideControlsTimeout();
     }, [hideControlsTimeout]);
+
+    // Native listener binding for pointer & mouse movement in LiveTVPlayer
+    useEffect(() => {
+        if (isEmbedStream) return;
+        const container = containerRef.current;
+        if (!container) return;
+
+        const onUserPointerActivity = (e: Event) => {
+            handleMouseMove(e);
+        };
+
+        const events = ['pointermove', 'mousemove', 'pointerenter', 'mouseenter'];
+
+        events.forEach(eventName => {
+            container.addEventListener(eventName, onUserPointerActivity, { passive: true });
+        });
+
+        const handleDocumentPointerMove = (e: Event) => {
+            if (document.fullscreenElement || container.contains(e.target as Node)) {
+                onUserPointerActivity(e);
+            }
+        };
+
+        document.addEventListener('pointermove', handleDocumentPointerMove, { passive: true });
+        document.addEventListener('mousemove', handleDocumentPointerMove, { passive: true });
+
+        return () => {
+            events.forEach(eventName => {
+                container.removeEventListener(eventName, onUserPointerActivity);
+            });
+            document.removeEventListener('pointermove', handleDocumentPointerMove);
+            document.removeEventListener('mousemove', handleDocumentPointerMove);
+        };
+    }, [isEmbedStream, handleMouseMove]);
 
     // Tap on video area to toggle play/pause (essential for mobile)
     const handleVideoClick = useCallback((e: React.MouseEvent) => {
@@ -1876,6 +1911,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             exit={{ opacity: 0 }}
             className={`fixed inset-0 z-[12000] flex items-center justify-center ${isEmbedStream ? 'bg-black/80 p-4 backdrop-blur-md sm:p-6' : 'bg-black'} ${shouldHideCursor ? 'cursor-none' : ''}`}
             ref={containerRef}
+            onPointerMove={isEmbedStream ? undefined : handleMouseMove}
             onMouseMove={isEmbedStream ? undefined : handleMouseMove}
             onClick={isEmbedStream ? undefined : handleMouseMove}
             onMouseLeave={isEmbedStream ? undefined : (() => {
