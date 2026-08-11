@@ -163,6 +163,7 @@ const { app, appReady } = require('./app');
 const { redis } = require('./config/redis');
 const { shutdownCycleTLS, refreshProxyScrapeProxies } = require('./utils/proxyManager');
 const { getPool } = require('./mysqlPool');
+const { startContentNotificationScheduler } = require('./services/contentNotifications/scheduler');
 
 const PORT = parseInt(process.env.PORT, 10) || 25565;
 
@@ -284,9 +285,14 @@ const startServer = async (retries = 3) => {
 
 // === DÉMARRAGE DU WORKER ===
 let activeServer = null;
+let stopContentNotificationScheduler = () => {};
 
 startServer().then((server) => {
   activeServer = server;
+  stopContentNotificationScheduler = startContentNotificationScheduler({
+    pool: getPool(),
+    redis,
+  });
   console.log(`✅ Worker ${process.pid} - Serveur démarré sur le port ${PORT}`);
   logMemoryUsage(); // baseline [memstats] line at boot
 }).catch((error) => {
@@ -324,6 +330,7 @@ const shutdownWorker = async () => {
   }
 
   // 2. Cleanup des ressources
+  stopContentNotificationScheduler();
   try { await redis.quit(); } catch { /* ignore */ }
   try { await shutdownCycleTLS(); } catch { /* ignore */ }
   try { const pool = getPool(); if (pool) await pool.end(); } catch { /* ignore */ }

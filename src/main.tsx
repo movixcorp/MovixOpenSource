@@ -7,6 +7,8 @@ import App from './App.tsx'
 import axios from 'axios'
 import { api } from './services/api'
 import { registerBlockDetection } from './services/blockDetection'
+import { getNotificationsDisabled } from './services/apiNotificationService'
+import { subscribeToPush } from './services/pushNotificationService'
 import './index.css'
 import './styles/light-mode.css'
 
@@ -221,10 +223,13 @@ if ('serviceWorker' in navigator) {
       if ('PushManager' in window && Notification.permission === 'granted' && localStorage.getItem('auth_token')) {
         const subscription = await registration.pushManager.getSubscription();
         if (!subscription) {
-          const { subscribeToPush } = await import('./services/pushNotificationService');
-          subscribeToPush();
+          if (!(await getNotificationsDisabled())) {
+            subscribeToPush();
+          }
         }
       }
-    } catch {}
+    } catch {
+      // Le site reste utilisable quand le navigateur refuse le service worker.
+    }
   });
 }

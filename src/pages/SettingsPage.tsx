@@ -30,7 +30,7 @@ import {
 } from '../utils/extractionPrefs';
 import { isExtensionAvailable, fetchFromExtension } from '../utils/extensionProxy';
 import { isUserVip } from '../utils/authUtils';
-import { unsubscribeFromPush } from '../services/pushNotificationService';
+import { resetPushBannerDismissal, subscribeToPush, unsubscribeFromPush } from '../services/pushNotificationService';
 import { clearStoredAuthSession, getResolvedAccountContext, setPendingAuthLink } from '../utils/accountAuth';
 import {
   formatStorageBytes,
@@ -1199,7 +1199,10 @@ const SettingsPage: React.FC = () => {
         window.dispatchEvent(new CustomEvent('notifications_disabled_changed', { detail: data.notificationsDisabled }));
         // Désinscrire des push si notifications désactivées
         if (data.notificationsDisabled) {
-          unsubscribeFromPush();
+          await unsubscribeFromPush();
+        } else {
+          resetPushBannerDismissal();
+          await subscribeToPush();
         }
       }
     } catch {
