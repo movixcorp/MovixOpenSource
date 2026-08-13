@@ -66,6 +66,9 @@ function createRuntimeHarness(buildBridgeRuntime, { rejectOpen = false } = {}) {
   window.ReactNativeWebView = {
     postMessage(raw) {
       const message = JSON.parse(raw);
+      // Fork Movix : le runtime relaie aussi les `console.*` du WebView vers la
+      // console de debug native. Ce bruit n'a rien à voir avec le proxy média.
+      if (message.type === 'CONSOLE_LOG') return;
       posted.push(message);
       queueMicrotask(() => {
         if (message.type === 'GM_OPEN_MEDIA_PROXY') {

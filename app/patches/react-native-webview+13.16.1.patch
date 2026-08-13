@@ -2,7 +2,7 @@ diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactna
 index 80c6803..f70b87d 100644
 --- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
 +++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
-@@ -253,7 +253,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+@@ -253,7 +253,11 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
              this.bridgeListener = new WebViewCompat.WebMessageListener() {
                @Override
                public void onPostMessage(@NonNull WebView view, @NonNull WebMessageCompat message, @NonNull Uri sourceOrigin, boolean isMainFrame, @NonNull JavaScriptReplyProxy replyProxy) {

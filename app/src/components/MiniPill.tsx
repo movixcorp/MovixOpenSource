@@ -1,6 +1,5 @@
 import React from 'react';
 import { StyleSheet, TouchableOpacity, View } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type Props = {
   onPress: () => void;
@@ -12,14 +11,14 @@ type Props = {
  * the bars back on. Rendered as position:absolute in BrowserScreen.
  */
 export default function MiniPill({ onPress }: Props) {
-  const insets = useSafeAreaInsets();
   return (
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.6}
       accessibilityRole="button"
       accessibilityLabel="Ouvrir les réglages"
-      style={[styles.wrapper, { bottom: insets.bottom + 8 }]}>
+      hitSlop={{ top: 12, bottom: 12, left: 24, right: 24 }}
+      style={styles.wrapper}>
       <View style={styles.pill} />
     </TouchableOpacity>
   );
@@ -28,16 +27,18 @@ export default function MiniPill({ onPress }: Props) {
 const styles = StyleSheet.create({
   wrapper: {
     position: 'absolute',
+    bottom: 0,
     alignSelf: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 9,
+    paddingHorizontal: 14,
+    paddingTop: 6,
+    paddingBottom: 3,
     zIndex: 5,
     elevation: 5,
   },
   pill: {
-    width: 40,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: '#333333',
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#3a3a3a',
   },
 });

@@ -7,7 +7,7 @@
  */
 
 import { type RefObject } from 'react';
-import { NativeModules } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   type CastLoadMetadata,
@@ -43,6 +43,22 @@ import {
 /** Minimal interface required by the shim helpers — satisfied by both WebView and WebViewBrowserRef. */
 interface InjectableRef {
   injectJavaScript: (script: string) => void;
+}
+
+/**
+ * Console de debug : le bridge ne dépend pas directement de `./debugLog`.
+ * L'app enregistre un puits de logs au démarrage (voir `App.tsx`) ; sans
+ * enregistrement, les messages `CONSOLE_LOG` du WebView sont simplement
+ * ignorés. Cette indirection garde `bridge.ts` sans dépendance supplémentaire,
+ * ce qui permet aux tests amont de le charger tel quel.
+ */
+export type BridgeLogLevel = 'log' | 'info' | 'warn' | 'error';
+type BridgeLogSink = (level: BridgeLogLevel, args: unknown[]) => void;
+
+let webViewLogSink: BridgeLogSink | null = null;
+
+export function setWebViewLogSink(sink: BridgeLogSink | null): void {
+  webViewLogSink = sink;
 }
 
 type CastShimRequest =
@@ -969,6 +985,8 @@ export type BridgeMessageContext = {
   sourceUrl: string;
   trustedOrigins: readonly string[];
   isTopFrame: boolean;
+  /** Relais de l'état lecture/pause publié par le script Media Session. */
+  onMediaPlayback?: (playing: boolean) => void;
 };
 
 export function isTrustedMovixBridgeUrl(
@@ -1074,6 +1092,21 @@ export async function handleBridgeMessage(
         return;
       }
       await handleCastShimMessage(parsed as CastShimRequest, webViewRef);
+      return;
+    }
+    // Logs du WebView relayés vers la console de debug.
+    if (p.type === 'CONSOLE_LOG') {
+      const level = (p.level as BridgeLogLevel) || 'log';
+      const args = Array.isArray(p.args) ? (p.args as unknown[]) : [];
+      webViewLogSink?.(level, args);
+      return;
+    }
+    // État de lecture publié par le script Media Session (jaquette écran
+    // verrouillé + auto-PiP iOS). Le PiP Android, lui, est piloté par le shim
+    // `picture-in-picture-shim` et `PictureInPictureController` côté natif.
+    if (p.type === 'MEDIA_PLAYBACK') {
+      const playing = p.playing === true;
+      context?.onMediaPlayback?.(playing);
       return;
     }
   }

@@ -12,8 +12,16 @@ import UpdateScreen from './screens/UpdateScreen';
 import UpdateDialog from './components/UpdateDialog';
 import { useAppUpdate } from './hooks/useAppUpdate';
 import { AddressProvider, useAddress } from './context/AddressContext';
+import { installConsoleCapture, pushLog } from './services/debugLog';
+import { setWebViewLogSink } from './services/bridge';
 
 const { DnsModule } = NativeModules;
+
+// Capture les `console.*` dès le chargement du module pour la console de debug.
+installConsoleCapture();
+// Le bridge relaie les `console.*` du WebView sans dépendre de `debugLog` :
+// on branche ici le puits de logs.
+setWebViewLogSink((level, args) => pushLog(level, 'web', args));
 
 function promptDns() {
   Alert.alert(

@@ -35,6 +35,10 @@ async function loadInjectedJavaScriptBuilder() {
     if (id === './playback-awake-shim') return { buildPlaybackAwakeShim: () => 'PLAYBACK_AWAKE_SHIM' };
     if (id === './bridge-runtime') return { buildBridgeRuntime: () => 'BRIDGE_RUNTIME' };
     if (id === './userscript-source') return { USERSCRIPT_SOURCE: 'USERSCRIPT_SOURCE' };
+    // Fork Movix : `inject.ts` conditionne le cast shim à la plateforme et
+    // injecte en plus le pont Media Session (jaquette écran verrouillé).
+    if (id === 'react-native') return { Platform: { OS: 'android' } };
+    if (id === './media-session') return { buildMediaSession: () => 'MEDIA_SESSION' };
     throw new Error(`Unexpected injection dependency: ${id}`);
   };
   vm.runInNewContext(`(function(require,module,exports){${output}\n})`, {})(require, module, module.exports);

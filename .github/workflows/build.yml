@@ -1,0 +1,185 @@
+name: Build Applications
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ios:
+        description: 'Build iOS IPA (unsigned)'
+        type: boolean
+        default: true
+      build_android:
+        description: 'Build Android APK'
+        type: boolean
+        default: true
+
+jobs:
+  build_ios:
+    name: Build iOS IPA (unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    if: ${{ inputs.build_ios }}
+
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: ⬇️ • Checkout
+        uses: actions/checkout@v4
+
+      - name: 📀 • Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 💾 • Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: node-modules-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: |
+            node-modules-
+
+      - name: 🗂️ • Install Node Dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: 📝 • Generate userscript source
+        run: npm run build:userscript
+
+      - name: 💎 • Setup Ruby & CocoaPods 1.16.2
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: 🛠️ • Install xcpretty
+        run: gem install xcpretty --no-document
+
+      - name: 💾 • Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/ios/Pods
+            ~/.cocoapods
+          key: pods-${{ hashFiles('app/ios/Podfile.lock') }}
+          restore-keys: |
+            pods-
+
+      - name: 🍫 • Install CocoaPods
+        run: |
+          gem install cocoapods -v 1.16.2 --no-document
+          cd ios && pod install
+
+      - name: 📖 • Read app version
+        id: version
+        run: echo "version=$(jq -r '.version' version.json)" >> "$GITHUB_OUTPUT"
+
+      - name: 🏗️ • Build iOS Release
+        run: |
+          set -eo pipefail
+          cd ios
+          xcodebuild \
+            -workspace MovixApp.xcworkspace \
+            -scheme MovixApp \
+            -configuration Release \
+            -destination generic/platform=iOS \
+            -derivedDataPath ./build \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            2>&1 | tee /tmp/xcodebuild.log | xcpretty --color
+          exit ${PIPESTATUS[0]}
+
+      - name: 📋 • Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: /tmp/xcodebuild.log
+          retention-days: 7
+
+      - name: 📦 • Package IPA
+        run: |
+          cd ios
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/MovixApp.app Payload/
+          zip -r MovixApp-${{ steps.version.outputs.version }}.ipa Payload
+          mv MovixApp-${{ steps.version.outputs.version }}.ipa build/
+          rm -rf Payload
+
+      - name: 🌍 • Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Movix-iOS-${{ steps.version.outputs.version }}
+          path: app/ios/build/MovixApp-${{ steps.version.outputs.version }}.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+  build_android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ inputs.build_android }}
+
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: ⬇️ • Checkout
+        uses: actions/checkout@v4
+
+      - name: 📀 • Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: ☕ • Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 💾 • Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: node-modules-android-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: |
+            node-modules-android-
+
+      - name: 🗂️ • Install Node Dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: 📝 • Generate userscript source
+        run: npm run build:userscript
+
+      - name: 💾 • Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('app/android/gradle/wrapper/gradle-wrapper.properties', 'app/android/build.gradle', 'app/android/app/build.gradle') }}
+          restore-keys: |
+            gradle-
+
+      - name: 📖 • Read app version
+        id: version
+        run: echo "version=$(jq -r '.version' version.json)" >> "$GITHUB_OUTPUT"
+
+      - name: 🤖 • Build Android APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: 🌍 • Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Movix-Android-${{ steps.version.outputs.version }}
+          path: app/android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+          if-no-files-found: error

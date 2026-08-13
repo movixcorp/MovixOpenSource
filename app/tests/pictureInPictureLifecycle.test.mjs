@@ -57,7 +57,11 @@ test('BrowserScreen hides toolbar pill and inset while PiP is active', async () 
   assert.match(source, /onPictureInPictureModeChange/);
   assert.match(source, /!isPictureInPictureActive && !toolbarHidden/);
   assert.match(source, /!isPictureInPictureActive && navBarHidden/);
-  assert.match(source, /isPictureInPictureActive \? 0 : insets\.top/);
+  // Fork Movix : le padding est piloté par `immersive`, qui regroupe le PiP
+  // Android et la lecture plein écran iOS (cf. définition juste au-dessus du
+  // rendu). `isPictureInPictureActive` en reste l'un des deux déclencheurs.
+  assert.match(source, /const immersive =[\s\S]*?isPictureInPictureActive;/);
+  assert.match(source, /immersive \? 0 : insets\.top/);
 });
 
 test('BrowserScreen closes and gates settings while PiP presentation is active', async () => {

@@ -5,9 +5,11 @@ import {
   StyleSheet,
   BackHandler,
   Platform,
+  StatusBar,
   Modal,
   TouchableOpacity,
-  ActivityIndicator,
+  Image,
+  Animated,
   AppState,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -27,6 +29,7 @@ import SettingsScreen from './SettingsScreen';
 export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
 
@@ -46,6 +49,8 @@ export default function BrowserScreen() {
   const [currentUrl, setCurrentUrl] = useState('');
   const [dnsEnabled, setDnsEnabled] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
+  const [webViewReady, setWebViewReady] = useState(false);
+  const splashFade = useRef(new Animated.Value(1)).current;
   const [isPictureInPictureActive, setIsPictureInPictureActive] = useState(false);
 
   const activeUrl = urlChain[mirrorIndex] ?? '';
@@ -95,6 +100,25 @@ export default function BrowserScreen() {
     setIsPictureInPictureActive(active);
   }, []);
 
+  const onMediaPlayback = useCallback((playing: boolean) => {
+    setIsVideoPlaying(playing);
+  }, []);
+
+  // iOS : barre de statut et toolbar masquées pendant la lecture vidéo.
+  // UIViewControllerBasedStatusBarAppearance = false → StatusBar.setHidden
+  // est global et fonctionne même en mode plein-écran WebView.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+    StatusBar.setHidden(isVideoPlaying && !settingsVisible, 'slide');
+  }, [isVideoPlaying, settingsVisible]);
+
+  // Restaure la barre de statut en quittant l'écran.
+  useEffect(() => {
+    return () => {
+      if (Platform.OS === 'ios') StatusBar.setHidden(false, 'none');
+    };
+  }, []);
+
   const onNavigationStateChange = useCallback((state: WebViewNavigation) => {
     setCanGoBack(state.canGoBack);
     setCanGoForward(state.canGoForward);
@@ -114,6 +138,15 @@ export default function BrowserScreen() {
     [activeUrl, mirrorIndex, urlChain.length],
   );
 
+  const onWebViewLoadEnd = useCallback(() => {
+    if (webViewReady) return;
+    Animated.timing(splashFade, {
+      toValue: 0,
+      duration: 400,
+      useNativeDriver: true,
+    }).start(() => setWebViewReady(true));
+  }, [webViewReady, splashFade]);
+
   const closeSettings = useCallback(() => {
     setSettingsVisible(false);
     AsyncStorage.getItem('dns_enabled').then(val => {
@@ -124,39 +157,46 @@ export default function BrowserScreen() {
   const onRetry = useCallback(async () => {
     setAllMirrorsFailed(false);
     setMirrorIndex(0);
+    setWebViewReady(false);
+    splashFade.setValue(1);
     await refresh();
-  }, [refresh]);
+  }, [refresh, splashFade]);
 
-  if (isLoading || !config) {
-    return (
-      <View style={[styles.container, styles.centered, { paddingTop: insets.top }]}>
-        <ActivityIndicator size="large" color="#8b5cf6" />
-      </View>
-    );
-  }
+  const showWebView = !isLoading && !!config && !allMirrorsFailed;
+  const showSplash = (!webViewReady || isLoading || !config) && !allMirrorsFailed;
 
-  if (allMirrorsFailed) {
-    return (
-      <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
-    );
-  }
+  // Mode immersif : pas de toolbar, pas de paddingTop (vidéo bord à bord).
+  // iOS : pendant la lecture vidéo. Android : pendant le Picture-in-Picture
+  // (la fenêtre flottante ne doit afficher que la WebView, sans la barre de
+  // paramètres ni le padding de status bar).
+  const immersive =
+    (Platform.OS === 'ios' && isVideoPlaying && !settingsVisible) ||
+    isPictureInPictureActive;
 
   return (
-    <View style={[styles.container, {
-      paddingTop: isPictureInPictureActive ? 0 : insets.top,
-    }]}>
-      <View style={styles.webViewContainer}>
-        <WebViewBrowser
-          key={activeUrl}
-          ref={webViewRef}
-          url={activeUrl}
-          onNavigationStateChange={onNavigationStateChange}
-          onError={onWebViewError}
-          onPictureInPictureModeChange={onPictureInPictureModeChange}
-        />
-      </View>
+    <View style={[styles.container, { paddingTop: immersive ? 0 : insets.top }]}>
+      {showWebView && (
+        <View style={styles.webViewContainer}>
+          <WebViewBrowser
+            key={`${activeUrl}:${uiPrefs.proxyEnabled ? 'proxy' : 'direct'}:${uiPrefs.castMode}`}
+            ref={webViewRef}
+            url={activeUrl}
+            proxyEnabled={uiPrefs.proxyEnabled}
+            castMode={uiPrefs.castMode}
+            onNavigationStateChange={onNavigationStateChange}
+            onError={onWebViewError}
+            onLoadEnd={onWebViewLoadEnd}
+            onMediaPlayback={onMediaPlayback}
+            onPictureInPictureModeChange={onPictureInPictureModeChange}
+          />
+        </View>
+      )}
 
-      {!isPictureInPictureActive && !toolbarHidden && (
+      {allMirrorsFailed && config && (
+        <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
+      )}
+
+      {!isPictureInPictureActive && !toolbarHidden && showWebView && !immersive && (
         <View style={{ paddingBottom: insets.bottom }}>
           <BrowserToolbar
             canGoBack={canGoBack}
@@ -175,24 +215,38 @@ export default function BrowserScreen() {
         </View>
       )}
 
-      <Modal
-        visible={!isPictureInPictureActive && settingsVisible}
-        animationType="slide"
-        onRequestClose={closeSettings}>
-        <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
-          <View style={styles.modalHeader}>
-            <TouchableOpacity onPress={closeSettings} style={styles.closeButton}>
-              <Text style={styles.closeText}>Fermer</Text>
-            </TouchableOpacity>
-            <Text style={styles.modalTitle}>Paramètres</Text>
-            <View style={styles.closeButton} />
+      {showWebView && (
+        <Modal
+          visible={!isPictureInPictureActive && settingsVisible}
+          animationType="slide"
+          onRequestClose={closeSettings}>
+          <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity onPress={closeSettings} style={styles.closeButton}>
+                <Text style={styles.closeText}>Fermer</Text>
+              </TouchableOpacity>
+              <Text style={styles.modalTitle}>Paramètres</Text>
+              <View style={styles.closeButton} />
+            </View>
+            <SettingsScreen />
           </View>
-          <SettingsScreen />
-        </View>
-      </Modal>
+        </Modal>
+      )}
 
-      {!isPictureInPictureActive && navBarHidden && (
+      {!isPictureInPictureActive && navBarHidden && showWebView && !immersive && (
         <MiniPill onPress={() => setSettingsVisible(true)} />
+      )}
+
+      {showSplash && (
+        <Animated.View
+          style={[StyleSheet.absoluteFillObject, styles.splash, { opacity: splashFade }]}
+          pointerEvents="none">
+          <Image
+            source={require('../../assets/movix512.png')}
+            style={styles.splashLogo}
+            resizeMode="contain"
+          />
+        </Animated.View>
       )}
     </View>
   );
@@ -202,10 +256,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0a0a0a',
-  },
-  centered: {
-    justifyContent: 'center',
-    alignItems: 'center',
   },
   webViewContainer: {
     flex: 1,
@@ -236,5 +286,14 @@ const styles = StyleSheet.create({
     color: '#8b5cf6',
     fontSize: 15,
     fontWeight: '500',
+  },
+  splash: {
+    backgroundColor: '#B5302C',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  splashLogo: {
+    width: 150,
+    height: 150,
   },
 });

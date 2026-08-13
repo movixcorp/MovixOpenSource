@@ -12,6 +12,7 @@ import {
   IconClose,
   IconForward,
   IconHome,
+  IconLock,
   IconRefresh,
   IconSettings,
 } from './icons/ToolbarIcons';
@@ -61,7 +62,7 @@ export default function BrowserToolbar({
           {loading ? (
             <ActivityIndicator size="small" color="#8b5cf6" style={styles.loadingIndicator} />
           ) : (
-            <Text style={styles.lockIcon}>🔒</Text>
+            <IconLock size={14} color="#a0a0a0" />
           )}
           <Text style={styles.urlText} numberOfLines={1}>
             {domain}
@@ -132,10 +133,6 @@ const styles = StyleSheet.create({
     marginRight: 6,
   },
   loadingIndicator: {
-    marginRight: 6,
-  },
-  lockIcon: {
-    fontSize: 12,
     marginRight: 6,
   },
   urlText: {

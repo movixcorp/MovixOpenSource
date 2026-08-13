@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
-import { DeviceEventEmitter } from 'react-native';
+import { DeviceEventEmitter, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export type CastMode = 'airplay' | 'chromecast';
 
 export type BrowserUIPrefs = {
   showUrlBar: boolean;
   showNavBar: boolean;
+  proxyEnabled: boolean;
+  castMode: CastMode;
 };
 
 const STORAGE_KEY = 'browser_ui_prefs';
@@ -14,11 +18,15 @@ type StoredShape = {
   version: 1;
   showUrlBar: boolean;
   showNavBar: boolean;
+  proxyEnabled: boolean;
+  castMode?: CastMode;
 };
 
 const defaults: BrowserUIPrefs = {
   showUrlBar: true,
   showNavBar: true,
+  proxyEnabled: true,
+  castMode: 'airplay',
 };
 
 function parseStored(raw: string | null): BrowserUIPrefs {
@@ -29,6 +37,9 @@ function parseStored(raw: string | null): BrowserUIPrefs {
       return {
         showUrlBar: typeof parsed.showUrlBar === 'boolean' ? parsed.showUrlBar : true,
         showNavBar: typeof parsed.showNavBar === 'boolean' ? parsed.showNavBar : true,
+        proxyEnabled:
+          typeof parsed.proxyEnabled === 'boolean' ? parsed.proxyEnabled : true,
+        castMode: parsed.castMode === 'chromecast' ? 'chromecast' : 'airplay',
       };
     }
   } catch (err) {
@@ -42,6 +53,8 @@ async function persist(next: BrowserUIPrefs): Promise<void> {
     version: 1,
     showUrlBar: next.showUrlBar,
     showNavBar: next.showNavBar,
+    proxyEnabled: next.proxyEnabled,
+    castMode: next.castMode,
   };
   try {
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -59,6 +72,8 @@ export function useBrowserUIPrefs(): {
   prefs: BrowserUIPrefs;
   setShowUrlBar: (v: boolean) => void;
   setShowNavBar: (v: boolean) => void;
+  setProxyEnabled: (v: boolean) => void;
+  setCastMode: (v: CastMode) => void;
 } {
   const [prefs, setPrefs] = useState<BrowserUIPrefs>(defaults);
 
@@ -99,5 +114,20 @@ export function useBrowserUIPrefs(): {
     [apply, prefs],
   );
 
-  return { prefs, setShowUrlBar, setShowNavBar };
+  const setProxyEnabled = useCallback(
+    (v: boolean) => {
+      apply({ ...prefs, proxyEnabled: v });
+    },
+    [apply, prefs],
+  );
+
+  const setCastMode = useCallback(
+    (v: CastMode) => {
+      if (Platform.OS !== 'ios') return;
+      apply({ ...prefs, castMode: v });
+    },
+    [apply, prefs],
+  );
+
+  return { prefs, setShowUrlBar, setShowNavBar, setProxyEnabled, setCastMode };
 }
