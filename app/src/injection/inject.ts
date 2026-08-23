@@ -12,6 +12,7 @@ export function buildInjectedJavaScript(
     pictureInPictureMode?: PictureInPictureShimMode;
     mediaProxyRoutingEnabled?: boolean;
     mediaProxyCapabilityEnabled?: boolean;
+    mediaProxyXhrRoutingEnabled?: boolean;
   } = {},
 ): string {
   const castShim = buildCastShim();
@@ -22,6 +23,7 @@ export function buildInjectedJavaScript(
   const bridge = buildBridgeRuntime({
     mediaProxyRoutingEnabled: options.mediaProxyRoutingEnabled,
     mediaProxyCapabilityEnabled: options.mediaProxyCapabilityEnabled,
+    mediaProxyXhrRoutingEnabled: options.mediaProxyXhrRoutingEnabled,
   });
 
   // Cast shim FIRST — must be on window before any page JS runs.

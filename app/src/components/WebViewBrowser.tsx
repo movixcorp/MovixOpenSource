@@ -64,6 +64,12 @@ const injectedJS = buildInjectedJavaScript({
   mediaProxyRoutingEnabled:
     Platform.OS === 'android' || Platform.OS === 'ios',
   mediaProxyCapabilityEnabled: Platform.OS === 'ios',
+  // WebKit bloque `http://127.0.0.1` comme contenu mixte depuis une page https,
+  // là où Chromium exempte la boucle locale. Router les segments HLS par le
+  // proxy local ne peut donc qu'échouer sur iOS : chaque requête payait deux
+  // allers-retours de pont avant de retomber sur GM_FETCH. Le handoff natif
+  // (`GM_openMediaProxy`) reste actif, lui ne passe pas par le moteur web.
+  mediaProxyXhrRoutingEnabled: Platform.OS === 'android',
 });
 
 function isUsableHttpUrl(value: unknown): value is string {

@@ -60,7 +60,12 @@ test('iOS project uses the canonical Movix identity', async () => {
   assert.doesNotMatch(scheme, /MovixApp/);
   assert.match(info, /<key>CFBundleShortVersionString<\/key>\s*<string>\$\(MARKETING_VERSION\)<\/string>/);
   assert.match(info, /<key>CFBundleVersion<\/key>\s*<string>\$\(CURRENT_PROJECT_VERSION\)<\/string>/);
-  assert.match(info, /<key>NSAllowsArbitraryLoads<\/key>\s*<false\/>/);
+  // ATS s'applique aux requêtes natives (fetch React Native du pont GM_FETCH,
+  // vérification de mise à jour), pas seulement au WebView. Les hébergeurs de
+  // flux servis par le proxy Movix n'ont aucune garantie TLS 1.2 + forward
+  // secrecy : sans cette dérogation, iOS coupait ces requêtes alors qu'Android,
+  // sans équivalent d'ATS, les laissait passer. La parité l'exige.
+  assert.match(info, /<key>NSAllowsArbitraryLoads<\/key>\s*<true\/>/);
   assert.match(info, /<key>NSAllowsArbitraryLoadsInWebContent<\/key>\s*<true\/>/);
   assert.match(info, /<key>NSAllowsLocalNetworking<\/key>\s*<true\/>/);
   assert.match(info, /<key>NSLocalNetworkUsageDescription<\/key>\s*<string>[^<]+<\/string>/);

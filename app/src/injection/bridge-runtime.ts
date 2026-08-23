@@ -12,11 +12,22 @@ export function buildBridgeRuntime(
   options: {
     mediaProxyRoutingEnabled?: boolean;
     mediaProxyCapabilityEnabled?: boolean;
+    mediaProxyXhrRoutingEnabled?: boolean;
   } = {},
 ): string {
   const mediaProxyRoutingEnabled = options.mediaProxyRoutingEnabled !== false;
   const mediaProxyCapabilityEnabled =
     mediaProxyRoutingEnabled && options.mediaProxyCapabilityEnabled === true;
+  // WebKit refuse toute sous-requête `http://127.0.0.1` depuis une page https :
+  // contrairement à Chromium, il n'applique pas l'exemption « loopback est une
+  // origine digne de confiance » du Mixed Content (bugs WebKit 171934 / 218627,
+  // toujours ouverts, et aucune dérogation ATS ne s'y substitue). Sur iOS, faire
+  // passer les segments par la boucle locale échoue donc systématiquement et
+  // coûte deux allers-retours de pont par requête avant de retomber sur
+  // GM_FETCH. Le handoff natif (`GM_openMediaProxy` -> AVPlayer, Cast) reste lui
+  // valable : il ne transite jamais par le moteur web.
+  const mediaProxyXhrRoutingEnabled =
+    mediaProxyRoutingEnabled && options.mediaProxyXhrRoutingEnabled !== false;
   return `
 (function() {
   'use strict';
@@ -33,6 +44,7 @@ export function buildBridgeRuntime(
   var _mediaEntryPath = new RegExp(${JSON.stringify(MEDIA_ENTRY_PATH_SOURCE)}, 'i');
   var _mediaProxyRoutingEnabled = ${mediaProxyRoutingEnabled};
   var _mediaProxyCapabilityEnabled = ${mediaProxyCapabilityEnabled};
+  var _mediaProxyXhrRoutingEnabled = ${mediaProxyXhrRoutingEnabled};
   var _mediaProxyCapability = null;
   var _mediaProxyGeneration = null;
 
@@ -292,7 +304,7 @@ export function buildBridgeRuntime(
   }
 
   function GM_xmlhttpRequest(details) {
-    if (!_mediaProxyRoutingEnabled || !isLocalMediaProxyCandidate(details)) {
+    if (!_mediaProxyXhrRoutingEnabled || !isLocalMediaProxyCandidate(details)) {
       return sendBridgeRequest(details);
     }
 

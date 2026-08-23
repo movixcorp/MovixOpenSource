@@ -238,9 +238,15 @@ test('injection keeps proxy routing separate from explicit Android/iOS-v1 PiP mo
   assert.match(webView, /topLevelUrl:\s*topLevelUrlRef\.current/);
   assert.match(webView, /navigationGeneration:\s*navigationGenerationRef\.current/);
   assert.match(webView, /navigationGenerationRef\.current \+= 1;[\s\S]*?clearBridgeCapabilities\(webViewRef\)/);
+  // WebKit bloque `http://127.0.0.1` comme contenu mixte depuis une page https :
+  // la boucle locale ne peut servir que le handoff natif sur iOS, jamais les
+  // requêtes XHR/fetch de la page.
+  assert.match(webView, /mediaProxyXhrRoutingEnabled:\s*Platform\.OS === 'android'/);
   assert.match(inject, /mediaProxyRoutingEnabled\?: boolean/);
   assert.match(inject, /mediaProxyCapabilityEnabled\?: boolean/);
+  assert.match(inject, /mediaProxyXhrRoutingEnabled\?: boolean/);
   assert.match(inject, /buildBridgeRuntime\(\{[\s\S]*?mediaProxyRoutingEnabled:[\s\S]*?mediaProxyCapabilityEnabled:/);
+  assert.match(runtime, /if \(!_mediaProxyXhrRoutingEnabled \|\| !isLocalMediaProxyCandidate\(details\)\)/);
   assert.match(runtime, /GM_MEDIA_PROXY_REGISTER_CAPABILITY/);
   assert.match(runtime, /crypto\.getRandomValues/);
   assert.match(runtime, /capability:[^,\n]+,[\s\S]*?generation:/);
