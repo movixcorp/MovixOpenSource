@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
+  AppState,
   View,
   Text,
   Switch,
@@ -51,27 +52,41 @@ export default function SettingsScreen() {
       });
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      let active = false;
-      if (DnsModule) {
-        try {
-          active = await DnsModule.isEnabled();
-        } catch {}
-      }
-      if (active) {
+  const refreshDnsState = useCallback(async () => {
+    let active = false;
+    if (DnsModule) {
+      try {
+        active = await DnsModule.isEnabled();
+      } catch {}
+    }
+    if (active) {
+      setDnsEnabled(true);
+      setDnsStatus('active');
+      await AsyncStorage.setItem('dns_enabled', 'true');
+      return;
+    }
+    const val = await AsyncStorage.getItem('dns_enabled');
+    if (Platform.OS === 'android' && val === 'true') {
         setDnsEnabled(true);
         setDnsStatus('active');
-        await AsyncStorage.setItem('dns_enabled', 'true');
         return;
-      }
-      const val = await AsyncStorage.getItem('dns_enabled');
-      if (val === 'true') {
-        setDnsEnabled(true);
-        setDnsStatus('active');
-      }
-    })();
+    }
+    if (val === 'true') {
+      await AsyncStorage.setItem('dns_enabled', 'false');
+    }
+    setDnsEnabled(false);
+    setDnsStatus('off');
   }, []);
+
+  useEffect(() => {
+    void refreshDnsState();
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        void refreshDnsState();
+      }
+    });
+    return () => subscription.remove();
+  }, [refreshDnsState]);
 
   useEffect(() => {
     AsyncStorage.getItem('movix_extraction_prefs').then((raw) => {
@@ -111,7 +126,18 @@ export default function SettingsScreen() {
     if (value) {
       setDnsStatus('connecting');
       try {
-        await DnsModule.enable(CONFIG.DNS_PRIMARY, CONFIG.DNS_SECONDARY);
+        const dnsActivated = await DnsModule.enable(CONFIG.DNS_PRIMARY, CONFIG.DNS_SECONDARY);
+        if (Platform.OS === 'ios' && !dnsActivated) {
+          setDnsStatus('off');
+          setDnsEnabled(false);
+          await AsyncStorage.setItem('dns_enabled', 'false');
+          Alert.alert(
+            'Activation DNS requise',
+            'La configuration est installée. Active-la manuellement dans Réglages > Général > VPN et gestion de l’appareil > DNS.',
+            [{ text: 'Compris' }],
+          );
+          return;
+        }
         setDnsStatus('active');
         await AsyncStorage.setItem('dns_enabled', 'true');
       } catch (err: any) {

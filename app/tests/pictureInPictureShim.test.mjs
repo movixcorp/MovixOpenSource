@@ -31,7 +31,7 @@ async function loadInjectedJavaScriptBuilder() {
   const module = { exports: {} };
   const require = id => {
     if (id === './cast-shim') return { buildCastShim: () => 'CAST_SHIM' };
-    if (id === './picture-in-picture-shim') return { buildPictureInPictureShim: enabled => enabled ? 'PIP_SHIM' : 'PIP_DISABLED' };
+    if (id === './picture-in-picture-shim') return { buildPictureInPictureShim: mode => mode === 'android' ? 'PIP_SHIM' : 'PIP_DISABLED' };
     if (id === './playback-awake-shim') return { buildPlaybackAwakeShim: () => 'PLAYBACK_AWAKE_SHIM' };
     if (id === './bridge-runtime') return { buildBridgeRuntime: () => 'BRIDGE_RUNTIME' };
     if (id === './userscript-source') return { USERSCRIPT_SOURCE: 'USERSCRIPT_SOURCE' };
@@ -117,7 +117,7 @@ class HTMLVideoElement extends FakeElement {
   }
 }
 
-async function createHarness(enabled, environment = {}) {
+async function createHarness(mode, environment = {}) {
   const { buildPictureInPictureShim } = await loadPictureInPictureShimBuilder();
   class HarnessVideoElement extends FakeElement {
     constructor() {
@@ -161,7 +161,7 @@ async function createHarness(enabled, environment = {}) {
   document.body = body;
   document.createElement = tagName => new FakeElement(tagName);
   document.querySelectorAll = selector => selector === 'video' ? [video, otherVideo] : [];
-  window.ReactNativeWebView = enabled && !environment.missingNativeWebView ? {
+  window.ReactNativeWebView = mode !== 'disabled' && !environment.missingNativeWebView ? {
     postMessage(raw) {
       posted.push(JSON.parse(raw));
     },
@@ -189,7 +189,7 @@ async function createHarness(enabled, environment = {}) {
     setTimeout,
     window,
   };
-  vm.runInNewContext(buildPictureInPictureShim(enabled), context);
+  vm.runInNewContext(buildPictureInPictureShim(mode), context);
   let enterEvents = 0;
   let leaveEvents = 0;
   video.addEventListener('enterpictureinpicture', () => { enterEvents += 1; });
@@ -214,7 +214,7 @@ async function createHarness(enabled, environment = {}) {
 }
 
 test('unsupported runtime leaves PiP globals untouched', async () => {
-  const h = await createHarness(false);
+  const h = await createHarness('disabled');
   assert.equal(h.document.pictureInPictureEnabled, undefined);
   assert.equal(h.video.requestPictureInPicture, undefined);
   assert.deepEqual(h.posted, []);
@@ -227,7 +227,7 @@ test('missing native capabilities leave PiP globals untouched', async () => {
     { throwingCrypto: true },
     { missingHtmlVideoElement: true },
   ]) {
-    const h = await createHarness(true, environment);
+    const h = await createHarness('android', environment);
     assert.equal(h.document.pictureInPictureEnabled, undefined);
     assert.equal(h.video.requestPictureInPicture, undefined);
     assert.deepEqual(h.posted, []);
@@ -236,14 +236,14 @@ test('missing native capabilities leave PiP globals untouched', async () => {
 
 test('injected runtime preserves Cast-first PiP and playback ordering', async () => {
   const { buildInjectedJavaScript } = await loadInjectedJavaScriptBuilder();
-  const script = buildInjectedJavaScript({ pictureInPictureEnabled: true });
+  const script = buildInjectedJavaScript({ pictureInPictureMode: 'android' });
   const order = ['CAST_SHIM', 'PIP_SHIM', 'PLAYBACK_AWAKE_SHIM', 'BRIDGE_RUNTIME', 'USERSCRIPT_SOURCE']
     .map(marker => script.indexOf(marker));
   assert.equal(order.every((position, index) => index === 0 || position > order[index - 1]), true);
 });
 
 test('supported runtime registers and resolves a matching request', async () => {
-  const h = await createHarness(true);
+  const h = await createHarness('android');
   assert.equal(h.document.pictureInPictureEnabled, true);
   const registration = h.posted.find(message => message.type === 'PIPSHIM_REGISTER_CAPABILITY');
   assert.match(registration.capability, /^[a-f0-9]{32}$/);
@@ -260,7 +260,7 @@ test('supported runtime registers and resolves a matching request', async () => 
 });
 
 test('native prepare and state isolate then restore the selected video', async () => {
-  const h = await createHarness(true);
+  const h = await createHarness('android');
   const promise = h.video.requestPictureInPicture();
   const request = h.posted.find(message => message.type === 'PIPSHIM_ENTER');
   h.dispatch({ kind: 'RESPONSE', id: request.id, ok: true, error: null });
@@ -283,7 +283,7 @@ test('native prepare and state isolate then restore the selected video', async (
 });
 
 test('wrong response IDs stay pending and matching errors reject with NotAllowedError', async () => {
-  const h = await createHarness(true);
+  const h = await createHarness('android');
   const promise = h.video.requestPictureInPicture();
   const request = h.posted.find(message => message.type === 'PIPSHIM_ENTER');
   h.dispatch({ kind: 'RESPONSE', id: 'pip-wrong-id', ok: true, error: null });
@@ -296,7 +296,7 @@ test('wrong response IDs stay pending and matching errors reject with NotAllowed
 });
 
 test('pagehide removes markers and rejects pending requests with AbortError', async () => {
-  const h = await createHarness(true);
+  const h = await createHarness('android');
   const committed = h.video.requestPictureInPicture();
   const request = h.posted.find(message => message.type === 'PIPSHIM_ENTER');
   h.dispatch({ kind: 'RESPONSE', id: request.id, ok: true, error: null });
@@ -315,7 +315,7 @@ test('pagehide removes markers and rejects pending requests with AbortError', as
 
 test('fallback and repeated lifecycle events retain markers only for the current video', async () => {
   for (const terminalEvent of ['inactive', 'error', 'pagehide']) {
-    const h = await createHarness(true);
+    const h = await createHarness('android');
     const promise = h.video.requestPictureInPicture();
     const request = h.posted.find(message => message.type === 'PIPSHIM_ENTER');
     h.dispatch({ kind: 'RESPONSE', id: request.id, ok: true, error: null });
@@ -354,7 +354,7 @@ test('fallback and repeated lifecycle events retain markers only for the current
 });
 
 test('native PiP actions control only the entered video and clamp seeks', async () => {
-  const h = await createHarness(true);
+  const h = await createHarness('android');
   const promise = h.video.requestPictureInPicture();
   const request = h.posted.find(message => message.type === 'PIPSHIM_ENTER');
   h.dispatch({ kind: 'RESPONSE', id: request.id, ok: true, error: null });
@@ -376,7 +376,7 @@ test('native PiP actions control only the entered video and clamp seeks', async 
 });
 
 test('native PiP toggle pauses and resumes the entered video', async () => {
-  const h = await createHarness(true);
+  const h = await createHarness('android');
   const promise = h.video.requestPictureInPicture();
   const request = h.posted.find(message => message.type === 'PIPSHIM_ENTER');
   h.dispatch({ kind: 'RESPONSE', id: request.id, ok: true, error: null });

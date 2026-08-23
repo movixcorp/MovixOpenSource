@@ -183,3 +183,35 @@ test('falls back to GM_FETCH when the native proxy is unavailable', async () => 
   ]);
   assert.deepEqual([...new Uint8Array(response.response)], [4, 5, 6]);
 });
+
+test('exposes a media proxy opener for userscript playback fallbacks', async () => {
+  const { buildBridgeRuntime } = await loadBridgeRuntimeBuilder();
+  const harness = createRuntimeHarness(buildBridgeRuntime);
+
+  assert.equal(typeof harness.window.GM_openMediaProxy, 'function');
+  const localUrl = await harness.window.GM_openMediaProxy({
+    url: 'https://hls08.cdnvideo11.shop/hls08/12905/Ep1_index.m3u8',
+    method: 'GET',
+    headers: {
+      Origin: 'https://kisskh.nl',
+      Referer: 'https://kisskh.nl/',
+    },
+  });
+
+  assert.equal(localUrl, 'http://127.0.0.1:28123/p/opaque-session');
+  assert.deepEqual(harness.posted.map(entry => entry.type), [
+    'GM_OPEN_MEDIA_PROXY',
+  ]);
+  const { id, ...openPayload } = harness.posted[0];
+  assert.equal(typeof id, 'string');
+  assert.deepEqual(openPayload, {
+    type: 'GM_OPEN_MEDIA_PROXY',
+    url: 'https://hls08.cdnvideo11.shop/hls08/12905/Ep1_index.m3u8',
+    method: 'GET',
+    headers: {
+      Origin: 'https://kisskh.nl',
+      Referer: 'https://kisskh.nl/',
+    },
+  });
+  assert.deepEqual(harness.nativeFetches, []);
+});

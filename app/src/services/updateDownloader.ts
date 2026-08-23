@@ -1,4 +1,4 @@
-import { NativeModules } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 
 type DownloadStatus =
   | 'pending'
@@ -31,9 +31,8 @@ type UpdateModuleType = {
   computeSha256(filePath: string): Promise<string>;
 };
 
-const { UpdateModule } = NativeModules as { UpdateModule?: UpdateModuleType };
-
 function ensureModule(): UpdateModuleType {
+  const { UpdateModule } = NativeModules as { UpdateModule?: UpdateModuleType };
   if (!UpdateModule) {
     throw new Error(
       '[updateDownloader] UpdateModule not registered — check MainApplication.getPackages()',
@@ -42,25 +41,33 @@ function ensureModule(): UpdateModuleType {
   return UpdateModule;
 }
 
+function unsupportedPlatform(operation: string): Error {
+  return new Error(`[updateDownloader] ${operation} is only available on Android`);
+}
+
 export async function enqueueDownload(
   url: string,
   fileName: string,
   title: string,
 ): Promise<EnqueueResult> {
+  if (Platform.OS !== 'android') throw unsupportedPlatform('enqueueDownload');
   return ensureModule().enqueueDownload(url, fileName, title);
 }
 
 export async function queryDownload(
   downloadId: number,
 ): Promise<DownloadProgress> {
+  if (Platform.OS !== 'android') throw unsupportedPlatform('queryDownload');
   return ensureModule().queryDownload(downloadId);
 }
 
 export async function cancelDownload(downloadId: number): Promise<boolean> {
+  if (Platform.OS !== 'android') throw unsupportedPlatform('cancelDownload');
   return ensureModule().cancelDownload(downloadId);
 }
 
 export async function computeSha256(filePath: string): Promise<string> {
+  if (Platform.OS !== 'android') throw unsupportedPlatform('computeSha256');
   return ensureModule().computeSha256(filePath);
 }
 
@@ -75,6 +82,7 @@ export async function pollUntilDone(
   shouldContinue: () => boolean,
   intervalMs = 500,
 ): Promise<DownloadProgress> {
+  if (Platform.OS !== 'android') throw unsupportedPlatform('pollUntilDone');
   while (shouldContinue()) {
     const progress = await queryDownload(downloadId);
     onTick(progress);

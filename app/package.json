@@ -10,6 +10,8 @@
     "clean:android": "cd android && ./gradlew clean && cd ..",
     "clean:ios": "cd ios && rm -rf Pods && pod install && cd ..",
     "build:userscript": "node scripts/build-userscript.js",
+    "test:ios-contract": "node --test tests/iosProjectContract.test.mjs",
+    "package:ios-unsigned": "bash scripts/package-unsigned-ios.sh",
     "prebuild": "node scripts/build-userscript.js",
     "postinstall": "patch-package"
   },

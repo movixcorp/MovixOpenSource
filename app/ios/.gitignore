@@ -1,8 +1,9 @@
-# OSX
 .DS_Store
-
-# Xcode
+.xcode.env.local
 build/
+DerivedData/
+Pods/
+xcuserdata/
 *.pbxuser
 !default.pbxuser
 *.mode1v3
@@ -11,78 +12,5 @@ build/
 !default.mode2v3
 *.perspectivev3
 !default.perspectivev3
-xcuserdata
-*.xccheckout
-*.moved-aside
-DerivedData
-*.hmap
-*.ipa
 *.xcuserstate
-ios/.xcode.env.local
-**/.xcode.env.local
-
-# Android / IntelliJ
-build/
-.idea/
-.gradle/
-local.properties
-*.iml
-*.hprof
-.cxx/
-*.keystore
-!debug.keystore
-*.jks
-
-# Android signing secrets (never commit)
-keystore.properties
-android/keystore.properties
-android/app/keystore.properties
-signing.properties
-release-signing.properties
-
-# node.js
-node_modules/
-npm-debug.log
-yarn-error.log
-yarn-debug.log
-
-# fastlane
-**/fastlane/report.xml
-**/fastlane/Preview.html
-**/fastlane/screenshots
-**/fastlane/test_output
-
-# Bundle artifact
-*.jsbundle
-
-# Ruby / CocoaPods
-/vendor/bundle/
-/ios/Pods/
-
-# Metro
-.metro-health-check*
-
-# Testing
-/coverage
-
-# Yarn
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/sdks
-!.yarn/versions
-
-# Environment
-.env
-.env.local
-.env.*.local
-
-# Generated userscript source (regenerated via `npm run build:userscript`)
-src/injection/userscript-source.ts
-
-# OS / editor
-Thumbs.db
-*.swp
-*.swo
-*.log
+Podfile.lock

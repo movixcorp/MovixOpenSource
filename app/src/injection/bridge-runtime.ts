@@ -8,7 +8,15 @@ import { MEDIA_ENTRY_PATH_SOURCE } from './mediaProxyRouting';
  * dans le WebView React Native.
  */
 
-export function buildBridgeRuntime(): string {
+export function buildBridgeRuntime(
+  options: {
+    mediaProxyRoutingEnabled?: boolean;
+    mediaProxyCapabilityEnabled?: boolean;
+  } = {},
+): string {
+  const mediaProxyRoutingEnabled = options.mediaProxyRoutingEnabled !== false;
+  const mediaProxyCapabilityEnabled =
+    mediaProxyRoutingEnabled && options.mediaProxyCapabilityEnabled === true;
   return `
 (function() {
   'use strict';
@@ -23,6 +31,39 @@ export function buildBridgeRuntime(): string {
   var _nativeWindowFetch =
     typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
   var _mediaEntryPath = new RegExp(${JSON.stringify(MEDIA_ENTRY_PATH_SOURCE)}, 'i');
+  var _mediaProxyRoutingEnabled = ${mediaProxyRoutingEnabled};
+  var _mediaProxyCapabilityEnabled = ${mediaProxyCapabilityEnabled};
+  var _mediaProxyCapability = null;
+  var _mediaProxyGeneration = null;
+
+  if (_mediaProxyCapabilityEnabled) {
+    try {
+      if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+        throw new Error('Secure randomness unavailable');
+      }
+      var capabilityBytes = new Uint8Array(16);
+      var generationBytes = new Uint8Array(16);
+      window.crypto.getRandomValues(capabilityBytes);
+      window.crypto.getRandomValues(generationBytes);
+      _mediaProxyCapability = Array.prototype.map.call(
+        capabilityBytes,
+        function(value) { return value.toString(16).padStart(2, '0'); }
+      ).join('');
+      _mediaProxyGeneration = Array.prototype.map.call(
+        generationBytes,
+        function(value) { return value.toString(16).padStart(2, '0'); }
+      ).join('');
+      if (
+        !/^[a-f0-9]{32}$/.test(_mediaProxyCapability)
+        || !/^[a-f0-9]{32}$/.test(_mediaProxyGeneration)
+      ) {
+        throw new Error('Invalid media proxy capability');
+      }
+    } catch (error) {
+      _mediaProxyCapability = null;
+      _mediaProxyGeneration = null;
+    }
+  }
 
   function generateId() {
     return 'req_' + (++_requestCounter) + '_' + Date.now();
@@ -30,8 +71,12 @@ export function buildBridgeRuntime(): string {
 
   function sendToNative(message) {
     if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
-      window.ReactNativeWebView.postMessage(JSON.stringify(message));
+      try {
+        window.ReactNativeWebView.postMessage(JSON.stringify(message));
+        return true;
+      } catch (error) {}
     }
+    return false;
   }
 
   // Réception des réponses du bridge React Native
@@ -60,6 +105,36 @@ export function buildBridgeRuntime(): string {
         }
       }, 60000);
     });
+  }
+
+  function requestLocalMediaProxy(details) {
+    var message = {
+      type: 'GM_OPEN_MEDIA_PROXY',
+      url: details.url,
+      method: (details.method || 'GET').toUpperCase(),
+      headers: details.headers || {}
+    };
+    if (_mediaProxyCapabilityEnabled) {
+      if (!_mediaProxyCapability || !_mediaProxyGeneration) {
+        return Promise.resolve({
+          success: false,
+          error: 'Local media proxy unavailable'
+        });
+      }
+      if (!sendToNative({
+        type: 'GM_MEDIA_PROXY_REGISTER_CAPABILITY',
+        capability: _mediaProxyCapability,
+        generation: _mediaProxyGeneration
+      })) {
+        return Promise.resolve({
+          success: false,
+          error: 'Local media proxy unavailable'
+        });
+      }
+      message.capability = _mediaProxyCapability;
+      message.generation = _mediaProxyGeneration;
+    }
+    return bridgeRequest(message);
   }
 
   // --- Base64 helpers ---
@@ -111,10 +186,9 @@ export function buildBridgeRuntime(): string {
       }
     }
 
-    var openResponse = await bridgeRequest({
-      type: 'GM_OPEN_MEDIA_PROXY',
+    var openResponse = await requestLocalMediaProxy({
       url: details.url,
-      method: (details.method || 'GET').toUpperCase(),
+      method: details.method,
       headers: upstreamHeaders
     });
     if (!openResponse.success || typeof openResponse.value !== 'string') {
@@ -218,7 +292,7 @@ export function buildBridgeRuntime(): string {
   }
 
   function GM_xmlhttpRequest(details) {
-    if (!isLocalMediaProxyCandidate(details)) {
+    if (!_mediaProxyRoutingEnabled || !isLocalMediaProxyCandidate(details)) {
       return sendBridgeRequest(details);
     }
 
@@ -246,12 +320,10 @@ export function buildBridgeRuntime(): string {
   }
 
   async function GM_openMediaProxy(details) {
-    var openResponse = await bridgeRequest({
-      type: 'GM_OPEN_MEDIA_PROXY',
-      url: details.url,
-      method: (details.method || 'GET').toUpperCase(),
-      headers: details.headers || {}
-    });
+    if (!_mediaProxyRoutingEnabled) {
+      throw new Error('Local media proxy unavailable');
+    }
+    var openResponse = await requestLocalMediaProxy(details);
     if (!openResponse.success || typeof openResponse.value !== 'string') {
       throw new Error(openResponse.error || 'Local media proxy unavailable');
     }

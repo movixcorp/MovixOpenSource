@@ -16,10 +16,23 @@
     <string>$(PRODUCT_NAME)</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLName</key>
+            <string>com.movix.app</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>movix</string>
+            </array>
+        </dict>
+    </array>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>NSAppTransportSecurity</key>
@@ -28,15 +41,16 @@
         <false/>
         <key>NSAllowsArbitraryLoadsInWebContent</key>
         <true/>
-        <key>NSExceptionDomains</key>
-        <dict>
-            <key>localhost</key>
-            <dict>
-                <key>NSExceptionAllowsInsecureHTTPLoads</key>
-                <true/>
-            </dict>
-        </dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
     </dict>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_googlecast._tcp</string>
+        <string>_CC1AD845._googlecast._tcp</string>
+    </array>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Movix utilise votre réseau local pour détecter votre Chromecast et lui transmettre la vidéo.</string>
     <key>UILaunchStoryboardName</key>
     <string>LaunchScreen</string>
     <key>UIRequiredDeviceCapabilities</key>
@@ -46,6 +60,13 @@
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>

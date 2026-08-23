@@ -95,6 +95,18 @@ object MediaProxyPolicy {
         "range",
     )
 
+    // Parite iOS (MediaProxyPolicy.swift/isReservedLocalHost) : un upstream ne
+    // doit jamais viser un nom reserve au reseau local. Bloquer uniquement
+    // "localhost" laissait passer les noms mDNS/.internal qui resolvent vers le
+    // LAN de l'utilisateur une fois le DNS interroge.
+    private val reservedLocalHostSuffixes = listOf(
+        "localhost",
+        "local",
+        "home.arpa",
+        "internal",
+        "localdomain",
+    )
+
     @Suppress("UNUSED_PARAMETER")
     fun playbackUserAgent(rawUrl: String): String = PLAYBACK_USER_AGENT
 
@@ -127,7 +139,7 @@ object MediaProxyPolicy {
 
         val host = uri.host?.trim()?.lowercase(Locale.US)
         require(!host.isNullOrEmpty()) { "Missing upstream host" }
-        require(host != "localhost" && !host.endsWith(".localhost")) {
+        require(!isReservedLocalHost(host)) {
             "Loopback upstream is forbidden"
         }
 
@@ -137,6 +149,14 @@ object MediaProxyPolicy {
             require(!isForbiddenAddress(literal)) { "Private upstream is forbidden" }
         }
         return uri
+    }
+
+    fun isReservedLocalHost(host: String): Boolean {
+        val unqualified = host.trimEnd('.').lowercase(Locale.US)
+        if (unqualified.isEmpty()) return false
+        return reservedLocalHostSuffixes.any {
+            unqualified == it || unqualified.endsWith(".$it")
+        }
     }
 
     fun isForbiddenAddress(address: InetAddress): Boolean {

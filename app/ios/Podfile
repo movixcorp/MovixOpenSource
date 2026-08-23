@@ -5,7 +5,10 @@ require Pod::Executable.execute_command('node', ['-p',
     {paths: [process.argv[1]]},
   )', __dir__]).strip
 
-platform :ios, min_ios_version_supported
+# Aligne sur IPHONEOS_DEPLOYMENT_TARGET du projet Xcode. min_ios_version_supported
+# vaut 13.4 avec React Native 0.75.4, en dessous de ce qu'exige google-cast-sdk
+# 4.8.4 : CocoaPods echouait sur "required a higher minimum deployment target".
+platform :ios, '15.6'
 prepare_react_native_project!
 
 linkage = ENV['USE_FRAMEWORKS']
@@ -21,6 +24,12 @@ target 'Movix' do
     :path => config[:reactNativePath],
     :app_path => "#{Pod::Config.instance.installation_root}/.."
   )
+
+  pod 'google-cast-sdk', '~> 4.8.4'
+
+  target 'MovixTests' do
+    inherit! :complete
+  end
 
   post_install do |installer|
     react_native_post_install(

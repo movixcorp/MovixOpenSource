@@ -88,6 +88,12 @@ function createShimHarness(buildCastShim, resolver, responder = () => ({})) {
   return { posted, registrations, window };
 }
 
+test('emits browser-parseable JavaScript without literal NUL bytes', async () => {
+  const { buildCastShim } = await loadCastShimBuilder();
+
+  assert.equal(buildCastShim().includes('\u0000'), false);
+});
+
 test('loadMedia rejects without loading and reports a bounded preparation diagnostic', async () => {
   const { buildCastShim } = await loadCastShimBuilder();
   const harness = createShimHarness(buildCastShim);
@@ -370,4 +376,42 @@ test('loadMedia prepares every external text track before posting', async () => 
     name: 'Français',
     active: true,
   });
+});
+
+test('loadMedia sends generated WebVTT inline without resolving it through a backend URL', async () => {
+  const { buildCastShim } = await loadCastShimBuilder();
+  const harness = createShimHarness(buildCastShim, request => ({
+    url: request.url,
+    headers: {},
+    contentType: request.contentType,
+    protocolVersion: 1,
+  }), message => message.type === 'CASTSHIM_INIT'
+    ? {
+        supported: true,
+        capabilities: {
+          configured: true,
+          receiverProtocolVersion: 1,
+          castLanProxyVersion: 1,
+        },
+      }
+    : {});
+  const inlineVtt = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nBonjour\n';
+
+  await harness.window.MovixAndroidCast.loadMedia(
+    'https://cdn.example/master.m3u8',
+    'Title',
+    '',
+    0,
+    'application/vnd.apple.mpegurl',
+    [{ inlineVtt, contentType: 'text/vtt', language: 'fr', active: true }],
+  );
+
+  const load = harness.posted.find(message => message.type === 'CASTSHIM_LOAD_MEDIA');
+  assert.deepEqual(load.source.tracks, [{
+    inlineVtt,
+    contentType: 'text/vtt',
+    protocolVersion: 1,
+    language: 'fr',
+    active: true,
+  }]);
 });

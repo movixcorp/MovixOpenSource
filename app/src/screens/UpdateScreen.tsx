@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
   Easing,
   Image,
+  Linking,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -10,12 +12,16 @@ import {
   View,
 } from 'react-native';
 
-import type { Manifest } from '../services/versionCheck';
 import type { DownloadProgress } from '../services/updateDownloader';
-import type { UpdateError, UpdateStage } from '../hooks/useAppUpdate';
+import type {
+  UpdateError,
+  UpdateManifest,
+  UpdateStage,
+} from '../hooks/useAppUpdate';
+import { isValidHttpsUpdateUrl } from '../hooks/useAppUpdate';
 
 type Props = {
-  manifest: Manifest;
+  manifest: UpdateManifest;
   stage: UpdateStage;
   progress: DownloadProgress | null;
   error: UpdateError | null;
@@ -68,6 +74,27 @@ export default function UpdateScreen({
   const barAnim = useRef(new Animated.Value(0)).current;
   const lastTick = useRef<{ t: number; b: number } | null>(null);
   const [bps, setBps] = useState(0);
+  const [iosOpenError, setIosOpenError] = useState(false);
+  const iosUpdateUrl = manifest.iosAction?.url ?? null;
+
+  const openIosUpdatePage = useCallback(async () => {
+    setIosOpenError(false);
+    if (!isValidHttpsUpdateUrl(iosUpdateUrl)) {
+      setIosOpenError(true);
+      return;
+    }
+
+    try {
+      const supported = await Linking.canOpenURL(iosUpdateUrl);
+      if (!supported) {
+        setIosOpenError(true);
+        return;
+      }
+      await Linking.openURL(iosUpdateUrl);
+    } catch {
+      setIosOpenError(true);
+    }
+  }, [iosUpdateUrl]);
 
   // Compute bytes-per-second from last 3 ticks (rolling average)
   const bpsSamples = useRef<number[]>([]);
@@ -117,6 +144,54 @@ export default function UpdateScreen({
   const downloaded = progress?.bytesDownloaded ?? 0;
   const total = progress?.bytesTotal ?? manifest.apkSizeBytes ?? 0;
   const remaining = Math.max(0, total - downloaded);
+
+  if (Platform.OS === 'ios') {
+    return (
+      <View style={styles.container}>
+        <View style={styles.inner}>
+          <Image
+            source={require('../../android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png')}
+            style={styles.icon}
+            resizeMode="contain"
+          />
+          <Text style={styles.title}>Mise à jour vers {manifest.version}</Text>
+          {!!notes && (
+            <View style={styles.notesCard}>
+              <Text style={styles.notesTitle}>Nouveautés</Text>
+              <ScrollView style={styles.notesScroll} nestedScrollEnabled>
+                <Text style={styles.notes}>{notes}</Text>
+              </ScrollView>
+            </View>
+          )}
+          <Text style={styles.statusText}>
+            La page de la version iOS s’ouvre dans votre navigateur. Le fichier
+            doit ensuite être signé et installé avec un outil externe.
+          </Text>
+          {iosOpenError && (
+            <Text style={styles.errorText}>
+              Impossible d’ouvrir la page de mise à jour sécurisée.
+            </Text>
+          )}
+          <TouchableOpacity
+            onPress={openIosUpdatePage}
+            style={[styles.button, styles.buttonPrimary]}
+            accessibilityRole="link"
+            activeOpacity={0.8}>
+            <Text style={styles.buttonTextPrimary}>Télécharger l’IPA</Text>
+          </TouchableOpacity>
+          {!manifest.mandatory && (
+            <TouchableOpacity
+              onPress={onCancel}
+              style={[styles.button, styles.buttonSecondary]}
+              accessibilityRole="button"
+              activeOpacity={0.8}>
+              <Text style={styles.buttonTextSecondary}>Plus tard</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>

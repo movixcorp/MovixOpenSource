@@ -9,6 +9,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   AppState,
+  PlatformColor,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { WebViewNavigation } from 'react-native-webview';
@@ -16,6 +17,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import WebViewBrowser, { type WebViewBrowserRef } from '../components/WebViewBrowser';
 import BrowserToolbar from '../components/BrowserToolbar';
+import IOSBrowserToolbar from '../components/ios/IOSBrowserToolbar';
+import { NativeGlassSurface } from '../components/ios/NativeGlassSurface';
 import MiniPill from '../components/MiniPill';
 import MirrorErrorScreen from '../components/MirrorErrorScreen';
 import { setLocalPlaybackAwake } from '../services/playbackAwake';
@@ -78,6 +81,9 @@ export default function BrowserScreen() {
     const subscription = AppState.addEventListener('change', nextState => {
       if (nextState === 'active') {
         webViewRef.current?.refreshCastShimStatus();
+        AsyncStorage.getItem('dns_enabled').then(val => {
+          setDnsEnabled(val === 'true');
+        });
       }
     });
     return () => subscription.remove();
@@ -158,20 +164,37 @@ export default function BrowserScreen() {
 
       {!isPictureInPictureActive && !toolbarHidden && (
         <View style={{ paddingBottom: insets.bottom }}>
-          <BrowserToolbar
-            canGoBack={canGoBack}
-            canGoForward={canGoForward}
-            loading={loading}
-            currentUrl={currentUrl}
-            dnsEnabled={dnsEnabled}
-            showUrlBar={uiPrefs.showUrlBar}
-            showNavBar={uiPrefs.showNavBar}
-            onGoBack={() => webViewRef.current?.goBack()}
-            onGoForward={() => webViewRef.current?.goForward()}
-            onReload={() => webViewRef.current?.reload()}
-            onHome={() => webViewRef.current?.loadUrl(activeUrl)}
-            onSettings={() => setSettingsVisible(true)}
-          />
+          {Platform.OS === 'ios' ? (
+            <IOSBrowserToolbar
+              canGoBack={canGoBack}
+              canGoForward={canGoForward}
+              loading={loading}
+              currentUrl={currentUrl}
+              dnsEnabled={dnsEnabled}
+              showUrlBar={uiPrefs.showUrlBar}
+              showNavBar={uiPrefs.showNavBar}
+              onGoBack={() => webViewRef.current?.goBack()}
+              onGoForward={() => webViewRef.current?.goForward()}
+              onReload={() => webViewRef.current?.reload()}
+              onHome={() => webViewRef.current?.loadUrl(activeUrl)}
+              onSettings={() => setSettingsVisible(true)}
+            />
+          ) : (
+            <BrowserToolbar
+              canGoBack={canGoBack}
+              canGoForward={canGoForward}
+              loading={loading}
+              currentUrl={currentUrl}
+              dnsEnabled={dnsEnabled}
+              showUrlBar={uiPrefs.showUrlBar}
+              showNavBar={uiPrefs.showNavBar}
+              onGoBack={() => webViewRef.current?.goBack()}
+              onGoForward={() => webViewRef.current?.goForward()}
+              onReload={() => webViewRef.current?.reload()}
+              onHome={() => webViewRef.current?.loadUrl(activeUrl)}
+              onSettings={() => setSettingsVisible(true)}
+            />
+          )}
         </View>
       )}
 
@@ -180,13 +203,27 @@ export default function BrowserScreen() {
         animationType="slide"
         onRequestClose={closeSettings}>
         <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
-          <View style={styles.modalHeader}>
-            <TouchableOpacity onPress={closeSettings} style={styles.closeButton}>
-              <Text style={styles.closeText}>Fermer</Text>
-            </TouchableOpacity>
-            <Text style={styles.modalTitle}>Paramètres</Text>
-            <View style={styles.closeButton} />
-          </View>
+          {Platform.OS === 'ios' ? (
+            <NativeGlassSurface interactive style={styles.modalHeaderIOS}>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Fermer les paramètres"
+                onPress={closeSettings}
+                style={styles.closeButton}>
+                <Text style={styles.closeText}>Fermer</Text>
+              </TouchableOpacity>
+              <Text style={styles.modalTitle}>Paramètres</Text>
+              <View style={styles.closeButton} />
+            </NativeGlassSurface>
+          ) : (
+            <View style={styles.modalHeader}>
+              <TouchableOpacity onPress={closeSettings} style={styles.closeButton}>
+                <Text style={styles.closeText}>Fermer</Text>
+              </TouchableOpacity>
+              <Text style={styles.modalTitle}>Paramètres</Text>
+              <View style={styles.closeButton} />
+            </View>
+          )}
           <SettingsScreen />
         </View>
       </Modal>
@@ -224,16 +261,25 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#1f1f1f',
   },
+  modalHeaderIOS: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    minHeight: 56,
+  },
   modalTitle: {
-    color: '#ffffff',
+    color: Platform.OS === 'ios' ? PlatformColor('labelColor') : '#ffffff',
     fontSize: 17,
     fontWeight: '600',
   },
   closeButton: {
     width: 60,
+    minHeight: 44,
+    justifyContent: 'center',
   },
   closeText: {
-    color: '#8b5cf6',
+    color: Platform.OS === 'ios' ? PlatformColor('systemPurpleColor') : '#8b5cf6',
     fontSize: 15,
     fontWeight: '500',
   },

@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Requis pour NEDNSSettingsManager -->
-    <key>com.apple.developer.networking.dns-settings</key>
-    <true/>
-    <!-- Associated Domains pour deep links -->
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>dns-settings</string>
+    </array>
     <key>com.apple.developer.associated-domains</key>
     <array>
         <string>applinks:movix.tax</string>

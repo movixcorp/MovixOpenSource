@@ -16,7 +16,7 @@ import {
   IconSettings,
 } from './icons/ToolbarIcons';
 
-interface BrowserToolbarProps {
+export interface BrowserToolbarProps {
   canGoBack: boolean;
   canGoForward: boolean;
   loading: boolean;

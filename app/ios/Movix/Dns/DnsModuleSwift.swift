@@ -2,7 +2,7 @@ import Foundation
 
 /// Bridge React Native pour le module DNS iOS.
 @objc(DnsModule)
-class DnsModuleBridge: NSObject {
+final class DnsModuleBridge: NSObject {
 
   @objc
   static func requiresMainQueueSetup() -> Bool {

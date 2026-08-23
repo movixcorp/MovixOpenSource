@@ -88,6 +88,35 @@ class MediaProxyPolicyTest {
     }
 
     @Test
+    fun rejectsReservedLocalHostNames() {
+        // Parite iOS : le chemin Cast LAN valide seulement la syntaxe (pas de
+        // DNS), donc les noms reserves au reseau local doivent etre refuses ici.
+        for (url in listOf(
+            "https://localhost/video.ts",
+            "https://box.localhost/video.ts",
+            "https://nas.local/video.ts",
+            "https://printer.home.arpa/video.ts",
+            "https://metadata.internal/video.ts",
+            "https://router.localdomain/video.ts",
+            "https://NAS.LOCAL./video.ts",
+        )) {
+            assertThrows(IllegalArgumentException::class.java) {
+                MediaProxyPolicy.validateHttpsUrlSyntax(url)
+            }
+        }
+
+        // Les CDN reels dont le nom contient ces mots restent joignables.
+        for (url in listOf(
+            "https://r1.fsvid.lol/video/master.m3u8",
+            "https://u14.vidzy.cc/video/master.m3u8",
+            "https://local.example.com/video.ts",
+            "https://internal-cdn.example/video.ts",
+        )) {
+            assertEquals("https", MediaProxyPolicy.validateHttpsUrlSyntax(url).scheme)
+        }
+    }
+
+    @Test
     fun rejectsPrivateDnsAnswers() {
         val privateResolver = { _: String ->
             listOf(InetAddress.getByAddress(byteArrayOf(192.toByte(), 168.toByte(), 1, 25)))
