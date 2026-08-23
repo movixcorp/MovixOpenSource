@@ -49,6 +49,26 @@ index 80c6803..f70b87d 100644
              } else {
                  FLog.w(TAG, "ReactNativeWebView.postMessage method was called but messaging is disabled. Pass an onMessage handler to the WebView.");
              }
+diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+--- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
++++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+@@ -456,6 +456,16 @@
+     }
+   }
+ #endif
++#if !TARGET_OS_OSX
++  // Sans cette préférence, WKWebView n'expose pas l'API Fullscreen aux
++  // éléments HTML : `document.fullscreenEnabled` reste faux et le bouton
++  // plein écran du lecteur Movix ne fait rien. Seule la vidéo native pouvait
++  // passer en plein écran, en perdant les contrôles et les sous-titres.
++  if (@available(iOS 15.4, *)) {
++    prefs.elementFullscreenEnabled = YES;
++    _prefsUsed = YES;
++  }
++#endif
+   if (_prefsUsed) {
+     wkWebViewConfig.preferences = prefs;
+   }
 diff --git a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts b/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
 index 8dd6cef..25f86ea 100644
 --- a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
