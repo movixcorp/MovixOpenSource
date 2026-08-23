@@ -58,3 +58,73 @@ test('PiP host exposes three immutable package-local actions', async () => {
   assert.match(manifest, /PictureInPictureActionReceiver/);
   assert.match(manifest, /android:exported="false"/);
 });
+
+test('iOS native PiP defines a handoff-bound AVPlayer state machine', async () => {
+  const [models, controller] = await Promise.all([
+    read('ios/Movix/Playback/NativePlaybackModels.swift'),
+    read('ios/Movix/Playback/NativePlaybackController.swift'),
+  ]);
+
+  assert.match(models, /preparedSourceProtocolVersion\s*=\s*1/);
+  assert.match(models, /case\s+ready\(handoffId:\s*String\)/);
+  assert.match(models, /case\s+restore\(handoffId:\s*String,\s*positionSec:\s*TimeInterval,\s*paused:\s*Bool\)/);
+  assert.match(models, /PIP_SOURCE_NOT_OWNED/);
+  assert.match(controller, /enum\s+State/);
+  for (const state of ['idle', 'preparing', 'awaitingWebPause', 'entering', 'active', 'restoring']) {
+    assert.match(controller, new RegExp(`case\\s+${state}`));
+  }
+  assert.match(controller, /acknowledgeWebViewPaused\(_\s+handoffId:\s*String\)/);
+  assert.match(controller, /acknowledgeRestoreApplied\(_\s+handoffId:\s*String,\s*ok:\s*Bool\)/);
+  assert.match(controller, /restoreUserInterfaceForPictureInPictureStop/);
+  assert.match(controller, /notifyOthersOnDeactivation/);
+  assert.doesNotMatch(controller, /player\.defaultRate/);
+  assert.match(controller, /guard let controller = AVPictureInPictureController\(playerLayer: playerLayer\) else/);
+  assert.match(controller, /pendingRestoreError/);
+  assert.match(controller, /pendingRestoreCompletion/);
+  assert.match(controller, /case let \.restoring\(currentID, _\) = state, currentID == handoffId/);
+  assert.match(controller, /events\(\.restore\([\s\S]*?schedulePhaseTimeout/);
+  assert.doesNotMatch(controller, /gate\.complete\(true\)[\s\S]*?beginRestoring/);
+});
+
+test('iOS PiP React module exposes the complete v1 handoff API and one event', async () => {
+  const [swift, objc] = await Promise.all([
+    read('ios/Movix/Playback/PictureInPictureModule.swift'),
+    read('ios/Movix/Playback/PictureInPictureModule.m'),
+  ]);
+
+  assert.match(swift, /@objc\(PictureInPicture\)/);
+  assert.match(swift, /RCTEventEmitter/);
+  assert.match(swift, /"preparedSourceProtocolVersion"\s*:\s*PreparedNativePlaybackSource\.preparedSourceProtocolVersion/);
+  assert.match(swift, /supportedEvents\(\).*\["MOVIX_PICTURE_IN_PICTURE"\]/s);
+  for (const method of [
+    'prepare',
+    'acknowledgeWebViewPaused',
+    'acknowledgeRestoreApplied',
+    'cancel',
+    'enter',
+    'exit',
+  ]) {
+    assert.match(objc, new RegExp(`RCT_EXTERN_METHOD\\(${method}`));
+  }
+  assert.doesNotMatch(swift, /MediaProxyServer\.shared\.close/);
+});
+
+test('iOS PiP retains a canonical MediaProxy ownership lease and is wired to both targets', async () => {
+  const [server, project] = await Promise.all([
+    read('ios/Movix/Proxy/MediaProxyServer.swift'),
+    read('ios/Movix.xcodeproj/project.pbxproj'),
+  ]);
+
+  assert.match(server, /retainForNativePlayback\(_\s+localURL:\s*URL\)\s+async\s*->\s*MediaProxyAccessLease\?/);
+  assert.match(server, /localURL\.absoluteString\s*==\s*canonicalURL/);
+  for (const file of [
+    'NativePlaybackModels.swift',
+    'NativePlaybackController.swift',
+    'PictureInPictureModule.swift',
+    'PictureInPictureModule.m',
+    'NativePlaybackControllerTests.swift',
+  ]) {
+    assert.match(project, new RegExp(file.replace('.', '\\.')));
+  }
+  assert.match(project, /NativePlaybackControllerTests\.swift in Sources/);
+});

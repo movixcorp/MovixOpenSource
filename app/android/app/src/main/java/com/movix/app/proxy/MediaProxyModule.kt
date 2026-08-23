@@ -12,7 +12,11 @@ import java.util.concurrent.Executors
 class MediaProxyModule(
     reactContext: ReactApplicationContext,
 ) : ReactContextBaseJavaModule(reactContext) {
-    private val server = MediaProxyServer()
+    // Fetch upstream via Cronet (signature TLS Chrome) pour passer les CDN
+    // fsvid/vidzy qui bloquent okhttp ; repli okhttp integre dans l'upstream.
+    private val server = MediaProxyServer(
+        upstream = CronetMediaProxyUpstream(reactContext.applicationContext),
+    )
     private val openExecutor = Executors.newFixedThreadPool(2) { task ->
         Thread(task, "MovixMediaProxy-Open").apply { isDaemon = true }
     }

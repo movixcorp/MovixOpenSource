@@ -7,10 +7,11 @@
  */
 
 import { type RefObject } from 'react';
-import { NativeModules } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   type CastLoadMetadata,
+  type NativeCastStatus,
   type PreparedCastSource,
   getCastCapabilities,
   getCastStatus,
@@ -29,11 +30,21 @@ import {
 import { applyMediaProxyHeaderRules } from './mediaProxyHeaders';
 import {
   type PictureInPictureEvent,
+  acknowledgePictureInPictureRestoreApplied,
+  acknowledgePictureInPictureWebViewPaused,
+  cancelPictureInPictureHandoff,
   enterPictureInPicture,
+  enterPreparedPictureInPicture,
   exitPictureInPicture,
+  getPreparedNativePlaybackSourceProtocolVersion,
+  isNativePlaybackHandoffId,
+  normalizePreparedNativePlaybackSource,
+  preparePictureInPictureSource,
   setPictureInPicturePlaybackActive,
   subscribePictureInPicture,
 } from './pictureInPicture';
+import type { PreparedNativePlaybackSource } from './nativePlayback';
+import { setPlaybackAwakeOwner } from './playbackAwake';
 import {
   createCastLoadIdentity,
   createCastLoadSingleFlight,
@@ -71,7 +82,20 @@ type CastShimRequest =
 
 type PipShimRequest =
   | { type: 'PIPSHIM_ENTER'; id: string; capability: string }
-  | { type: 'PIPSHIM_EXIT'; id: string; capability: string };
+  | { type: 'PIPSHIM_EXIT'; id: string; capability: string }
+  | { type: 'PIPSHIM_WEBVIEW_PAUSED'; id: string; capability: string }
+  | {
+      type: 'PIPSHIM_RESTORE_APPLIED';
+      id: string;
+      capability: string;
+      ok: boolean;
+    }
+  | {
+      type: 'PIPSHIM_PREPARED_SOURCE';
+      id: string;
+      capability: string;
+      source: PreparedNativePlaybackSource;
+    };
 
 const CAST_SOURCE_MAX_URL_LENGTH = 16_384;
 const CAST_SOURCE_MAX_HEADER_NAME_LENGTH = 128;
@@ -85,8 +109,51 @@ const CAST_TRACK_LANGUAGE_MAX_LENGTH = 35;
 const MOVIX_PLAYBACK_AWAKE_V1 = 'MOVIX_PLAYBACK_AWAKE_V1';
 const CAST_CAPABILITY_PATTERN = /^[a-f0-9]{32}$/;
 const PIP_CAPABILITY_PATTERN = /^[a-f0-9]{32}$/;
+const MEDIA_PROXY_CAPABILITY_PATTERN = /^[a-f0-9]{32}$/;
+const MEDIA_PROXY_MAX_RETIRED_GENERATIONS = 32;
 const castShimCapabilities = new WeakMap<object, string>();
-const pipShimCapabilities = new WeakMap<object, string>();
+type PipShimCapability = {
+  capability: string;
+  generation: number;
+  navigationGeneration: number | null;
+};
+type PendingPipHandoff = PipShimCapability & {
+  id: string;
+  source: PreparedNativePlaybackSource;
+};
+type ActivePipHandoff = PipShimCapability & {
+  id: string;
+  invalidated: Promise<void>;
+  invalidate: () => void;
+  invalidatedFlag: boolean;
+  nativeStarted: boolean;
+  nativeReady: boolean;
+  nativeInactive: boolean;
+  exitRequested: boolean;
+  restoreRequested: boolean;
+  restoreAcknowledging: boolean;
+  webViewPauseAcknowledged: boolean;
+  restoreAcknowledged: boolean;
+  restoreTimeout?: ReturnType<typeof setTimeout>;
+  entering: boolean;
+};
+const PIP_NATIVE_PREPARE_TIMEOUT_MS = 15_000;
+const PIP_NATIVE_CLEANUP_TIMEOUT_MS = 2_000;
+const PIP_NATIVE_RESTORE_TIMEOUT_MS = 5_000;
+const PIP_MAX_RETIRED_HANDOFF_IDS = 32;
+let nextPipShimGeneration = 1;
+const pipShimCapabilities = new WeakMap<object, PipShimCapability>();
+const pendingPipHandoffs = new WeakMap<object, PendingPipHandoff>();
+const activePipHandoffs = new WeakMap<object, ActivePipHandoff>();
+const retiredPipHandoffIds = new WeakMap<object, Set<string>>();
+type MediaProxyCapability = {
+  capability: string;
+  generation: string;
+  navigationGeneration: number;
+  topLevelUrl: string;
+};
+const mediaProxyCapabilities = new WeakMap<object, MediaProxyCapability>();
+const retiredMediaProxyGenerations = new WeakMap<object, Set<string>>();
 const castLoadSingleFlights = new WeakMap<object, CastLoadSingleFlight>();
 const CAST_HEADER_ALLOW_LIST = new Set([
   'accept',
@@ -178,6 +245,208 @@ function parseAbsoluteHttpUrl(value: unknown): ParsedAbsoluteHttpUrl | null {
   };
 }
 
+function normalizeBridgeDocumentUrl(value: unknown): string | null {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > CAST_SOURCE_MAX_URL_LENGTH
+    || /[\u0000-\u0020\\]/.test(value)
+  ) {
+    return null;
+  }
+  try {
+    const url = new URL(value);
+    if (
+      (url.protocol !== 'http:' && url.protocol !== 'https:')
+      || url.username !== ''
+      || url.password !== ''
+    ) {
+      return null;
+    }
+    url.hash = '';
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function hasCoherentTopLevelBridgeUrl(
+  context: BridgeMessageContext | undefined,
+): context is BridgeMessageContext & {
+  topLevelUrl: string;
+  navigationGeneration: number;
+} {
+  if (
+    !context
+    || !Number.isSafeInteger(context.navigationGeneration)
+    || (context.navigationGeneration ?? -1) < 0
+  ) {
+    return false;
+  }
+  const sourceUrl = normalizeBridgeDocumentUrl(context.sourceUrl);
+  const topLevelUrl = normalizeBridgeDocumentUrl(context.topLevelUrl);
+  return sourceUrl !== null && sourceUrl === topLevelUrl;
+}
+
+function bridgeNavigationGeneration(
+  context: BridgeMessageContext | undefined,
+): number | null {
+  return Number.isSafeInteger(context?.navigationGeneration)
+    && (context?.navigationGeneration ?? -1) >= 0
+    ? context!.navigationGeneration!
+    : null;
+}
+
+function isPreparedPipV1(): boolean {
+  if (Platform.OS !== 'ios') return false;
+  try {
+    return typeof getPreparedNativePlaybackSourceProtocolVersion === 'function'
+      && getPreparedNativePlaybackSourceProtocolVersion() === 1;
+  } catch {
+    return false;
+  }
+}
+
+function isCurrentPipCapability(
+  webViewRef: RefObject<InjectableRef | null>,
+  capability: PipShimCapability,
+  context?: BridgeMessageContext,
+): boolean {
+  const current = pipShimCapabilities.get(webViewRef);
+  if (current !== capability) return false;
+  const navigationGeneration = bridgeNavigationGeneration(context);
+  if (isPreparedPipV1()) {
+    return capability.navigationGeneration !== null
+      && capability.navigationGeneration === navigationGeneration;
+  }
+  return capability.navigationGeneration === null
+    || capability.navigationGeneration === navigationGeneration;
+}
+
+function retirePipHandoffId(
+  webViewRef: RefObject<InjectableRef | null>,
+  id: string,
+): void {
+  let retired = retiredPipHandoffIds.get(webViewRef);
+  if (!retired) {
+    retired = new Set<string>();
+    retiredPipHandoffIds.set(webViewRef, retired);
+  }
+  retired.add(id);
+  while (retired.size > PIP_MAX_RETIRED_HANDOFF_IDS) {
+    const oldest = retired.values().next().value;
+    if (typeof oldest !== 'string') break;
+    retired.delete(oldest);
+  }
+}
+
+function cancelNativePipHandoffBounded(handoffId: string): void {
+  let cleanup: Promise<void>;
+  try {
+    cleanup = cancelPictureInPictureHandoff(handoffId);
+  } catch {
+    return;
+  }
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>(resolve => {
+    timeoutId = setTimeout(resolve, PIP_NATIVE_CLEANUP_TIMEOUT_MS);
+  });
+  void Promise.race([cleanup.catch(() => undefined), timeout]).finally(() => {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  });
+}
+
+function completeActivePipHandoff(
+  webViewRef: RefObject<InjectableRef | null>,
+  handoff: ActivePipHandoff,
+  cancelNative: boolean,
+): void {
+  if (handoff.invalidatedFlag) return;
+  handoff.invalidatedFlag = true;
+  if (handoff.restoreTimeout !== undefined) {
+    clearTimeout(handoff.restoreTimeout);
+    handoff.restoreTimeout = undefined;
+  }
+  if (activePipHandoffs.get(webViewRef) === handoff) {
+    activePipHandoffs.delete(webViewRef);
+  }
+  retirePipHandoffId(webViewRef, handoff.id);
+  handoff.invalidate();
+  if (cancelNative && handoff.nativeStarted) {
+    cancelNativePipHandoffBounded(handoff.id);
+  }
+}
+
+function invalidateActivePipHandoff(
+  webViewRef: RefObject<InjectableRef | null>,
+  handoff: ActivePipHandoff,
+): void {
+  completeActivePipHandoff(webViewRef, handoff, true);
+}
+
+function finishActivePipHandoff(
+  webViewRef: RefObject<InjectableRef | null>,
+  handoff: ActivePipHandoff,
+): void {
+  completeActivePipHandoff(webViewRef, handoff, false);
+}
+
+function schedulePipRestoreTimeout(
+  webViewRef: RefObject<InjectableRef | null>,
+  handoff: ActivePipHandoff,
+): void {
+  if (handoff.restoreTimeout !== undefined) return;
+  handoff.restoreTimeout = setTimeout(() => {
+    handoff.restoreTimeout = undefined;
+    if (
+      activePipHandoffs.get(webViewRef) === handoff
+      && (
+        handoff.nativeInactive
+        || handoff.exitRequested
+        || handoff.restoreAcknowledged
+      )
+    ) {
+      invalidateActivePipHandoff(webViewRef, handoff);
+    }
+  }, PIP_NATIVE_RESTORE_TIMEOUT_MS);
+}
+
+function clearPendingPipHandoff(
+  webViewRef: RefObject<InjectableRef | null>,
+): void {
+  const pending = pendingPipHandoffs.get(webViewRef);
+  if (!pending) return;
+  pendingPipHandoffs.delete(webViewRef);
+  retirePipHandoffId(webViewRef, pending.id);
+}
+
+function createActivePipHandoff(
+  pending: PendingPipHandoff,
+): ActivePipHandoff {
+  let invalidate: () => void = () => undefined;
+  const invalidated = new Promise<void>(resolve => {
+    invalidate = resolve;
+  });
+  return {
+    id: pending.id,
+    capability: pending.capability,
+    generation: pending.generation,
+    navigationGeneration: pending.navigationGeneration,
+    invalidated,
+    invalidate,
+    invalidatedFlag: false,
+    nativeStarted: false,
+    nativeReady: false,
+    nativeInactive: false,
+    exitRequested: false,
+    restoreRequested: false,
+    restoreAcknowledging: false,
+    webViewPauseAcknowledged: false,
+    restoreAcknowledged: false,
+    entering: false,
+  };
+}
+
 function buildShimDispatch(detail: object): string {
   const json = JSON.stringify(detail);
   return `(function(){try{window.dispatchEvent(new CustomEvent('__MOVIX_CAST_SHIM__',{detail:${json}}));}catch(e){}})(); true;`;
@@ -193,10 +462,11 @@ function sendPipShimResponse(
   ok: boolean,
   expectedCapability: string,
 ): void {
-  if (pipShimCapabilities.get(webViewRef) !== expectedCapability) return;
+  if (pipShimCapabilities.get(webViewRef)?.capability !== expectedCapability) return;
   webViewRef.current?.injectJavaScript(buildPipShimDispatch({
     kind: 'RESPONSE',
     id,
+    capability: expectedCapability,
     ok,
     error: ok ? null : { code: 'PIP_REQUEST_REJECTED' },
   }));
@@ -205,19 +475,64 @@ function sendPipShimResponse(
 function sendPipShimEvent(
   webViewRef: RefObject<InjectableRef | null>,
   event: PictureInPictureEvent,
-  expectedCapability = pipShimCapabilities.get(webViewRef),
+  expectedCapability = pipShimCapabilities.get(webViewRef)?.capability,
 ): boolean {
   if (
     !expectedCapability
-    || pipShimCapabilities.get(webViewRef) !== expectedCapability
+    || pipShimCapabilities.get(webViewRef)?.capability !== expectedCapability
   ) {
     return false;
   }
   webViewRef.current?.injectJavaScript(buildPipShimDispatch({
     kind: 'NATIVE_EVENT',
+    capability: expectedCapability,
     event,
   }));
   return true;
+}
+
+async function preparePendingPipHandoff(
+  webViewRef: RefObject<InjectableRef | null>,
+  pending: PendingPipHandoff,
+  handoff: ActivePipHandoff,
+): Promise<void> {
+  handoff.nativeStarted = true;
+  let preparation: Promise<'prepared' | 'failed'>;
+  try {
+    preparation = preparePictureInPictureSource(pending.source, pending.id).then(
+      () => 'prepared' as const,
+      () => 'failed' as const,
+    );
+  } catch {
+    preparation = Promise.resolve('failed');
+  }
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'timeout'>(resolve => {
+    timeoutId = setTimeout(() => resolve('timeout'), PIP_NATIVE_PREPARE_TIMEOUT_MS);
+  });
+  const result = await Promise.race([
+    preparation,
+    handoff.invalidated.then(() => 'invalidated' as const),
+    timeout,
+  ]);
+  if (timeoutId !== undefined) clearTimeout(timeoutId);
+  if (result === 'invalidated') return;
+
+  const capability = pipShimCapabilities.get(webViewRef);
+  const stillCurrent = activePipHandoffs.get(webViewRef) === handoff
+    && capability?.capability === handoff.capability
+    && capability.generation === handoff.generation;
+  if (!stillCurrent) {
+    invalidateActivePipHandoff(webViewRef, handoff);
+    return;
+  }
+  if (result !== 'prepared') {
+    invalidateActivePipHandoff(webViewRef, handoff);
+    sendPipShimResponse(webViewRef, pending.id, false, pending.capability);
+    return;
+  }
+  sendPipShimResponse(webViewRef, pending.id, true, pending.capability);
 }
 
 function sendShimResponse(
@@ -257,25 +572,105 @@ function sendShimStatusEvent(
   webViewRef.current?.injectJavaScript(script);
 }
 
+// Etats pendant lesquels le telephone alimente encore le relais Cast : couper
+// l'ecran a ce moment suspend l'app (iOS) et interrompt le flux. Aligne sur
+// CastPowerLease.updatePlaybackState cote Android.
+const CAST_AWAKE_STATES = new Set<NativeCastStatus['state']>([
+  'loading',
+  'buffering',
+  'playing',
+]);
+
 export function startCastShimEventForwarding(
   webViewRef: RefObject<InjectableRef | null>,
 ): () => void {
-  return subscribeCastStatus(status => sendShimStatusEvent(webViewRef, status));
+  const stop = subscribeCastStatus(status => {
+    setPlaybackAwakeOwner(
+      'cast',
+      status.connected && CAST_AWAKE_STATES.has(status.state),
+    );
+    sendShimStatusEvent(webViewRef, status);
+  });
+  return () => {
+    stop();
+    setPlaybackAwakeOwner('cast', false);
+  };
 }
 
 export function startPictureInPictureEventForwarding(
   webViewRef: RefObject<InjectableRef | null>,
   listener: (event: PictureInPictureEvent) => void,
 ): () => void {
-  return subscribePictureInPicture(event => {
-    const expectedCapability = pipShimCapabilities.get(webViewRef);
+  const stop = subscribePictureInPicture(event => {
+    // Le handoff met la WebView en pause, ce qui relache le proprietaire
+    // 'local-playback'. Sans ce relais l'ecran s'eteindrait alors que le
+    // lecteur natif joue toujours en PiP.
+    if (event.kind === 'state') setPlaybackAwakeOwner('pip', event.active);
+    if (event.kind === 'error') setPlaybackAwakeOwner('pip', false);
+    if (isPreparedPipV1()) {
+      if (!('handoffId' in event)) return;
+      const handoff = activePipHandoffs.get(webViewRef);
+      const capability = pipShimCapabilities.get(webViewRef);
+      if (
+        !handoff
+        || !capability
+        || event.handoffId !== handoff.id
+        || handoff.capability !== capability.capability
+        || handoff.generation !== capability.generation
+      ) {
+        return;
+      }
+      if (sendPipShimEvent(webViewRef, event, handoff.capability)) {
+        if (event.kind === 'ready') handoff.nativeReady = true;
+        if (event.kind === 'restore') handoff.restoreRequested = true;
+        if (event.kind === 'state' && event.active === false) {
+          handoff.nativeInactive = true;
+        }
+        listener(event);
+      }
+      if (event.kind === 'error') {
+        invalidateActivePipHandoff(webViewRef, handoff);
+      } else if (event.kind === 'state' && event.active === false) {
+        if (handoff.restoreAcknowledged) {
+          finishActivePipHandoff(webViewRef, handoff);
+        } else {
+          schedulePipRestoreTimeout(webViewRef, handoff);
+        }
+      }
+      return;
+    }
+    const expectedCapability = pipShimCapabilities.get(webViewRef)?.capability;
     if (sendPipShimEvent(webViewRef, event, expectedCapability)) listener(event);
   });
+  return () => {
+    stop();
+    setPlaybackAwakeOwner('pip', false);
+  };
 }
 
 export function clearBridgeCapabilities(
   webViewRef: RefObject<InjectableRef | null>,
 ): void {
+  clearPendingPipHandoff(webViewRef);
+  const activePipHandoff = activePipHandoffs.get(webViewRef);
+  if (activePipHandoff) {
+    invalidateActivePipHandoff(webViewRef, activePipHandoff);
+  }
+  const mediaProxyCapability = mediaProxyCapabilities.get(webViewRef);
+  if (mediaProxyCapability) {
+    let retired = retiredMediaProxyGenerations.get(webViewRef);
+    if (!retired) {
+      retired = new Set<string>();
+      retiredMediaProxyGenerations.set(webViewRef, retired);
+    }
+    retired.add(mediaProxyCapability.generation);
+    while (retired.size > MEDIA_PROXY_MAX_RETIRED_GENERATIONS) {
+      const oldest = retired.values().next().value;
+      if (typeof oldest !== 'string') break;
+      retired.delete(oldest);
+    }
+  }
+  mediaProxyCapabilities.delete(webViewRef);
   castShimCapabilities.delete(webViewRef);
   pipShimCapabilities.delete(webViewRef);
   castLoadSingleFlights.delete(webViewRef);
@@ -745,6 +1140,8 @@ export interface BridgeRequest {
   timeout?: number;
   key?: string;
   value?: any;
+  capability?: string;
+  generation?: string;
 }
 
 interface BridgeResponse {
@@ -778,32 +1175,55 @@ interface MediaProxyNativeModule {
   resolveForCast: (localUrl: string) => Promise<unknown>;
 }
 
+export function isCanonicalIOSMediaProxyUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = (
+    /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/p\/[A-Za-z0-9_-]{43}\/[A-Za-z0-9_-]{43}\/[A-Za-z0-9_-]{43}$/
+  ).exec(value);
+  if (!match) return false;
+  const port = Number(match[1]);
+  return port >= 1 && port <= 65_535 && String(port) === match[1];
+}
+
+function parseMediaProxyRequestHeaders(
+  value: unknown,
+): Record<string, string> | null {
+  if (value === undefined) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (entries.length > 32) return null;
+  const headers: Record<string, string> = {};
+  for (const [name, headerValue] of entries) {
+    if (
+      name.length === 0
+      || name.length > 128
+      || typeof headerValue !== 'string'
+      || headerValue.length > 8_192
+      || /[\r\n]/.test(name)
+      || /[\r\n]/.test(headerValue)
+    ) {
+      return null;
+    }
+    headers[name] = headerValue;
+  }
+  return headers;
+}
+
 async function handleGMOpenMediaProxy(
   req: BridgeRequest,
 ): Promise<BridgeResponse> {
   const method = String(req.method || 'GET').toUpperCase();
+  const headers = parseMediaProxyRequestHeaders(req.headers);
   if (
-    !req.url ||
-    !/^https:\/\//i.test(req.url) ||
-    (method !== 'GET' && method !== 'HEAD')
+    !isBoundedHttpsUrl(req.url)
+    || !headers
+    || (method !== 'GET' && method !== 'HEAD')
   ) {
     return {
       id: req.id,
       success: false,
       error: 'Invalid local media proxy request',
     };
-  }
-
-  const headers: Record<string, string> = {};
-  for (const [key, value] of Object.entries(req.headers || {}).slice(0, 32)) {
-    if (
-      key.length <= 128 &&
-      value.length <= 8192 &&
-      !/[\r\n]/.test(key) &&
-      !/[\r\n]/.test(value)
-    ) {
-      headers[key] = value;
-    }
   }
 
   const mediaProxy = NativeModules.MediaProxy as
@@ -823,7 +1243,12 @@ async function handleGMOpenMediaProxy(
       method,
       applyMediaProxyHeaderRules(req.url, headers),
     );
-    if (!/^http:\/\/127\.0\.0\.1:\d+\/p\//i.test(localUrl)) {
+    const validLocalUrl = Platform.OS === 'ios'
+      ? isCanonicalIOSMediaProxyUrl(localUrl)
+      : Platform.OS === 'android'
+        ? /^http:\/\/127\.0\.0\.1:\d+\/p\//i.test(localUrl)
+        : false;
+    if (!validLocalUrl) {
       throw new Error('Invalid loopback response');
     }
     return {
@@ -967,9 +1392,22 @@ function sendToWebView(
 
 export type BridgeMessageContext = {
   sourceUrl: string;
+  topLevelUrl?: string;
   trustedOrigins: readonly string[];
-  isTopFrame: boolean;
+  isTopFrame?: boolean;
+  navigationGeneration?: number;
 };
+
+function isTrustedPipDocument(
+  context: BridgeMessageContext | undefined,
+  trusted: boolean,
+): boolean {
+  if (!trusted || !context) return false;
+  if (context.isTopFrame === true) return true;
+  return Platform.OS === 'ios'
+    && context.isTopFrame === undefined
+    && hasCoherentTopLevelBridgeUrl(context);
+}
 
 export function isTrustedMovixBridgeUrl(
   sourceUrl: string,
@@ -981,6 +1419,75 @@ export function isTrustedMovixBridgeUrl(
     const trusted = parseAbsoluteHttpUrl(value);
     return trusted?.protocol === 'https:' && trusted.origin === source.origin;
   });
+}
+
+function registerIOSMediaProxyCapability(
+  message: Record<string, unknown>,
+  webViewRef: RefObject<WebView | null>,
+  context: BridgeMessageContext | undefined,
+  trusted: boolean,
+): void {
+  if (
+    Platform.OS !== 'ios'
+    || !trusted
+    || !hasCoherentTopLevelBridgeUrl(context)
+    || typeof message.capability !== 'string'
+    || !MEDIA_PROXY_CAPABILITY_PATTERN.test(message.capability)
+    || typeof message.generation !== 'string'
+    || !MEDIA_PROXY_CAPABILITY_PATTERN.test(message.generation)
+  ) {
+    return;
+  }
+
+  const existing = mediaProxyCapabilities.get(webViewRef);
+  if (existing) {
+    if (
+      existing.capability === message.capability
+      && existing.generation === message.generation
+      && existing.navigationGeneration === context.navigationGeneration
+      && existing.topLevelUrl === normalizeBridgeDocumentUrl(context.topLevelUrl)
+    ) {
+      return;
+    }
+    return;
+  }
+  if (retiredMediaProxyGenerations.get(webViewRef)?.has(message.generation)) {
+    return;
+  }
+
+  const topLevelUrl = normalizeBridgeDocumentUrl(context.topLevelUrl);
+  if (!topLevelUrl) return;
+  mediaProxyCapabilities.set(webViewRef, {
+    capability: message.capability,
+    generation: message.generation,
+    navigationGeneration: context.navigationGeneration,
+    topLevelUrl,
+  });
+}
+
+function isAuthorizedMediaProxyRequest(
+  message: Record<string, unknown>,
+  webViewRef: RefObject<WebView | null>,
+  context: BridgeMessageContext | undefined,
+  trusted: boolean,
+  trustedTopFrame: boolean,
+): boolean {
+  if (Platform.OS === 'android') return trustedTopFrame;
+  if (
+    Platform.OS !== 'ios'
+    || !trusted
+    || !hasCoherentTopLevelBridgeUrl(context)
+    || typeof message.capability !== 'string'
+    || typeof message.generation !== 'string'
+  ) {
+    return false;
+  }
+  const capability = mediaProxyCapabilities.get(webViewRef);
+  return !!capability
+    && capability.capability === message.capability
+    && capability.generation === message.generation
+    && capability.navigationGeneration === context.navigationGeneration
+    && capability.topLevelUrl === normalizeBridgeDocumentUrl(context.topLevelUrl);
 }
 
 export async function handleBridgeMessage(
@@ -1002,9 +1509,33 @@ export async function handleBridgeMessage(
       !!context
       && isTrustedMovixBridgeUrl(context.sourceUrl, context.trustedOrigins);
     const trustedTopFrame = trusted && context?.isTopFrame === true;
+    const trustedPipDocument = isTrustedPipDocument(context, trusted);
+    if (p.type === 'GM_MEDIA_PROXY_REGISTER_CAPABILITY') {
+      registerIOSMediaProxyCapability(p, webViewRef, context, trusted);
+      return;
+    }
+    if (
+      p.type === 'GM_OPEN_MEDIA_PROXY'
+      && !isAuthorizedMediaProxyRequest(
+        p,
+        webViewRef,
+        context,
+        trusted,
+        trustedTopFrame,
+      )
+    ) {
+      if (typeof p.id === 'string' && p.id.length > 0 && p.id.length <= 128) {
+        sendToWebView(webViewRef, {
+          id: p.id,
+          success: false,
+          error: 'Local media proxy unavailable',
+        });
+      }
+      return;
+    }
     if (p.type === 'PLAYBACK_AWAKE_SET') {
       if (
-        trustedTopFrame
+        trustedPipDocument
         && p.capability === MOVIX_PLAYBACK_AWAKE_V1
         && typeof p.active === 'boolean'
       ) {
@@ -1012,39 +1543,256 @@ export async function handleBridgeMessage(
           | { setLocalPlaybackAwake: (active: boolean) => void }
           | undefined;
         playbackAwake?.setLocalPlaybackAwake(p.active);
-        setPictureInPicturePlaybackActive(p.active);
+        const currentPipCapability = pipShimCapabilities.get(webViewRef);
+        const activePipHandoff = activePipHandoffs.get(webViewRef);
+        const suppressNativeInactiveTransition = p.active === false
+          && isPreparedPipV1()
+          && !!currentPipCapability
+          && !!activePipHandoff
+          && activePipHandoff.capability === currentPipCapability.capability
+          && activePipHandoff.generation === currentPipCapability.generation;
+        if (!suppressNativeInactiveTransition) {
+          setPictureInPicturePlaybackActive(p.active);
+        }
       }
       return;
     }
     if (p.type === 'PIPSHIM_REGISTER_CAPABILITY') {
+      const navigationGeneration = bridgeNavigationGeneration(context);
       if (
-        trustedTopFrame
+        trustedPipDocument
         && typeof p.capability === 'string'
         && PIP_CAPABILITY_PATTERN.test(p.capability)
+        && (!isPreparedPipV1() || navigationGeneration !== null)
         && !pipShimCapabilities.has(webViewRef)
       ) {
-        pipShimCapabilities.set(webViewRef, p.capability);
+        pipShimCapabilities.set(webViewRef, {
+          capability: p.capability,
+          generation: nextPipShimGeneration++,
+          navigationGeneration,
+        });
+      }
+      return;
+    }
+    if (p.type === 'PIPSHIM_PREPARED_SOURCE') {
+      if (!isPreparedPipV1()) return;
+      const capability = pipShimCapabilities.get(webViewRef);
+      const source = normalizePreparedNativePlaybackSource(p.source);
+      if (
+        !trustedPipDocument
+        || !capability
+        || typeof p.capability !== 'string'
+        || p.capability !== capability.capability
+        || !isCurrentPipCapability(webViewRef, capability, context)
+        || !isNativePlaybackHandoffId(p.id)
+        || !source
+        || retiredPipHandoffIds.get(webViewRef)?.has(p.id)
+      ) {
+        return;
+      }
+      const active = activePipHandoffs.get(webViewRef);
+      if (active) {
+        invalidateActivePipHandoff(webViewRef, active);
+        retirePipHandoffId(webViewRef, p.id);
+        return;
+      }
+      if (pendingPipHandoffs.has(webViewRef)) {
+        clearPendingPipHandoff(webViewRef);
+        retirePipHandoffId(webViewRef, p.id);
+        return;
+      }
+      pendingPipHandoffs.set(webViewRef, {
+        ...capability,
+        id: p.id,
+        source,
+      });
+      return;
+    }
+    if (
+      p.type === 'PIPSHIM_WEBVIEW_PAUSED'
+      || p.type === 'PIPSHIM_RESTORE_APPLIED'
+    ) {
+      if (!isPreparedPipV1()) return;
+      const request = p as PipShimRequest;
+      const capability = pipShimCapabilities.get(webViewRef);
+      const handoff = activePipHandoffs.get(webViewRef);
+      if (
+        !trustedPipDocument
+        || !capability
+        || !handoff
+        || typeof request.capability !== 'string'
+        || request.capability !== capability.capability
+        || handoff.capability !== capability.capability
+        || handoff.generation !== capability.generation
+        || !isCurrentPipCapability(webViewRef, capability, context)
+        || !isNativePlaybackHandoffId(request.id)
+        || request.id !== handoff.id
+      ) {
+        return;
+      }
+
+      if (request.type === 'PIPSHIM_WEBVIEW_PAUSED') {
+        if (
+          !handoff.nativeReady
+          || handoff.restoreRequested
+          || handoff.webViewPauseAcknowledged
+          || handoff.entering
+        ) {
+          return;
+        }
+        handoff.webViewPauseAcknowledged = true;
+        handoff.entering = true;
+        try {
+          await acknowledgePictureInPictureWebViewPaused(handoff.id);
+          if (
+            activePipHandoffs.get(webViewRef) !== handoff
+            || handoff.invalidatedFlag
+            || pipShimCapabilities.get(webViewRef) !== capability
+          ) {
+            return;
+          }
+          if (handoff.restoreRequested) return;
+          await enterPreparedPictureInPicture(handoff.id);
+        } catch {
+          if (handoff.restoreRequested) return;
+          invalidateActivePipHandoff(webViewRef, handoff);
+        } finally {
+          handoff.entering = false;
+        }
+        return;
+      }
+
+      if (request.type !== 'PIPSHIM_RESTORE_APPLIED') return;
+      if (
+        !handoff.restoreRequested
+        || handoff.restoreAcknowledging
+        || handoff.restoreAcknowledged
+        || typeof request.ok !== 'boolean'
+      ) {
+        return;
+      }
+      handoff.restoreAcknowledging = true;
+      try {
+        await acknowledgePictureInPictureRestoreApplied(handoff.id, request.ok);
+        if (
+          activePipHandoffs.get(webViewRef) !== handoff
+          || handoff.invalidatedFlag
+          || pipShimCapabilities.get(webViewRef) !== capability
+        ) {
+          return;
+        }
+        handoff.restoreAcknowledging = false;
+        handoff.restoreAcknowledged = true;
+        if (handoff.nativeInactive) {
+          finishActivePipHandoff(webViewRef, handoff);
+        } else {
+          schedulePipRestoreTimeout(webViewRef, handoff);
+        }
+      } catch {
+        invalidateActivePipHandoff(webViewRef, handoff);
+      } finally {
+        if (!handoff.invalidatedFlag) handoff.restoreAcknowledging = false;
       }
       return;
     }
     if (p.type === 'PIPSHIM_ENTER' || p.type === 'PIPSHIM_EXIT') {
+      const capability = pipShimCapabilities.get(webViewRef);
+      const preparedV1 = isPreparedPipV1();
+      const validRequestId = preparedV1
+        ? isNativePlaybackHandoffId(p.id)
+        : typeof p.id === 'string' && p.id.length > 0 && p.id.length <= 128;
       if (
-        !trustedTopFrame
+        !trustedPipDocument
+        || !capability
         || typeof p.capability !== 'string'
-        || p.capability !== pipShimCapabilities.get(webViewRef)
-        || typeof p.id !== 'string'
-        || p.id.length === 0
-        || p.id.length > 128
+        || p.capability !== capability.capability
+        || !isCurrentPipCapability(webViewRef, capability, context)
+        || !validRequestId
       ) {
         return;
       }
+
+      const request = p as PipShimRequest;
+      if (preparedV1) {
+        const handoffId = request.id;
+        if (request.type === 'PIPSHIM_ENTER') {
+          const active = activePipHandoffs.get(webViewRef);
+          if (active) {
+            invalidateActivePipHandoff(webViewRef, active);
+            retirePipHandoffId(webViewRef, handoffId);
+            sendPipShimResponse(webViewRef, handoffId, false, capability.capability);
+            return;
+          }
+          const pending = pendingPipHandoffs.get(webViewRef);
+          if (
+            !pending
+            || pending.id !== handoffId
+            || pending.capability !== capability.capability
+            || pending.generation !== capability.generation
+          ) {
+            clearPendingPipHandoff(webViewRef);
+            retirePipHandoffId(webViewRef, handoffId);
+            sendPipShimResponse(webViewRef, handoffId, false, capability.capability);
+            return;
+          }
+          pendingPipHandoffs.delete(webViewRef);
+          const handoff = createActivePipHandoff(pending);
+          activePipHandoffs.set(webViewRef, handoff);
+          await preparePendingPipHandoff(webViewRef, pending, handoff);
+          return;
+        }
+
+        const active = activePipHandoffs.get(webViewRef);
+        const pending = pendingPipHandoffs.get(webViewRef);
+        if (active?.id === handoffId) {
+          if (!active.nativeReady) {
+            invalidateActivePipHandoff(webViewRef, active);
+            sendPipShimResponse(webViewRef, handoffId, true, capability.capability);
+            return;
+          }
+          if (active.exitRequested) {
+            sendPipShimResponse(webViewRef, handoffId, true, capability.capability);
+            return;
+          }
+          active.exitRequested = true;
+          try {
+            await exitPictureInPicture();
+            if (
+              activePipHandoffs.get(webViewRef) === active
+              && !active.invalidatedFlag
+              && pipShimCapabilities.get(webViewRef) === capability
+            ) {
+              schedulePipRestoreTimeout(webViewRef, active);
+              sendPipShimResponse(webViewRef, handoffId, true, capability.capability);
+            }
+          } catch {
+            invalidateActivePipHandoff(webViewRef, active);
+            sendPipShimResponse(webViewRef, handoffId, false, capability.capability);
+          }
+          return;
+        }
+        if (pending?.id === handoffId) {
+          clearPendingPipHandoff(webViewRef);
+          sendPipShimResponse(webViewRef, handoffId, true, capability.capability);
+          return;
+        }
+        if (active) invalidateActivePipHandoff(webViewRef, active);
+        clearPendingPipHandoff(webViewRef);
+        retirePipHandoffId(webViewRef, handoffId);
+        sendPipShimResponse(webViewRef, handoffId, false, capability.capability);
+        return;
+      }
+
+      if (Platform.OS === 'ios') {
+        sendPipShimResponse(webViewRef, request.id, false, capability.capability);
+        return;
+      }
       try {
-        const request = p as PipShimRequest;
         if (request.type === 'PIPSHIM_ENTER') await enterPictureInPicture();
         else await exitPictureInPicture();
-        sendPipShimResponse(webViewRef, request.id, true, request.capability);
+        sendPipShimResponse(webViewRef, request.id, true, capability.capability);
       } catch {
-        sendPipShimResponse(webViewRef, p.id, false, p.capability);
+        sendPipShimResponse(webViewRef, request.id, false, capability.capability);
       }
       return;
     }
@@ -1086,6 +1834,24 @@ export async function handleBridgeMessage(
   switch (req.type) {
     case 'GM_OPEN_MEDIA_PROXY':
       response = await handleGMOpenMediaProxy(req);
+      {
+        const trusted =
+          !!context
+          && isTrustedMovixBridgeUrl(context.sourceUrl, context.trustedOrigins);
+        if (!isAuthorizedMediaProxyRequest(
+          parsed as Record<string, unknown>,
+          webViewRef,
+          context,
+          trusted,
+          trusted && context?.isTopFrame === true,
+        )) {
+          response = {
+            id: req.id,
+            success: false,
+            error: 'Local media proxy unavailable',
+          };
+        }
+      }
       break;
     case 'GM_FETCH':
       response = await handleGMFetch(req);

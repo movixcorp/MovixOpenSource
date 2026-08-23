@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import ts from 'typescript';
 
 const root = new URL('../', import.meta.url);
+const providerSignedUserAgent = 'Mozilla/5.0 Chrome/140.0.0.0';
 
 async function read(relativePath) {
   return readFile(new URL(relativePath, root), 'utf8');
@@ -43,7 +44,7 @@ test('Android local proxy injects the required Fsvid headers', async () => {
   );
 });
 
-test('Fsvid media headers mirror the userscript for embeds and CDN requests', async () => {
+test('Fsvid media headers preserve the user agent used to sign playback URLs', async () => {
   const { applyMediaProxyHeaderRules } = await importTypeScript(
     'src/services/mediaProxyHeaders.ts',
   );
@@ -58,6 +59,10 @@ test('Fsvid media headers mirror the userscript for embeds and CDN requests', as
     {
       Origin: 'https://fsvid.lol',
       Referer: 'https://fsvid.lol/',
+      'Sec-Fetch-Site': 'cross-site',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+      'User-Agent': providerSignedUserAgent,
     },
   );
   assert.deepEqual(
@@ -65,6 +70,10 @@ test('Fsvid media headers mirror the userscript for embeds and CDN requests', as
     {
       Origin: 'https://fs13.lol',
       Referer: 'https://fs13.lol/',
+      'Sec-Fetch-Site': 'cross-site',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+      'User-Agent': providerSignedUserAgent,
     },
   );
   assert.deepEqual(
@@ -73,6 +82,29 @@ test('Fsvid media headers mirror the userscript for embeds and CDN requests', as
       { Referer: 'https://movix.fun/' },
     ),
     { Referer: 'https://movix.fun/' },
+  );
+});
+
+test('Vidzy playback preserves the user agent used to sign playback URLs', async () => {
+  const { applyMediaProxyHeaderRules } = await importTypeScript(
+    'src/services/mediaProxyHeaders.ts',
+  );
+
+  assert.deepEqual(
+    applyMediaProxyHeaderRules('https://u14.vidzy.cc/hls/master.m3u8', {
+      Origin: 'https://vidzy.org',
+      Referer: 'https://vidzy.org/',
+      'sec-fetch-dest': 'video',
+      'user-agent': 'okhttp/4.12.0',
+    }),
+    {
+      Origin: 'https://vidzy.org',
+      Referer: 'https://vidzy.org/',
+      'Sec-Fetch-Site': 'cross-site',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+      'User-Agent': providerSignedUserAgent,
+    },
   );
 });
 
@@ -119,5 +151,27 @@ test('Android native media proxy adds browser Fetch Metadata for every provider'
     );
     assert.match(castUpstream, defaultHeaderPattern);
     assert.match(localUpstream, defaultHeaderPattern);
+  }
+});
+
+test('both native media proxies reject the same reserved local host names', async () => {
+  const [kotlin, swift] = await Promise.all([
+    read('android/app/src/main/java/com/movix/app/proxy/MediaProxyPolicy.kt'),
+    read('ios/Movix/Proxy/MediaProxyPolicy.swift').catch(() => ''),
+  ]);
+
+  // Le chemin Cast LAN ne fait que valider la syntaxe (aucune resolution DNS),
+  // donc chaque plateforme doit bloquer les noms reserves elle-meme.
+  assert.match(kotlin, /fun isReservedLocalHost\(/);
+  assert.match(kotlin, /require\(!isReservedLocalHost\(host\)\)/);
+  for (const reserved of [
+    'localhost',
+    'local',
+    'home\\.arpa',
+    'internal',
+    'localdomain',
+  ]) {
+    assert.match(kotlin, new RegExp(`"${reserved}"`), reserved);
+    if (swift) assert.match(swift, new RegExp(`"${reserved}"`), reserved);
   }
 });

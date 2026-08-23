@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import {
+  AppState,
   StatusBar,
   Alert,
   NativeModules,
+  Platform,
 } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -32,10 +34,25 @@ function promptDns() {
         style: 'default',
         onPress: async () => {
           try {
-            if (DnsModule) {
-              await DnsModule.enable('1.1.1.1', '1.0.0.1');
+            if (!DnsModule) {
+              await AsyncStorage.setItem('dns_enabled', 'false');
+              return;
             }
-            await AsyncStorage.setItem('dns_enabled', 'true');
+
+            if (Platform.OS === 'ios') {
+              const dnsActivated = await DnsModule.enable('1.1.1.1', '1.0.0.1');
+              await AsyncStorage.setItem('dns_enabled', dnsActivated ? 'true' : 'false');
+              if (!dnsActivated) {
+                Alert.alert(
+                  'Activation DNS requise',
+                  'La configuration est installée. Active-la manuellement dans Réglages > Général > VPN et gestion de l’appareil > DNS.',
+                  [{ text: 'Compris' }],
+                );
+              }
+            } else {
+              await DnsModule.enable('1.1.1.1', '1.0.0.1');
+              await AsyncStorage.setItem('dns_enabled', 'true');
+            }
           } catch {
             await AsyncStorage.setItem('dns_enabled', 'false');
           }
@@ -65,8 +82,11 @@ export default function App() {
             await AsyncStorage.setItem('dns_enabled', 'true');
           }
           setDnsSettled(true);
-        } else if (stored === 'true' && DnsModule) {
+        } else if (stored === 'true' && DnsModule && Platform.OS === 'android') {
           DnsModule.enable('1.1.1.1', '1.0.0.1').catch(() => {});
+          setDnsSettled(true);
+        } else if (stored === 'true') {
+          await AsyncStorage.setItem('dns_enabled', 'false');
           setDnsSettled(true);
         } else if (stored === null) {
           promptDns();
@@ -82,6 +102,23 @@ export default function App() {
         setReady(true);
       }
     })();
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios' || !DnsModule) return undefined;
+
+    const syncDnsState = async () => {
+      try {
+        const active = await DnsModule.isEnabled();
+        await AsyncStorage.setItem('dns_enabled', active ? 'true' : 'false');
+      } catch {}
+    };
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        void syncDnsState();
+      }
+    });
+    return () => subscription.remove();
   }, []);
 
   if (!ready) return null;

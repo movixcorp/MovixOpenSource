@@ -17,11 +17,12 @@ export interface DnsState {
   method: 'vpn' | 'system' | 'none';
 }
 
-export async function enableDns(): Promise<void> {
+export async function enableDns(): Promise<boolean> {
   if (!DnsModule) {
     throw new Error('Module DNS natif non disponible');
   }
-  await DnsModule.enable(CONFIG.DNS_PRIMARY, CONFIG.DNS_SECONDARY);
+  const enabled = await DnsModule.enable(CONFIG.DNS_PRIMARY, CONFIG.DNS_SECONDARY);
+  return Platform.OS === 'ios' ? enabled === true : true;
 }
 
 export async function disableDns(): Promise<void> {

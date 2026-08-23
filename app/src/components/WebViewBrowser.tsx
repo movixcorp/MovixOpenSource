@@ -18,8 +18,12 @@ import {
   startPictureInPictureEventForwarding,
 } from '../services/bridge';
 import { setLocalPlaybackAwake } from '../services/playbackAwake';
-import { setPictureInPicturePlaybackActive } from '../services/pictureInPicture';
+import {
+  getPreparedNativePlaybackSourceProtocolVersion,
+  setPictureInPicturePlaybackActive,
+} from '../services/pictureInPicture';
 import { buildInjectedJavaScript } from '../injection/inject';
+import type { PictureInPictureShimMode } from '../injection/picture-in-picture-shim';
 import { CONFIG } from '../config';
 
 export interface WebViewBrowserRef {
@@ -38,9 +42,27 @@ interface WebViewBrowserProps {
   onPictureInPictureModeChange?: (active: boolean) => void;
 }
 
+function getPictureInPictureShimMode(): PictureInPictureShimMode {
+  if (Platform.OS === 'android' && Number(Platform.Version) >= 26) {
+    return 'android';
+  }
+  if (Platform.OS === 'ios') {
+    try {
+      if (getPreparedNativePlaybackSourceProtocolVersion() === 1) {
+        return 'ios-native-v1';
+      }
+    } catch {
+      // A missing/older native module must leave WebKit behavior untouched.
+    }
+  }
+  return 'disabled';
+}
+
 const injectedJS = buildInjectedJavaScript({
-  pictureInPictureEnabled:
-    Platform.OS === 'android' && Number(Platform.Version) >= 26,
+  pictureInPictureMode: getPictureInPictureShimMode(),
+  mediaProxyRoutingEnabled:
+    Platform.OS === 'android' || Platform.OS === 'ios',
+  mediaProxyCapabilityEnabled: Platform.OS === 'ios',
 });
 
 function isUsableHttpUrl(value: unknown): value is string {
@@ -56,6 +78,7 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
   ({ url, onNavigationStateChange, onError, onPictureInPictureModeChange }, ref) => {
     const webViewRef = useRef<WebView>(null);
     const topLevelUrlRef = useRef(url);
+    const navigationGenerationRef = useRef(0);
 
     React.useEffect(() => {
       topLevelUrlRef.current = url;
@@ -66,7 +89,6 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       const stopPictureInPictureForwarding = startPictureInPictureEventForwarding(
         webViewRef,
         event => {
-          if (event.kind === 'prepare') onPictureInPictureModeChange?.(true);
           if (event.kind === 'state') onPictureInPictureModeChange?.(event.active);
           if (event.kind === 'error') onPictureInPictureModeChange?.(false);
         },
@@ -108,7 +130,9 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
     }));
 
     const onMessage = useCallback((event: WebViewMessageEvent) => {
-      const isTopFrame = event.nativeEvent.isTopFrame === true;
+      const isTopFrame = typeof event.nativeEvent.isTopFrame === 'boolean'
+        ? event.nativeEvent.isTopFrame
+        : undefined;
       const reportedSourceUrl =
         typeof event.nativeEvent.url === 'string' ? event.nativeEvent.url : '';
       const hasUsableReportedOrigin = isUsableHttpUrl(reportedSourceUrl);
@@ -119,8 +143,10 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
           : '';
       handleBridgeMessage(event.nativeEvent.data, webViewRef, {
         sourceUrl,
+        topLevelUrl: topLevelUrlRef.current,
         trustedOrigins: [url],
-        isTopFrame: event.nativeEvent.isTopFrame === true,
+        isTopFrame: isTopFrame,
+        navigationGeneration: navigationGenerationRef.current,
       });
     }, [url]);
 
@@ -159,6 +185,7 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
             if (isUsableHttpUrl(request.url)) {
               topLevelUrlRef.current = request.url;
             }
+            navigationGenerationRef.current += 1;
             clearBridgeCapabilities(webViewRef);
           }
           return true;
@@ -174,6 +201,7 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         domStorageEnabled={true}
         mediaPlaybackRequiresUserAction={false}
         allowsInlineMediaPlayback={true}
+        allowsPictureInPictureMediaPlayback={Platform.OS === 'ios'}
         allowsFullscreenVideo={true}
         allowsBackForwardNavigationGestures={true}
         // Sécurité

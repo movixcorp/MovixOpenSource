@@ -4,7 +4,6 @@ apply plugin: "com.facebook.react"
 
 react {
     autolinkLibrariesWithApp()
-    extraPackagerArgs = ["--max-workers", "2"]
 }
 
 def keystorePropertiesFile = rootProject.file("app/keystore.properties")
@@ -21,8 +20,8 @@ android {
         applicationId "com.movix.app"
         minSdk rootProject.ext.minSdkVersion
         targetSdk rootProject.ext.targetSdkVersion
-        versionCode 21
-        versionName "2.5.12"
+        versionCode 23
+        versionName "2.5.14"
 
         buildConfigField "int", "VERSION_CODE_INT", "${versionCode}"
         buildConfigField "String", "VERSION_NAME_STR", "\"${versionName}\""
@@ -61,22 +60,37 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // play-services-cronet (et Cast recents) sont compiles avec des
+        // metadonnees Kotlin 2.1 que le compilateur 1.9.24 (impose par le plugin
+        // Gradle de RN 0.75.4) refuse par defaut. On consomme juste leur API
+        // (CronetEngine, Tasks) -> on tolere la version de metadonnees.
+        freeCompilerArgs += ["-Xskip-metadata-version-check"]
     }
-
     testOptions {
         unitTests.includeAndroidResources = true
     }
-
 }
 
 dependencies {
     implementation("com.facebook.react:react-android")
     implementation("com.facebook.react:hermes-android")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    testImplementation("junit:junit:4.13.2")
 
-    // Google Cast (Chromecast) — see app/src/main/java/com/movix/app/cast/
+    // Google Cast (Chromecast) - see app/src/main/java/com/movix/app/cast/
+    // Rester en 21.5.0 tant que RN est en 0.75.4 : la 22.3.1 est compilee en
+    // Kotlin 2.2 et le compilateur 1.9.24 impose par le plugin Gradle de RN ne
+    // sait pas lire ses metadonnees. Les APIs utilisees ici existent en 21.5.0.
     implementation("com.google.android.gms:play-services-cast-framework:21.5.0")
     implementation("androidx.mediarouter:mediarouter:1.7.0")
+
+    // Cronet (moteur reseau Chromium, charge depuis GMS) pour le proxy media :
+    // les CDN fsvid/vidzy filtrent la signature TLS d'okhttp (bloque comme
+    // scraper). Cronet presente la vraie signature Chrome -> le CDN sert le
+    // vrai flux au lieu d'un 403 / leurre. Repli sur okhttp si Cronet indispo.
+    // Voir CronetMediaProxyUpstream.
+    implementation("com.google.android.gms:play-services-cronet:18.1.1")
+
+    // Robolectric n'expose JUnit qu'au runtime : sans cette ligne tout
+    // src/test/ echoue a la compilation sur "Unresolved reference: junit".
+    testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
 }

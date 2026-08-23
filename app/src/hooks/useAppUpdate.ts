@@ -8,6 +8,7 @@ import {
   installApk,
   openInstallSettings,
   getLocalVersionCode,
+  getLocalVersionName,
 } from '../services/apkInstaller';
 import {
   cancelDownload,
@@ -39,9 +40,17 @@ export type UpdateError =
   | 'install_denied'
   | 'unknown';
 
+export type IosUpdateAction = Readonly<{
+  url: string;
+}>;
+
+export type UpdateManifest = Manifest & {
+  iosAction?: IosUpdateAction;
+};
+
 export type UpdateState = {
   stage: UpdateStage;
-  manifest: Manifest | null;
+  manifest: UpdateManifest | null;
   progress: DownloadProgress | null;
   error: UpdateError | null;
   downloadId: number | null;
@@ -66,6 +75,182 @@ const initialState: UpdateState = {
 
 function fileNameForBuild(buildNumber: number): string {
   return `movix-android-${buildNumber}.apk`;
+}
+
+type SemanticVersion = {
+  core: [number, number, number];
+  prerelease: string[];
+};
+
+function parseSemanticVersion(value: string): SemanticVersion | null {
+  const match = value.match(
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+  );
+  if (!match) return null;
+
+  const core = [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+  ] as const;
+  if (core.some(part => !Number.isSafeInteger(part))) return null;
+  const prerelease = match[4]?.split('.') ?? [];
+  if (
+    prerelease.some(
+      identifier =>
+        /^\d+$/.test(identifier) &&
+        identifier.length > 1 &&
+        identifier[0] === '0',
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    core: [core[0], core[1], core[2]],
+    prerelease,
+  };
+}
+
+function comparePrerelease(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) {
+    return left.length === right.length ? 0 : left.length === 0 ? 1 : -1;
+  }
+
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const leftPart = left[index];
+    const rightPart = right[index];
+    if (leftPart === undefined || rightPart === undefined) {
+      return leftPart === rightPart ? 0 : leftPart === undefined ? -1 : 1;
+    }
+    if (leftPart === rightPart) continue;
+
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) {
+      if (leftPart.length !== rightPart.length) {
+        return leftPart.length > rightPart.length ? 1 : -1;
+      }
+      return leftPart > rightPart ? 1 : -1;
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftPart > rightPart ? 1 : -1;
+  }
+  return 0;
+}
+
+export function isNewerSemanticVersion(
+  candidate: string,
+  current: string,
+): boolean {
+  const next = parseSemanticVersion(candidate);
+  const local = parseSemanticVersion(current);
+  if (!next || !local) return false;
+
+  for (let index = 0; index < next.core.length; index += 1) {
+    if (next.core[index] !== local.core[index]) {
+      return next.core[index] > local.core[index];
+    }
+  }
+  return comparePrerelease(next.prerelease, local.prerelease) > 0;
+}
+
+type ParsedHttpsUpdateUrl = Readonly<{
+  origin: string;
+  pathname: string;
+}>;
+
+const HTTPS_PREFIX = 'https://';
+const MAX_UPDATE_URL_LENGTH = 2048;
+const RAW_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+const ENCODED_CONTROL_RE = /%(?:0[0-9a-f]|1[0-9a-f]|7f|8[0-9a-f]|9[0-9a-f])/i;
+const MALFORMED_PERCENT_RE = /%(?![0-9a-f]{2})/i;
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+function isValidHostname(hostname: string): boolean {
+  if (
+    !hostname ||
+    hostname.length > 253 ||
+    hostname.startsWith('.') ||
+    hostname.endsWith('.')
+  ) {
+    return false;
+  }
+
+  if (/^\d+(?:\.\d+){3}$/.test(hostname)) {
+    return hostname.split('.').every(part => {
+      if (part.length > 1 && part.startsWith('0')) return false;
+      const octet = Number(part);
+      return Number.isInteger(octet) && octet >= 0 && octet <= 255;
+    });
+  }
+
+  return hostname.split('.').every(label => DNS_LABEL_RE.test(label));
+}
+
+function parseHttpsUpdateUrl(
+  value: string | null | undefined,
+): ParsedHttpsUpdateUrl | null {
+  if (
+    !value ||
+    value.length > MAX_UPDATE_URL_LENGTH ||
+    value !== value.trim() ||
+    !value.startsWith(HTTPS_PREFIX) ||
+    /\s/u.test(value) ||
+    value.includes('\\') ||
+    RAW_CONTROL_RE.test(value) ||
+    ENCODED_CONTROL_RE.test(value) ||
+    MALFORMED_PERCENT_RE.test(value)
+  ) {
+    return null;
+  }
+
+  const remainder = value.slice(HTTPS_PREFIX.length);
+  const authorityEnd = remainder.search(/[/?#]/);
+  const authority = remainder.slice(
+    0,
+    authorityEnd === -1 ? remainder.length : authorityEnd,
+  );
+  if (!authority || authority.includes('@')) return null;
+
+  const authorityMatch = /^([^:]+)(?::([0-9]{1,5}))?$/.exec(authority);
+  if (!authorityMatch) return null;
+  const hostname = authorityMatch[1].toLowerCase();
+  if (!isValidHostname(hostname)) return null;
+
+  const rawPort = authorityMatch[2];
+  let normalizedPort = '';
+  if (rawPort) {
+    const port = Number(rawPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    normalizedPort = `:${port}`;
+  }
+
+  const suffix = authorityEnd === -1 ? '' : remainder.slice(authorityEnd);
+  const pathnameEnd = suffix.search(/[?#]/);
+  const pathname = suffix.slice(
+    0,
+    pathnameEnd === -1 ? suffix.length : pathnameEnd,
+  );
+  if (pathname && !pathname.startsWith('/')) return null;
+
+  return {
+    origin: `${HTTPS_PREFIX}${hostname}${normalizedPort}`,
+    pathname,
+  };
+}
+
+export function isValidHttpsUpdateUrl(
+  value: string | null | undefined,
+): value is string {
+  return parseHttpsUpdateUrl(value) !== null;
+}
+
+export function releasePageUrl(githubUrl: string): string | null {
+  const parsed = parseHttpsUpdateUrl(githubUrl);
+  if (!parsed) return null;
+  const repositoryPath = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.origin}${repositoryPath}/releases/latest`;
 }
 
 export function useAppUpdate(githubUrl: string | null) {
@@ -97,8 +282,42 @@ export function useAppUpdate(githubUrl: string | null) {
   //   D. Manifest unreachable but pending exists → use pending alone (syntheticManifest).
   //   E. No pending, no update → idle.
   useEffect(() => {
-    if (Platform.OS !== 'android') return;
     let cancelled = false;
+
+    if (Platform.OS === 'ios') {
+      if (!githubUrl) return;
+      const iosReleasePageUrl = releasePageUrl(githubUrl);
+      if (!iosReleasePageUrl) return;
+
+      void (async () => {
+        try {
+          const [result, localVersion] = await Promise.all([
+            fetchLatestVersion(githubUrl),
+            getLocalVersionName(),
+          ]);
+          if (cancelled || result.kind !== 'update-available') return;
+          if (!isNewerSemanticVersion(result.remote.version, localVersion)) return;
+
+          setState({
+            ...initialState,
+            // Reuse the existing full-screen state; iOS performs no permission flow.
+            stage: 'need_permission',
+            manifest: {
+              ...result.remote,
+              iosAction: { url: iosReleasePageUrl },
+            },
+          });
+        } catch (err) {
+          console.warn('[useAppUpdate] iOS version check failed', err);
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (Platform.OS !== 'android') return;
     cancelRef.current = false;
 
     (async () => {
@@ -263,6 +482,16 @@ export function useAppUpdate(githubUrl: string | null) {
     if (!state.manifest) return;
     const manifest = state.manifest;
 
+    if (Platform.OS === 'ios') {
+      if (!isValidHttpsUpdateUrl(manifest.iosAction?.url)) {
+        setState(s => ({ ...s, stage: 'error', error: 'unknown' }));
+        return;
+      }
+      setState(s => ({ ...s, stage: 'need_permission' }));
+      return;
+    }
+    if (Platform.OS !== 'android') return;
+
     try {
       const allowed = await canInstallApks();
       if (!allowed) {
@@ -279,6 +508,11 @@ export function useAppUpdate(githubUrl: string | null) {
   }, [state.manifest]);
 
   const cancel = useCallback(async () => {
+    if (Platform.OS === 'ios') {
+      setState({ ...initialState });
+      return;
+    }
+    if (Platform.OS !== 'android') return;
     if (state.downloadId == null) return;
     // Leave cancelRef.current = true until a new accept() starts a fresh DL.
     // Any in-flight pollUntilDone promise will see the flag and bail out in its .then.
@@ -295,6 +529,7 @@ export function useAppUpdate(githubUrl: string | null) {
   }, [state.downloadId]);
 
   const openSettings = useCallback(async () => {
+    if (Platform.OS !== 'android') return;
     try {
       await openInstallSettings();
     } catch (err) {

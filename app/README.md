@@ -2,13 +2,9 @@
 
 Application iOS & Android pour Movix. WebView avec l'extension Movix intégrée (remplacement du userscript Tampermonkey) et changeur DNS 1.1.1.1.
 
-> ⚠️ **Statut iOS : non testé, non compilé**
+> ⚠️ **Statut iOS : build automatisé non signé**
 >
-> Je n'ai pas de Mac à disposition, donc la partie iOS (Xcode, CocoaPods, `NEDNSSettingsManager`, entitlements, archive, signature, App Store) n'a **jamais été buildée ni testée**. Le code natif Swift/Objective-C et la config `Podfile` sont rédigés à l'aveugle à partir de la documentation Apple.
->
-> Il est très probable qu'il y ait des erreurs de build, des permissions manquantes, du linking à corriger ou un bridging header à ajuster avant que l'app tourne sur un vrai device iOS.
->
-> **Toute aide est la bienvenue** : si tu as un Mac et un peu de temps, n'hésite pas à tester, ouvrir une issue ou soumettre une PR. La partie **Android** est elle fonctionnelle et testée localement.
+> GitHub Actions compile et teste l'application sur macOS, puis publie une IPA non signée avec sa somme SHA-256. Cette IPA est impossible à installer tant qu'un utilisateur ne l'a pas signée par ses propres moyens.
 
 ## Architecture
 
@@ -95,11 +91,17 @@ L'APK sera dans `android/app/build/outputs/apk/release/`.
 
 ### iOS
 
-> ⚠️ Section non vérifiée — voir l'avertissement en haut du README. Les étapes ci-dessous sont les étapes Xcode standard pour un projet React Native, mais elles n'ont pas été exécutées sur ce projet.
+Le workflow GitHub Actions **iOS unsigned IPA** produit un artefact nommé `Movix-unsigned-<version>-<run-number>`. Depuis la racine du dépôt, remplacez les valeurs entre chevrons par celles du run à télécharger :
 
-1. Ouvrir `ios/Movix.xcworkspace` dans Xcode
-2. Sélectionner le scheme "Movix" et la target device
-3. Product → Archive
+```bash
+gh run download <run-id> \
+  --name "Movix-unsigned-<version>-<run-number>" \
+  --dir Movix-unsigned-<version>-<run-number>
+cd Movix-unsigned-<version>-<run-number>
+shasum -a 256 -c Movix-unsigned.ipa.sha256
+```
+
+Le téléchargement contient `Movix-unsigned.ipa` et `Movix-unsigned.ipa.sha256`. **L'IPA est non signée et son installation est impossible tant qu'un utilisateur ne l'a pas signée par ses propres moyens.**
 
 ## DNS 1.1.1.1
 

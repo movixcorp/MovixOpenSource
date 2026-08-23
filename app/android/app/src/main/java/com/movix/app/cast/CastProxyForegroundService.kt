@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.IBinder
 import com.movix.app.R
 import com.movix.app.proxy.CastMediaPreparer
+import com.movix.app.proxy.CronetMediaProxyUpstream
 import com.movix.app.proxy.MediaProxyPolicy
 import com.movix.app.proxy.MediaProxyServer
 import com.movix.app.proxy.MediaProxyServerConfig
@@ -98,7 +99,15 @@ class CastProxyForegroundService : Service() {
                 selected.receiverAddress,
             )
             val store = MediaProxySessionStore()
-            val networkUpstream = NetworkBoundMediaProxyUpstream(selected.network)
+            // Fetch upstream via Cronet lie au reseau du Chromecast (signature TLS
+            // Chrome) pour passer les CDN fsvid/vidzy qui bloquent okhttp. Repli
+            // sur l'upstream okhttp network-bound si Cronet est indisponible.
+            val networkUpstream = CronetMediaProxyUpstream(
+                context = applicationContext,
+                validateUrl = MediaProxyPolicy::validateHttpsUrlSyntax,
+                fallback = NetworkBoundMediaProxyUpstream(selected.network),
+                boundNetwork = selected.network,
+            )
             val relayServer = MediaProxyServer(
                 upstream = networkUpstream,
                 validateUrl = MediaProxyPolicy::validateHttpsUrlSyntax,

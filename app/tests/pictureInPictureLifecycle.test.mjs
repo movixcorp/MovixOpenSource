@@ -4,17 +4,25 @@ import test from 'node:test';
 
 const read = path => readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 
-test('WebView gates shim to Android API 26 and forwards native PiP presentation state', async () => {
+test('WebView selects explicit Android/iOS-v1 modes and only forwards active native PiP state', async () => {
   const source = await read('src/components/WebViewBrowser.tsx');
 
   assert.match(source, /Platform\.OS === 'android'/);
   assert.match(source, /Number\(Platform\.Version\) >= 26/);
-  assert.match(source, /pictureInPictureEnabled/);
+  assert.match(source, /getPreparedNativePlaybackSourceProtocolVersion/);
+  assert.match(source, /Platform\.OS === 'ios'[\s\S]*?=== 1/);
+  assert.match(source, /pictureInPictureMode/);
+  assert.match(source, /'disabled'/);
+  assert.match(source, /'android'/);
+  assert.match(source, /'ios-native-v1'/);
   assert.match(source, /startPictureInPictureEventForwarding/);
   assert.match(source, /onPictureInPictureModeChange/);
-  assert.match(source, /event\.kind === 'prepare'[\s\S]*?onPictureInPictureModeChange\?\.\(true\)/);
+  assert.doesNotMatch(source, /event\.kind === 'prepare'[\s\S]*?onPictureInPictureModeChange\?\.\(true\)/);
   assert.match(source, /event\.kind === 'state'[\s\S]*?onPictureInPictureModeChange\?\.\(event\.active\)/);
   assert.match(source, /event\.kind === 'error'[\s\S]*?onPictureInPictureModeChange\?\.\(false\)/);
+  assert.match(source, /allowsInlineMediaPlayback=\{true\}/);
+  assert.match(source, /allowsPictureInPictureMediaPlayback=\{Platform\.OS === 'ios'\}/);
+  assert.match(source, /mediaPlaybackRequiresUserAction=\{false\}/);
 });
 
 test('WebView teardown disables PiP eligibility, awake playback, and bridge capabilities', async () => {
@@ -39,7 +47,11 @@ test('WebView retains top-frame provenance and navigation capability invalidatio
     source,
     /request\.isTopFrame !== false[\s\S]*?isUsableHttpUrl\(request\.url\)[\s\S]*?topLevelUrlRef\.current = request\.url[\s\S]*?clearBridgeCapabilities\(webViewRef\)/,
   );
-  assert.match(source, /isTopFrame:\s*event\.nativeEvent\.isTopFrame === true/);
+  assert.match(
+    source,
+    /typeof event\.nativeEvent\.isTopFrame === 'boolean'[\s\S]*?event\.nativeEvent\.isTopFrame[\s\S]*?: undefined/,
+  );
+  assert.match(source, /isTopFrame:\s*isTopFrame/);
   assert.match(
     source,
     /onShouldStartLoadWithRequest=\{\(request\)\s*=>\s*\{[\s\S]*?request\.isTopFrame !== false[\s\S]*?clearBridgeCapabilities\(webViewRef\)/,

@@ -5,6 +5,9 @@ buildscript {
         compileSdkVersion = 35
         targetSdkVersion = 35
         ndkVersion = "26.1.10909125"
+        // Ne pas monter sans monter React Native : le plugin Gradle de RN 0.75.4
+        // attend KotlinTopLevelExtension en classe, or Kotlin >= 2.1 en fait une
+        // interface ("Found interface ..., but class was expected").
         kotlinVersion = "1.9.24"
     }
     repositories {

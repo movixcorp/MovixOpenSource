@@ -4,6 +4,7 @@
  * Lit le userscript depuis ../userscript/movix.user.js,
  * supprime le header ==UserScript==,
  * et génère src/injection/userscript-source.ts avec le contenu en string.
+ * Avec --check, compare les octets attendus sans écrire.
  */
 
 import { readFileSync, writeFileSync } from 'fs';
@@ -38,6 +39,27 @@ const output = `/**
 export const USERSCRIPT_SOURCE = \`${escaped}\`;
 `;
 
-writeFileSync(outputPath, output, 'utf-8');
-console.log(`[build-userscript] Généré: ${outputPath}`);
+if (process.argv.slice(2).includes('--check')) {
+  let current = null;
+  try {
+    current = readFileSync(outputPath, 'utf-8');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (current !== output) {
+    console.error(`[build-userscript] Dérive détectée: ${outputPath}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`[build-userscript] Vérifié: ${outputPath}`);
+  }
+} else {
+  let current = null;
+  try {
+    current = readFileSync(outputPath, 'utf-8');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (current !== output) writeFileSync(outputPath, output, 'utf-8');
+  console.log(`[build-userscript] Généré: ${outputPath}`);
+}
 console.log(`[build-userscript] Taille du userscript: ${(source.length / 1024).toFixed(1)} KB`);

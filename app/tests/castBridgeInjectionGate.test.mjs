@@ -80,7 +80,7 @@ function loadBridge(overrides = {}, nativeModules = {}) {
   const module = { exports: {} };
   const require = id => {
     if (id === 'react-native') {
-      return { NativeModules: nativeModules };
+      return { NativeModules: nativeModules, Platform: { OS: 'android' } };
     }
     if (id === './cast') return cast;
     if (id === './castLoadSingleFlight') return loadCastLoadSingleFlight();
@@ -89,6 +89,7 @@ function loadBridge(overrides = {}, nativeModules = {}) {
         applyMediaProxyHeaderRules: (_url, headers) => ({ ...headers }),
       };
     }
+    if (id === './playbackAwake') return { setPlaybackAwakeOwner: () => {} };
     if (id === './pictureInPicture') {
       return {
         enterPictureInPicture: async () => {},
@@ -292,4 +293,36 @@ test('resolves an authenticated loopback media URL before native Cast loading', 
     contentType: 'application/vnd.apple.mpegurl',
     protocolVersion: 1,
   }]);
+});
+
+test('preserves bounded inline WebVTT tracks for the native LAN relay', async () => {
+  const loaded = [];
+  const { bridge } = loadBridge({
+    loadCastMedia: async source => loaded.push(source),
+  });
+  const webViewRef = { current: { injectJavaScript() {} } };
+  await register(bridge, webViewRef, capabilityA);
+  const inlineVtt = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nBonjour\n';
+
+  await bridge.handleBridgeMessage(JSON.stringify({
+    type: 'CASTSHIM_LOAD_MEDIA',
+    id: 'inline-subtitle-load',
+    capability: capabilityA,
+    source: {
+      url: 'https://cdn.example/master.m3u8',
+      headers: {},
+      protocolVersion: 1,
+      tracks: [{
+        inlineVtt,
+        contentType: 'text/vtt',
+        protocolVersion: 1,
+        language: 'fr',
+        active: true,
+      }],
+    },
+    metadata: { title: 'Film', currentTime: 0 },
+  }), webViewRef, trustedContext);
+
+  assert.equal(loaded[0].tracks[0].inlineVtt, inlineVtt);
+  assert.equal('url' in loaded[0].tracks[0], false);
 });

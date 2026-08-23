@@ -1,0 +1,194 @@
+name: iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/ios-unsigned.yml'
+  push:
+    tags:
+      - 'ios-v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compile and package the unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.artifact.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install JavaScript dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Build the injected userscript
+        working-directory: app
+        run: npm run build:userscript
+
+      # L'identite de l'artefact vient d'app.json, jamais d'une saisie humaine :
+      # une valeur hors format casserait le nom de l'artefact et la release.
+      - name: Resolve the artifact version
+        id: artifact
+        working-directory: app
+        run: |
+          VERSION="$(node -p "require('./app.json').version")"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "app.json version is not a bare semantic version: $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Les Pods et les objets deja compilees dominent la duree du job. La cle
+      # suit le Podfile et le lock npm : tout changement de dependance invalide
+      # le cache, le reste du temps la compilation redevient incrementale.
+      - name: Cache CocoaPods and build objects
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            app/ios/Pods
+            app/build/dd-simulator
+            app/build/dd
+          key: ios-${{ hashFiles('app/ios/Podfile', 'app/package-lock.json') }}-${{ github.sha }}
+          restore-keys: |
+            ios-${{ hashFiles('app/ios/Podfile', 'app/package-lock.json') }}-
+            ios-
+
+      # Pas de --deployment : le Podfile.lock est un resultat du run, publie en
+      # artefact pour rendre la resolution auditable, pas une entree figee.
+      - name: Install CocoaPods dependencies
+        working-directory: app/ios
+        run: pod install
+
+      - name: Upload the resolved Podfile.lock
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Movix-Podfile-lock-${{ steps.artifact.outputs.version }}-${{ github.run_number }}
+          path: app/ios/Podfile.lock
+          if-no-files-found: error
+
+      - name: Run the native and bridge contracts
+        working-directory: app
+        run: |
+          npm run test:ios-contract
+          node --test \
+            tests/unsignedIpaWorkflow.test.mjs \
+            tests/mediaProxyRouting.test.mjs \
+            tests/mediaProxyRuntime.test.mjs \
+            tests/mediaProxyBridgeContract.test.mjs
+
+      # L'image du runner change de versions d'iOS sans preavis : figer un
+      # "OS=" precis casse le job des qu'Apple retire un simulateur.
+      - name: Select an available iPhone simulator
+        id: simulator
+        run: |
+          UDID="$(xcrun simctl list devices available \
+            | grep -E '^[[:space:]]+iPhone' \
+            | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}' \
+            | head -n 1)"
+          if [ -z "$UDID" ]; then
+            echo "No available iPhone simulator on this runner" >&2
+            exit 1
+          fi
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Compile for the simulator
+        working-directory: app/ios
+        run: |
+          xcodebuild build \
+            -workspace Movix.xcworkspace \
+            -scheme Movix \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -derivedDataPath "$GITHUB_WORKSPACE/app/build/dd-simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Compile the unsigned device binary
+        working-directory: app/ios
+        run: |
+          xcodebuild build \
+            -workspace Movix.xcworkspace \
+            -scheme Movix \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/app/build/dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGN_ENTITLEMENTS=
+
+      - name: Package the unsigned IPA
+        working-directory: app
+        env:
+          IOS_APP_PATH: build/dd/Build/Products/Release-iphoneos/Movix.app
+          IOS_OUTPUT_DIR: build/unsigned-ipa
+        run: bash scripts/package-unsigned-ios.sh
+
+      - name: Validate the unsigned IPA
+        working-directory: app
+        run: |
+          APP="build/dd/Build/Products/Release-iphoneos/Movix.app"
+          PAYLOAD="build/unsigned-ipa/Payload/Movix.app"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          lipo -archs "$APP/Movix" | tr ' ' '\n' | grep -qw arm64
+          test ! -e "$PAYLOAD/_CodeSignature"
+          test ! -e "$PAYLOAD/embedded.mobileprovision"
+          unzip -t build/unsigned-ipa/Movix-unsigned.ipa
+          (cd build/unsigned-ipa && shasum -a 256 -c Movix-unsigned.ipa.sha256)
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Movix-unsigned-${{ steps.artifact.outputs.version }}-${{ github.run_number }}
+          path: |
+            app/build/unsigned-ipa/Movix-unsigned.ipa
+            app/build/unsigned-ipa/Movix-unsigned.ipa.sha256
+          if-no-files-found: error
+
+  # Seul ce job ecrit dans le depot, et il ne consomme que l'artefact produit
+  # au-dessus : rien de ce qui est compile ne tourne avec un jeton en ecriture.
+  release:
+    name: Publish the tagged unsigned IPA
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/ios-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: Movix-unsigned-${{ needs.build.outputs.version }}-${{ github.run_number }}
+          path: dist
+
+      - name: Verify the checksum before publishing
+        working-directory: dist
+        run: shasum -a 256 -c Movix-unsigned.ipa.sha256
+
+      - name: Create the release
+        working-directory: dist
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            Movix-unsigned.ipa \
+            Movix-unsigned.ipa.sha256 \
+            --title "Movix ${{ needs.build.outputs.version }} (iOS, non signee)" \
+            --notes "IPA non signee. Son installation est impossible tant qu'un utilisateur ne l'a pas signee par ses propres moyens. Verifiez l'archive avec: shasum -a 256 -c Movix-unsigned.ipa.sha256"
