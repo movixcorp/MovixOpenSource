@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# patch-package refuse un patch en CRLF alors que les fichiers vises sont en LF.
+# Sans cette regle, un checkout Windows le rend illisible et npm ci echoue.
+*.patch text eol=lf
+*.diff text eol=lf
