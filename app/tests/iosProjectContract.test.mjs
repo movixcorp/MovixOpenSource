@@ -273,6 +273,39 @@ test('iOS loopback media proxy transport and server are securely wired', async (
   }
 });
 
+test('the app icon catalog is compiled into the Movix bundle', async () => {
+  const project = await text('../ios/Movix.xcodeproj/project.pbxproj');
+  const catalog = JSON.parse(
+    await text('../ios/Movix/Images.xcassets/AppIcon.appiconset/Contents.json'),
+  );
+
+  // Les fichiers d'icones ne suffisent pas : sans reference, appartenance au
+  // groupe, phase Resources et nom de catalogue, l'IPA sort sans icone.
+  assert.match(
+    project,
+    /isa = PBXFileReference; lastKnownFileType = folder\.assetcatalog;[^\n]*path = Movix\/Images\.xcassets;/,
+  );
+  assert.match(project, /Images\.xcassets in Resources \*\/ = \{isa = PBXBuildFile;/);
+  assert.match(project, /Images\.xcassets in Resources \*\/,/);
+  assert.equal(
+    project.match(/ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;/g)?.length,
+    2,
+    'les configurations Debug et Release doivent toutes deux nommer AppIcon',
+  );
+
+  // L'icone du store est obligatoire, et une entree sans fichier fait echouer
+  // la compilation du catalogue.
+  assert.ok(
+    catalog.images.some(image => image.size === '1024x1024' && image.filename),
+    'le catalogue doit fournir l icone 1024x1024',
+  );
+  await Promise.all(
+    catalog.images.map(image => text(
+      `../ios/Movix/Images.xcassets/AppIcon.appiconset/${image.filename}`,
+    )),
+  );
+});
+
 test('legacy MovixApp Xcode artifacts are absent', async () => {
   await Promise.all([
     missing('../ios/MovixApp.xcodeproj'),
