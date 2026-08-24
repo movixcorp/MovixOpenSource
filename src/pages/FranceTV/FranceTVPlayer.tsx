@@ -480,9 +480,43 @@ const FranceTVPlayer: React.FC = () => {
     }, 5000);
   }, [isPlaying, showSettings]);
 
-  const handleMouseMove = useCallback(() => {
+  const handleMouseMove = useCallback((e?: Event | React.MouseEvent | PointerEvent) => {
+    if (e && 'pointerType' in e && (e as PointerEvent).pointerType === 'touch') return;
     resetControlsTimeout();
   }, [resetControlsTimeout]);
+
+  // Native listener binding for pointer & mouse movement in FranceTVPlayer
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const onUserPointerActivity = (e: Event) => {
+      handleMouseMove(e);
+    };
+
+    const events = ['pointermove', 'mousemove', 'pointerenter', 'mouseenter'];
+
+    events.forEach(eventName => {
+      container.addEventListener(eventName, onUserPointerActivity, { passive: true });
+    });
+
+    const handleDocumentPointerMove = (e: Event) => {
+      if (document.fullscreenElement || container.contains(e.target as Node)) {
+        onUserPointerActivity(e);
+      }
+    };
+
+    document.addEventListener('pointermove', handleDocumentPointerMove, { passive: true });
+    document.addEventListener('mousemove', handleDocumentPointerMove, { passive: true });
+
+    return () => {
+      events.forEach(eventName => {
+        container.removeEventListener(eventName, onUserPointerActivity);
+      });
+      document.removeEventListener('pointermove', handleDocumentPointerMove);
+      document.removeEventListener('mousemove', handleDocumentPointerMove);
+    };
+  }, [handleMouseMove]);
 
   const handleMouseLeave = useCallback(() => {
     if (isPlaying) {
@@ -759,6 +793,7 @@ const FranceTVPlayer: React.FC = () => {
       ref={containerRef}
       style={{ minHeight: 'calc(var(--vh, 1vh) * 100)', overflow: 'hidden' }}
       className="w-full bg-black text-white overflow-hidden fixed inset-0 z-40"
+      onPointerMove={handleMouseMove}
       onMouseMove={handleMouseMove}
       onMouseLeave={handleMouseLeave}
     >

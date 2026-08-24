@@ -5107,9 +5107,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   }, [activeTranslatedSubtitleId]);
 
-  const handleMouseMove = () => {
-    // Do not show controls via mousemove on touch devices or while a touch gesture is active
-    if (isTouchDevice || touchActiveRef.current) return;
+  const handleMouseMove = useCallback((e?: Event | React.MouseEvent | PointerEvent) => {
+    // Ignore touch drag events (touch taps/toggles are handled separately)
+    if (touchActiveRef.current) return;
+    if (e && 'pointerType' in e && (e as PointerEvent).pointerType === 'touch') return;
 
     setShowControls(true);
     if (controlsTimeoutRef.current) {
@@ -5124,7 +5125,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }
       }, 5000);
     }
-  };
+  }, [isPlaying, showCastMenu, showForwardAnimation, showRewindAnimation, showLeftTapAnimation, showRightTapAnimation]);
 
 
   const togglePlay = () => {
@@ -6568,6 +6569,40 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       document.removeEventListener('mouseup', handleMouseUp);
     };
   }, [isCastDragging, castDuration, handleCastProgressDragMove, handleCastProgressDragEnd]);
+
+  // Native listener binding for pointer & mouse movement to ensure controls wake up
+  // across all platforms (including Firefox on Linux Wayland)
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const onUserPointerActivity = (e: Event) => {
+      handleMouseMove(e);
+    };
+
+    const events = ['pointermove', 'mousemove', 'pointerenter', 'mouseenter'];
+
+    events.forEach(eventName => {
+      container.addEventListener(eventName, onUserPointerActivity, { passive: true });
+    });
+
+    const handleDocumentPointerMove = (e: Event) => {
+      if (document.fullscreenElement || container.contains(e.target as Node)) {
+        onUserPointerActivity(e);
+      }
+    };
+
+    document.addEventListener('pointermove', handleDocumentPointerMove, { passive: true });
+    document.addEventListener('mousemove', handleDocumentPointerMove, { passive: true });
+
+    return () => {
+      events.forEach(eventName => {
+        container.removeEventListener(eventName, onUserPointerActivity);
+      });
+      document.removeEventListener('pointermove', handleDocumentPointerMove);
+      document.removeEventListener('mousemove', handleDocumentPointerMove);
+    };
+  }, [handleMouseMove]);
 
   // Add event listener for PIP changes initiated outside our button
   useEffect(() => {
@@ -10403,7 +10438,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   };
 
   const shouldHideCursor =
-    !isTouchDevice &&
     !isCasting &&
     isFullscreen &&
     isPlaying &&
@@ -10422,7 +10456,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     <div
       ref={containerRef}
       className={`relative group w-full h-full bg-black rounded-xl overflow-hidden ${isLoading ? 'aspect-[16/9]' : ''} video-container ${className} ${isFullscreenAnimating ? 'fullscreen-animating' : ''} select-none ${shouldHideCursor || isLocked ? 'cursor-none' : ''}`}
-      onMouseMove={!isTouchDevice ? handleMouseMove : undefined}
+      onPointerMove={handleMouseMove}
+      onMouseMove={handleMouseMove}
       onMouseLeave={() => isPlaying && !showCastMenu && setShowControls(false)}
       onClickCapture={handlePlayerControlInteractionCapture}
       onChangeCapture={handlePlayerControlInteractionCapture}
