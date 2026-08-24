@@ -66,6 +66,13 @@ object MediaProxyPolicy {
     private const val MAX_URL_LENGTH = 16_384
     private const val MAX_HEADER_VALUE_LENGTH = 8_192
     private const val PLAYBACK_USER_AGENT = "Mozilla/5.0 Chrome/140.0.0.0"
+
+    // Fsvid/Vidzy exigent un Referer sur un de leurs domaines ET la presence de
+    // Sec-Ch-Ua. Sans cet en-tete leur CDN repond 302 vers .../troll/master.m3u8
+    // (fsvid) ou 403 (vidzy). La valeur exacte est ignoree, seule la presence
+    // compte, donc on aligne celle d'un Chrome recent.
+    const val PLAYBACK_SEC_CH_UA =
+        "\"Chromium\";v=\"140\", \"Not=A?Brand\";v=\"24\", \"Google Chrome\";v=\"140\""
     private val tokenPattern = Regex("^[A-Za-z0-9_-]{8,128}$")
     private val numericIpv4Pattern = Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")
     private val uriAttributePattern = Regex("""URI=(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
@@ -82,6 +89,9 @@ object MediaProxyPolicy {
         "origin" to "Origin",
         "range" to "Range",
         "referer" to "Referer",
+        // Fsvid/Vidzy renvoient leur flux leurre (302 vers .../troll/master.m3u8)
+        // ou une 403 si Sec-Ch-Ua manque : cet en-tete doit atteindre l'amont.
+        "sec-ch-ua" to "Sec-Ch-Ua",
         "sec-fetch-dest" to "Sec-Fetch-Dest",
         "sec-fetch-mode" to "Sec-Fetch-Mode",
         "sec-fetch-site" to "Sec-Fetch-Site",
@@ -199,6 +209,25 @@ object MediaProxyPolicy {
         }
         return false
     }
+
+    /**
+     * Vrai si l'URL est le flux leurre servi par Fsvid/Vidzy quand ils jugent la
+     * requete illegitime. Leur CDN repond alors 302 vers .../troll/master.m3u8 :
+     * suivre la redirection ferait lire la video troll au lieu d'echouer.
+     */
+    fun isProviderDecoyUrl(rawUrl: String): Boolean {
+        val uri = runCatching { URI(rawUrl) }.getOrNull() ?: return false
+        val host = uri.host?.lowercase(Locale.US)?.trimEnd('.') ?: return false
+        val providerHost = PROVIDER_DECOY_HOST_SUFFIXES.any {
+            host == it || host.endsWith(".$it")
+        }
+        if (!providerHost) return false
+        val path = uri.path?.lowercase(Locale.US) ?: return false
+        return path.split('/').any { it == "troll" }
+    }
+
+    private val PROVIDER_DECOY_HOST_SUFFIXES =
+        listOf("fsvid.lol", "vidzy.cc", "vidzy.org")
 
     fun sanitizeRequestHeaders(input: Map<String, String>): Map<String, String> {
         val output = linkedMapOf<String, String>()

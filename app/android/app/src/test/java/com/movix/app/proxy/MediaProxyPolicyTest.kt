@@ -155,6 +155,24 @@ class MediaProxyPolicyTest {
     }
 
     @Test
+    fun detectsTheFsvidVidzyDecoyStream() {
+        // Le CDN repond 302 vers ce flux quand il refuse la requete : le suivre
+        // ferait lire la video troll au lieu de remonter un echec.
+        assertTrue(MediaProxyPolicy.isProviderDecoyUrl("https://s1.fsvid.lol/troll/master.m3u8"))
+        assertTrue(MediaProxyPolicy.isProviderDecoyUrl("https://s1.fsvid.lol/troll/seg0.ts"))
+        assertTrue(MediaProxyPolicy.isProviderDecoyUrl("https://u14.vidzy.cc/troll/master.m3u8"))
+
+        // Un vrai flux, et un hote tiers qui contient "troll", restent acceptes.
+        assertFalse(
+            MediaProxyPolicy.isProviderDecoyUrl(
+                "https://r1.fsvid.lol/hls2/03/00005/5b1wl2a101nm_n/master.m3u8?t=x",
+            ),
+        )
+        assertFalse(MediaProxyPolicy.isProviderDecoyUrl("https://cdn.example.com/troll/master.m3u8"))
+        assertFalse(MediaProxyPolicy.isProviderDecoyUrl("https://r1.fsvid.lol/controller/master.m3u8"))
+    }
+
+    @Test
     fun sanitizesRequestHeadersWithAnAllowlist() {
         val sanitized = MediaProxyPolicy.sanitizeRequestHeaders(
             mapOf(
@@ -163,6 +181,7 @@ class MediaProxyPolicyTest {
                 "Range" to "bytes=0-1023",
                 "Accept" to "*/*",
                 "User-Agent" to "Movix",
+                "sec-ch-ua" to "\"Chromium\";v=\"140\"",
                 "sec-fetch-site" to "cross-site",
                 "Sec-Fetch-Mode" to "cors",
                 "SEC-FETCH-DEST" to "empty",
@@ -177,6 +196,8 @@ class MediaProxyPolicyTest {
         assertEquals("https://vidzy.org", sanitized["Origin"])
         assertEquals("https://vidzy.org/", sanitized["Referer"])
         assertEquals("bytes=0-1023", sanitized["Range"])
+        // Sans Sec-Ch-Ua, Fsvid redirige vers son flux leurre et Vidzy repond 403.
+        assertEquals("\"Chromium\";v=\"140\"", sanitized["Sec-Ch-Ua"])
         assertEquals("cross-site", sanitized["Sec-Fetch-Site"])
         assertEquals("cors", sanitized["Sec-Fetch-Mode"])
         assertEquals("empty", sanitized["Sec-Fetch-Dest"])

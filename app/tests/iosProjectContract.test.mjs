@@ -12,8 +12,11 @@ test('iOS release metadata uses the canonical Movix values', async () => {
 
   assert.equal(appJson.name, 'Movix');
   assert.equal(appJson.displayName, 'Movix');
-  assert.equal(appJson.version, '2.5.14');
-  assert.equal(appJson.buildNumber, '23');
+  // La version est celle de la release en cours : la figer ici ferait echouer
+  // le contrat a chaque publication. On verifie sa forme, et le test suivant
+  // verifie que le projet Xcode reste aligne dessus.
+  assert.match(appJson.version, /^\d+\.\d+\.\d+$/);
+  assert.match(appJson.buildNumber, /^\d+$/);
 });
 
 test('iOS project uses the canonical Movix identity', async () => {
@@ -32,8 +35,12 @@ test('iOS project uses the canonical Movix identity', async () => {
   assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET = 15\.6;/);
   assert.match(project, /TARGETED_DEVICE_FAMILY = "1,2";/);
   assert.match(project, /PRODUCT_NAME = Movix;/);
-  assert.match(project, /MARKETING_VERSION = 2\.5\.14;/);
-  assert.match(project, /CURRENT_PROJECT_VERSION = 23;/);
+  // Xcode doit suivre app.json, sinon l'IPA publiee annonce une autre version
+  // que l'APK et que le manifeste de mise a jour.
+  const { version, buildNumber } = JSON.parse(appJson);
+  assert.match(project, new RegExp(`MARKETING_VERSION = ${version.replace(/\./g, '\\.')};`));
+  assert.match(project, new RegExp(`CURRENT_PROJECT_VERSION = ${buildNumber};`));
+  assert.doesNotMatch(project, /MARKETING_VERSION = (?!\d+\.\d+\.\d+;)/);
   assert.match(project, /INFOPLIST_FILE = Movix\/Info\.plist;/);
   assert.match(project, /CODE_SIGN_ENTITLEMENTS = Movix\/Movix\.entitlements;/);
   assert.match(project, /SWIFT_OBJC_BRIDGING_HEADER = "?Movix\/Movix-Bridging-Header\.h"?;/);

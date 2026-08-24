@@ -1,13 +1,13 @@
 {
-  "version": "2.5.14",
-  "buildNumber": 23,
+  "version": "2.5.16",
+  "buildNumber": 25,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72576533,
-  "apkSha256": "7d06af8013b58528a4b707fea82354b02413f5dfc107375867e157315bbdbfd7",
+  "apkSizeBytes": 72577173,
+  "apkSha256": "34e0bebbe5884bd7f751280aaf3aedc7579d764e34084621bcb2d16779a42977",
   "mandatory": false,
-  "releasedAt": "2026-08-23T00:00:00.000Z",
+  "releasedAt": "2026-08-24T00:00:00.000Z",
   "releaseNotes": {
-    "fr": "Correction des proxy des lecteurs Vidzy et Fsvid, y compris en Cast.",
-    "en": "Fixed the Vidzy and Fsvid player proxies, including when casting."
+    "fr": "Fsvid et Vidzy relancent à nouveau, et la vidéo leurre est désormais refusée au lieu d'être lue.",
+    "en": "Fsvid and Vidzy play again, and the decoy video is now rejected instead of played."
   }
 }

@@ -5,6 +5,10 @@ import ts from 'typescript';
 
 const root = new URL('../', import.meta.url);
 const providerSignedUserAgent = 'Mozilla/5.0 Chrome/140.0.0.0';
+// Fsvid/Vidzy renvoient leur flux leurre (302 vers .../troll/master.m3u8) ou
+// une 403 tant que la requête n'a pas un Referer sur un de leurs domaines ET
+// un en-tête Sec-Ch-Ua.
+const providerSecChUa = '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"';
 
 async function read(relativePath) {
   return readFile(new URL(relativePath, root), 'utf8');
@@ -59,6 +63,7 @@ test('Fsvid media headers preserve the user agent used to sign playback URLs', a
     {
       Origin: 'https://fsvid.lol',
       Referer: 'https://fsvid.lol/',
+      'Sec-Ch-Ua': providerSecChUa,
       'Sec-Fetch-Site': 'cross-site',
       'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty',
@@ -70,6 +75,7 @@ test('Fsvid media headers preserve the user agent used to sign playback URLs', a
     {
       Origin: 'https://fs13.lol',
       Referer: 'https://fs13.lol/',
+      'Sec-Ch-Ua': providerSecChUa,
       'Sec-Fetch-Site': 'cross-site',
       'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty',
@@ -100,6 +106,20 @@ test('Vidzy playback preserves the user agent used to sign playback URLs', async
     {
       Origin: 'https://vidzy.org',
       Referer: 'https://vidzy.org/',
+      'Sec-Ch-Ua': providerSecChUa,
+      'Sec-Fetch-Site': 'cross-site',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+      'User-Agent': providerSignedUserAgent,
+    },
+  );
+
+  // Sans Referer, le CDN Vidzy répond 403 : on en pose un par défaut.
+  assert.deepEqual(
+    applyMediaProxyHeaderRules('https://u14.vidzy.cc/hls/master.m3u8', {}),
+    {
+      Referer: 'https://vidzy.org/',
+      'Sec-Ch-Ua': providerSecChUa,
       'Sec-Fetch-Site': 'cross-site',
       'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Dest': 'empty',
@@ -152,6 +172,32 @@ test('Android native media proxy adds browser Fetch Metadata for every provider'
     assert.match(castUpstream, defaultHeaderPattern);
     assert.match(localUpstream, defaultHeaderPattern);
   }
+});
+
+test('every native upstream defaults Sec-Ch-Ua, whatever the caller sent', async () => {
+  const [kotlinPolicy, swiftPolicy, swiftUpstream, ...kotlinUpstreams] = await Promise.all([
+    read('android/app/src/main/java/com/movix/app/proxy/MediaProxyPolicy.kt'),
+    read('ios/Movix/Proxy/MediaProxyPolicy.swift').catch(() => ''),
+    read('ios/Movix/Proxy/MediaProxyUpstream.swift').catch(() => ''),
+    read('android/app/src/main/java/com/movix/app/proxy/MediaProxyServer.kt'),
+    read('android/app/src/main/java/com/movix/app/proxy/CronetMediaProxyUpstream.kt'),
+    read('android/app/src/main/java/com/movix/app/proxy/NetworkBoundMediaProxyUpstream.kt'),
+  ]);
+
+  // Sans cet en-tete, Fsvid repond 302 vers son flux leurre et Vidzy 403.
+  // Il doit traverser l'allowlist...
+  assert.match(kotlinPolicy, /"sec-ch-ua"\s+to\s+"Sec-Ch-Ua"/);
+  assert.match(swiftPolicy, /"sec-ch-ua":\s*"Sec-Ch-Ua"/);
+
+  // ...et surtout etre pose par defaut au niveau de l'upstream : le chemin
+  // JS qui l'ajoute n'est pas emprunte par tous les appelants du proxy local.
+  for (const upstream of kotlinUpstreams) {
+    assert.match(
+      upstream,
+      /putIfAbsent\("Sec-Ch-Ua",\s*MediaProxyPolicy\.PLAYBACK_SEC_CH_UA\)/,
+    );
+  }
+  assert.match(swiftUpstream, /headers\["Sec-Ch-Ua"\] = MediaProxyPolicy\.playbackSecChUa/);
 });
 
 test('both native media proxies reject the same reserved local host names', async () => {

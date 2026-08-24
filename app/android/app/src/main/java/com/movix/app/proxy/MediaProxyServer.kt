@@ -325,9 +325,13 @@ internal class OkHttpMediaProxyUpstream(
         target: MediaProxyTarget,
         localRequestHeaders: Map<String, String>,
     ): MediaProxyUpstreamResponse {
+        if (MediaProxyPolicy.isProviderDecoyUrl(target.upstreamUrl)) {
+            throw IllegalStateException("Upstream returned a decoy stream")
+        }
         val mergedHeaders = linkedMapOf<String, String>()
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeRequestHeaders(target.headers))
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeLocalRequestHeaders(localRequestHeaders))
+        mergedHeaders.putIfAbsent("Sec-Ch-Ua", MediaProxyPolicy.PLAYBACK_SEC_CH_UA)
         mergedHeaders.putIfAbsent("Sec-Fetch-Site", "cross-site")
         mergedHeaders.putIfAbsent("Sec-Fetch-Mode", "cors")
         mergedHeaders.putIfAbsent("Sec-Fetch-Dest", "empty")
@@ -363,6 +367,9 @@ internal class OkHttpMediaProxyUpstream(
                 response.close()
                 currentUrl = nextUrl
                     ?: throw IllegalArgumentException("Invalid media redirect")
+                if (MediaProxyPolicy.isProviderDecoyUrl(currentUrl)) {
+                    throw IllegalStateException("Upstream returned a decoy stream")
+                }
                 return@repeat
             }
 

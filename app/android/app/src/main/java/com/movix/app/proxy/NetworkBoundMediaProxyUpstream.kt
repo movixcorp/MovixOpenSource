@@ -94,9 +94,13 @@ internal class NetworkBoundMediaProxyUpstream(
         target: MediaProxyTarget,
         localRequestHeaders: Map<String, String>,
     ): MediaProxyUpstreamResponse {
+        if (MediaProxyPolicy.isProviderDecoyUrl(target.upstreamUrl)) {
+            throw IllegalStateException("Upstream returned a decoy stream")
+        }
         val headers = linkedMapOf<String, String>()
         headers.putAll(MediaProxyPolicy.sanitizeRequestHeaders(target.headers))
         headers.putAll(MediaProxyPolicy.sanitizeLocalRequestHeaders(localRequestHeaders))
+        headers.putIfAbsent("Sec-Ch-Ua", MediaProxyPolicy.PLAYBACK_SEC_CH_UA)
         headers.putIfAbsent("Sec-Fetch-Site", "cross-site")
         headers.putIfAbsent("Sec-Fetch-Mode", "cors")
         headers.putIfAbsent("Sec-Fetch-Dest", "empty")
@@ -133,6 +137,9 @@ internal class NetworkBoundMediaProxyUpstream(
                 currentUrl = next
                     ?: throw IllegalArgumentException("Invalid media redirect")
                 MediaProxyPolicy.validateHttpsUrlSyntax(currentUrl)
+                if (MediaProxyPolicy.isProviderDecoyUrl(currentUrl)) {
+                    throw IllegalStateException("Upstream returned a decoy stream")
+                }
                 return@repeat
             }
             return MediaProxyUpstreamResponse(

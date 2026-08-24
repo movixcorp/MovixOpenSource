@@ -94,6 +94,9 @@ internal class CronetMediaProxyUpstream(
         target: MediaProxyTarget,
         localRequestHeaders: Map<String, String>,
     ): MediaProxyUpstreamResponse {
+        if (MediaProxyPolicy.isProviderDecoyUrl(target.upstreamUrl)) {
+            throw IllegalStateException("Upstream returned a decoy stream")
+        }
         val activeEngine = cronetEngine()
             ?: return fallback.execute(target, localRequestHeaders)
 
@@ -101,6 +104,7 @@ internal class CronetMediaProxyUpstream(
         val mergedHeaders = linkedMapOf<String, String>()
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeRequestHeaders(target.headers))
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeLocalRequestHeaders(localRequestHeaders))
+        mergedHeaders.putIfAbsent("Sec-Ch-Ua", MediaProxyPolicy.PLAYBACK_SEC_CH_UA)
         mergedHeaders.putIfAbsent("Sec-Fetch-Site", "cross-site")
         mergedHeaders.putIfAbsent("Sec-Fetch-Mode", "cors")
         mergedHeaders.putIfAbsent("Sec-Fetch-Dest", "empty")
@@ -251,6 +255,11 @@ private class CronetProxyCallback(
         val valid = runCatching { validateUrl(newLocationUrl) }.isSuccess
         if (!valid) {
             startError = IllegalArgumentException("Invalid media redirect")
+            request.cancel()
+            return
+        }
+        if (MediaProxyPolicy.isProviderDecoyUrl(newLocationUrl)) {
+            startError = IOException("Upstream returned a decoy stream")
             request.cancel()
             return
         }

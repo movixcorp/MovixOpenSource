@@ -116,6 +116,28 @@ enum MediaProxyPolicy {
   static let maximumURLLength = 16_384
   static let maximumHeaderValueLength = 8_192
   static let playbackUserAgent = "Mozilla/5.0 Chrome/140.0.0.0"
+  // Fsvid/Vidzy exigent un Referer sur un de leurs domaines ET la présence de
+  // Sec-Ch-Ua. Sans cet en-tête leur CDN répond 302 vers .../troll/master.m3u8
+  // (fsvid) ou 403 (vidzy). Seule la présence compte, pas la valeur.
+  static let playbackSecChUa =
+    "\"Chromium\";v=\"140\", \"Not=A?Brand\";v=\"24\", \"Google Chrome\";v=\"140\""
+
+  private static let providerDecoyHostSuffixes = ["fsvid.lol", "vidzy.cc", "vidzy.org"]
+
+  /// Vrai si l'URL est le flux leurre servi par Fsvid/Vidzy quand ils jugent la
+  /// requête illégitime (302 vers .../troll/master.m3u8).
+  static func isProviderDecoyURL(_ rawURL: String) -> Bool {
+    guard let components = URLComponents(string: rawURL),
+          let host = components.host?.lowercased() else {
+      return false
+    }
+    let normalizedHost = host.hasSuffix(".") ? String(host.dropLast()) : host
+    let isProviderHost = providerDecoyHostSuffixes.contains {
+      normalizedHost == $0 || normalizedHost.hasSuffix(".\($0)")
+    }
+    guard isProviderHost else { return false }
+    return components.percentEncodedPath.lowercased().split(separator: "/").contains("troll")
+  }
 
   static let allowedRequestHeaders: [String: String] = [
     "accept": "Accept",
@@ -126,6 +148,9 @@ enum MediaProxyPolicy {
     "origin": "Origin",
     "range": "Range",
     "referer": "Referer",
+    // Fsvid/Vidzy renvoient leur flux leurre (302 vers .../troll/master.m3u8)
+    // ou une 403 si Sec-Ch-Ua manque : cet en-tête doit atteindre l'amont.
+    "sec-ch-ua": "Sec-Ch-Ua",
     "sec-fetch-dest": "Sec-Fetch-Dest",
     "sec-fetch-mode": "Sec-Fetch-Mode",
     "sec-fetch-site": "Sec-Fetch-Site",

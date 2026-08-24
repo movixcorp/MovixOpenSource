@@ -128,6 +128,29 @@ test('tag releases are isolated in a write-enabled job fed only by the build art
   assert.equal(workflow.match(/contents: write/g)?.length, 1);
 });
 
+test('tagged releases commit the IPA next to the Android build', async () => {
+  const workflow = await readWorkflow();
+
+  // Le fichier vit dans app/ comme movix-android.apk, pour rester
+  // téléchargeable depuis raw.githubusercontent.
+  assert.match(
+    workflow,
+    /install -m 644 dist\/Movix-unsigned\.ipa app\/movix-ios-unsigner\.ipa/,
+  );
+  // Rien d'autre que ce chemin ne doit être indexé : dist/ est dans le workspace.
+  assert.match(workflow, /git add -- app\/movix-ios-unsigner\.ipa/);
+  // Le commit vient après la vérification d'empreinte, jamais avant.
+  const checksumIndex = workflow.indexOf('Verify the checksum before publishing');
+  const commitIndex = workflow.indexOf('Commit the IPA next to the Android build');
+  assert.ok(checksumIndex > 0 && commitIndex > checksumIndex);
+  // Le checkout doit précéder le download-artifact, sinon il efface dist/.
+  const checkoutIndex = workflow.indexOf('default_branch }}', commitIndex - 4000);
+  assert.ok(checkoutIndex > 0 && checkoutIndex < workflow.indexOf('path: dist'));
+  // Une exécution concurrente ne doit pas faire échouer la publication.
+  assert.match(workflow, /git pull --rebase origin "\$\{DEFAULT_BRANCH\}"/);
+  assert.match(workflow, /git push origin "HEAD:\$\{DEFAULT_BRANCH\}"/);
+});
+
 test('README explains how to download, verify, and externally sign the unsigned IPA', async () => {
   const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
 

@@ -206,6 +206,13 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # Checkout avant le téléchargement : actions/checkout nettoie le workspace
+      # et effacerait dist/. La branche par défaut, pas le tag, parce que ce job
+      # y ajoute un commit.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: Movix-unsigned-${{ needs.build.outputs.version }}-${{ github.run_number }}
@@ -214,6 +221,41 @@ jobs:
       - name: Verify the checksum before publishing
         working-directory: dist
         run: shasum -a 256 -c Movix-unsigned.ipa.sha256
+
+      # L'IPA vit dans le dépôt à côté de movix-android.apk, pour être
+      # téléchargeable en direct depuis raw.githubusercontent comme l'APK.
+      # Seul ce chemin est indexé : dist/ reste non suivi.
+      - name: Commit the IPA next to the Android build
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          install -m 644 dist/Movix-unsigned.ipa app/movix-ios-unsigner.ipa
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- app/movix-ios-unsigner.ipa
+          if git diff --cached --quiet; then
+            echo "IPA identique à celle déjà publiée, rien à committer."
+            exit 0
+          fi
+          git commit -F - <<EOF
+          build(ios): publier l'IPA non signée ${{ needs.build.outputs.version }}
+
+          Générée par le workflow ios-unsigned depuis le tag ${GITHUB_REF_NAME}.
+          L'archive est identique à celle attachée à la release et a été
+          vérifiée par son empreinte SHA-256 avant d'être indexée.
+
+          Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          EOF
+          # Une autre exécution peut avoir avancé la branche entre le checkout
+          # et le push : on rejoue le commit sur la nouvelle tête.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${DEFAULT_BRANCH}"; then
+              exit 0
+            fi
+            git pull --rebase origin "${DEFAULT_BRANCH}"
+          done
+          echo "Impossible de pousser l'IPA sur ${DEFAULT_BRANCH}" >&2
+          exit 1
 
       - name: Create the release
         working-directory: dist

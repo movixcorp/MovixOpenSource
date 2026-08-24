@@ -8,6 +8,7 @@ enum MediaProxyUpstreamError: Error, Equatable {
   case unsupportedTransferEncoding
   case missingRedirectLocation
   case tooManyRedirects
+  case decoyRedirect
   case connectionFailed
   case timedOut
   case truncatedBody
@@ -89,12 +90,18 @@ final class MediaProxyUpstream: @unchecked Sendable {
     guard method == "GET" || method == "HEAD" else {
       throw MediaProxyUpstreamError.invalidResponse
     }
+    if MediaProxyPolicy.isProviderDecoyURL(target.upstreamURL.absoluteString) {
+      throw MediaProxyUpstreamError.decoyRedirect
+    }
     var headers = MediaProxyPolicy.sanitizeRequestHeaders(target.headers)
     for (name, value) in MediaProxyPolicy.sanitizeLocalOverrideHeaders(localHeaders) {
       headers[name] = value
     }
     if headers["User-Agent"] == nil {
       headers["User-Agent"] = MediaProxyPolicy.playbackUserAgent
+    }
+    if headers["Sec-Ch-Ua"] == nil {
+      headers["Sec-Ch-Ua"] = MediaProxyPolicy.playbackSecChUa
     }
 
     var currentURL = target.upstreamURL
@@ -136,6 +143,11 @@ final class MediaProxyUpstream: @unchecked Sendable {
             }),
             let nextURL = URL(string: rawLocation, relativeTo: currentURL)?.absoluteURL else {
         throw MediaProxyUpstreamError.missingRedirectLocation
+      }
+      // Fsvid/Vidzy redirigent vers leur flux leurre quand ils refusent la
+      // requête : la suivre ferait lire la vidéo troll au lieu d'échouer.
+      if MediaProxyPolicy.isProviderDecoyURL(nextURL.absoluteString) {
+        throw MediaProxyUpstreamError.decoyRedirect
       }
       previousOrigin = currentOrigin
       currentURL = nextURL

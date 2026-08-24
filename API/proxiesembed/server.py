@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Python Proxy Server - Ultra High Performance Version
 Optimized for massive concurrent connections and high-load streaming
@@ -631,8 +631,12 @@ SIBNET_PROXY_CONFIG = _load_proxy_dict_env('SIBNET_PROXY_SOCKS5_JSON')
 DEEPBRID_API_KEY = os.environ.get('DEEPBRID_API_KEY', '').strip()
 REAL_DEBRID_API_KEY = os.environ.get('REAL_DEBRID_API_KEY', '').strip()
 REAL_DEBRID_API_BASE = 'https://api.real-debrid.com/rest/1.0'
+DEBRIDR_BASE_URL = 'https://debridr.com'
+DEBRIDR_ACCOUNT_KEY = os.environ.get('DEBRIDR_ACCOUNT_KEY', '').strip()
+DEBRIDR_REQUEST_TIMEOUT = 45
+DEBRIDR_MAX_POW_ATTEMPTS = 250_000
 
-DEBRID_PROVIDERS = frozenset({'deepbrid', 'realdebrid'})
+DEBRID_PROVIDERS = frozenset({'deepbrid', 'realdebrid', 'debridr'})
 
 SIBNET_PROXY = PROXIES[0] if len(PROXIES) > 0 else None
 VIDMOLY_PROXY = PROXIES[1] if len(PROXIES) > 1 else (PROXIES[0] if len(PROXIES) > 0 else None)
@@ -673,7 +677,7 @@ KNOWN_EXTENSIONS = ('.mp4', '.m3u8', '.ts', '.m4s', '.mpd', '.webm', '.mkv', '.a
 # CORS headers constant - MINIMIZED for bandwidth savings
 CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Range, Content-Type, Accept, x-access-key',
     'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
 }
@@ -705,6 +709,11 @@ PROBLEMATIC_DOMAINS = frozenset([
     'bandwidth.com', 'edgeon-bandwidth.com', 'familyrestream.com', '6522236688.shop',
     '1396168994.live', 'vuunov.1396168994.live'
 ])
+
+# Fsvid/Vidzy gate their HLS CDN on Referer + the presence of Sec-Ch-Ua.
+# A request missing either one is answered with a 302 to their decoy stream
+# (s1.fsvid.lol/troll/master.m3u8) on fsvid, or a bare 403 on vidzy.
+FSVID_VIDZY_SEC_CH_UA = '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"'
 
 # AES decryption constants for seekstreaming (embed4me)
 SEEKSTREAMING_AES_KEY = b"kiemtienmua911ca"
@@ -1056,7 +1065,8 @@ class _CurlCffiUpstream:
 class ProxyServer:
     # Compiled regex patterns (class-level for sharing)
     RE_BANDWIDTH = re.compile(r'bandwidth\.com|edgeon-bandwidth\.com', re.IGNORECASE)
-    RE_VIDZY = re.compile(r'vidzy\.org|v\d+\.vidzy\.org', re.IGNORECASE)
+    # Vidzy now serves its embeds and its HLS CDN from vidzy.cc (u\d+.vidzy.cc).
+    RE_VIDZY = re.compile(r'vidzy\.(?:org|cc)', re.IGNORECASE)
     RE_FSVID = re.compile(r'fsvid\.lol', re.IGNORECASE)
     RE_SIBNET = re.compile(r'sibnet\.ru|dv\d+\.sibnet\.ru', re.IGNORECASE)
     RE_VMWESA = re.compile(r'vmwesa\.online|vidmoly|getromes\.space', re.IGNORECASE)
@@ -1065,7 +1075,6 @@ class ProxyServer:
     RE_WITV = re.compile(r'lansdrud\.space', re.IGNORECASE)
     RE_UQLOAD_EMBED = re.compile(r'uqload\.(is|cx|com|net|bz|org|to|io|co)/(embed-)?[^/]+\.html', re.IGNORECASE)
     RE_UQLOAD = re.compile(r'uqload\.(is|cx|com|bz|net|org|to|io|co)', re.IGNORECASE)
-    RE_NIGGAFLIX = re.compile(r'cdn\.niggaflix\.xyz', re.IGNORECASE)
     RE_DROPCDN = re.compile(r'dropcdn', re.IGNORECASE)
     RE_SERVERSICURO = re.compile(r'serversicuro', re.IGNORECASE)
     RE_MERI = re.compile(r'merichunidya\.com', re.IGNORECASE)
@@ -1101,6 +1110,7 @@ class ProxyServer:
         self.vip_cache = TTLCache(maxsize=5000, ttl=VIP_CACHE_TTL)  # VIP access key verification cache
         self.m3u8_response_cache = TTLCache(maxsize=2000, ttl=M3U8_CACHE_TTL)  # Short-lived M3U8 response cache
         self.m3u8_vod_cache = TTLCache(maxsize=1000, ttl=M3U8_VOD_CACHE_TTL)   # Longer-lived VOD M3U8 cache
+        self.debridr_status_cache = TTLCache(maxsize=1, ttl=300)
         self.cache_duration = 300  # 5 minutes
         
         # Request coalescer - deduplicates identical concurrent requests
@@ -1597,6 +1607,27 @@ class ProxyServer:
             return max(int(size_value), 0)
 
         size_text = str(size_value or '').strip().upper()
+        size_match = re.search(r'(\d+(?:[.,]\d+)?)\s*([KMGTPE]?I?B)', size_text)
+        if size_match:
+            amount = float(size_match.group(1).replace(',', '.'))
+            unit = size_match.group(2)
+            multipliers = {
+                'B': 1,
+                'KB': 1024,
+                'MB': 1024 ** 2,
+                'GB': 1024 ** 3,
+                'TB': 1024 ** 4,
+                'PB': 1024 ** 5,
+                'EB': 1024 ** 6,
+                'KIB': 1024,
+                'MIB': 1024 ** 2,
+                'GIB': 1024 ** 3,
+                'TIB': 1024 ** 4,
+                'PIB': 1024 ** 5,
+                'EIB': 1024 ** 6,
+            }
+            return max(int(amount * multipliers.get(unit, 0)), 0)
+
         try:
             if 'GB' in size_text:
                 return int(float(size_text.replace(' GB', '').replace('GB', '')) * 1073741824)
@@ -1735,14 +1766,325 @@ class ProxyServer:
         error_status = 400 if 400 <= status_code < 500 else 502
         return web.json_response({'status': 'error', 'error': error_msg}, status=error_status)
 
+    def _extract_debridr_pow(self, page_html: str) -> Tuple[str, int, str]:
+        """Read the public form fields required by DebridR's current page."""
+        soup = BeautifulSoup(page_html, 'html.parser')
+        form = soup.select_one('form.console[action]')
+        seed_input = soup.select_one('input[name="pow_seed"]')
+        seed = str(seed_input.get('value', '') if seed_input else '').strip()
+        action = str(form.get('action', '') if form else '').strip()
+
+        bits_match = re.search(r'\bbits\s*=\s*(\d+)', page_html)
+        bits = int(bits_match.group(1)) if bits_match else 0
+
+        if not seed or not action or bits < 1 or bits > 8:
+            return '', 0, ''
+
+        return seed, bits, action
+
+    def _solve_debridr_pow(self, seed: str, bits: int) -> Optional[int]:
+        """Run the small proof-of-work published in DebridR's form JavaScript."""
+        target = '0' * bits
+        for nonce in range(DEBRIDR_MAX_POW_ATTEMPTS):
+            digest = hashlib.sha256(f'{seed}{nonce}'.encode('utf-8')).hexdigest()
+            if digest.startswith(target):
+                return nonce
+        return None
+
+    def _extract_debridr_page_error(self, page_html: str) -> str:
+        """Prefer a displayed provider error over a generic HTTP failure."""
+        soup = BeautifulSoup(page_html, 'html.parser')
+        for selector in ('.error', '.err', '.alert', '[role="alert"]', '.panel.error'):
+            element = soup.select_one(selector)
+            if element:
+                message = element.get_text(' ', strip=True)
+                if message:
+                    return message[:300]
+
+        page_text = soup.get_text(' ', strip=True)
+        patterns = (
+            r'[^.]{0,80}(?:rate limit|daily limit|quota|unsupported|invalid link|link not found|try again)[^.]{0,160}',
+            r'[^.]{0,80}(?:could not|cannot|failed to)[^.]{0,160}',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, page_text, re.IGNORECASE)
+            if match:
+                return match.group(0).strip()[:300]
+        return ''
+
+    async def _get_debridr_host_status(self, host: str) -> str:
+        """Return an actionable DebridR host status, cached to avoid extra load."""
+        normalized_host = host.lower().removeprefix('www.')
+        if not normalized_host:
+            return ''
+
+        statuses = self.debridr_status_cache.get('hosts')
+        if statuses is None:
+            try:
+                headers = {
+                    'Accept': 'text/html,application/xhtml+xml',
+                    'User-Agent': 'Movix/1.0 (+https://movix.online)',
+                }
+                timeout = ClientTimeout(total=15)
+                async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                    async with session.get(f'{DEBRIDR_BASE_URL}/status') as response:
+                        if response.status != 200:
+                            return ''
+                        status_html = await response.text()
+
+                soup = BeautifulSoup(status_html, 'html.parser')
+                statuses = {}
+                for row in soup.select('.srow'):
+                    host_element = row.select_one('.shost')
+                    badge_element = row.select_one('.sbadge')
+                    if not host_element or not badge_element:
+                        continue
+                    status_host = host_element.get_text(' ', strip=True).lower().removeprefix('www.')
+                    status_badge = badge_element.get_text(' ', strip=True)
+                    if status_host and status_badge:
+                        statuses[status_host] = status_badge
+                self.debridr_status_cache.set('hosts', statuses)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return ''
+
+        status = statuses.get(normalized_host, '') if isinstance(statuses, dict) else ''
+        normalized_status = status.lower()
+        if status and any(marker in normalized_status for marker in ('down', 'issues')):
+            return f'DebridR indique que {normalized_host} est actuellement « {status} ».'
+        return ''
+
+    async def _debridr_error_response(self, status_code: int, page_html: str, host: str) -> Response:
+        """Normalize a DebridR failure and enrich it with its live host status."""
+        provider_message = self._extract_debridr_page_error(page_html)
+        lower_message = provider_message.lower()
+
+        if status_code == 429 or any(marker in lower_message for marker in ('rate limit', 'daily limit', 'quota')):
+            message = 'Limite DebridR atteinte. Attendez avant de réessayer.'
+            response_status = 429
+        elif status_code in (401, 403) or 'proof-of-work' in lower_message:
+            message = 'DebridR a refusé la demande. Réessayez plus tard depuis le site DebridR.'
+            response_status = 403
+        elif 500 <= status_code:
+            message = 'DebridR est temporairement indisponible.'
+            response_status = 502
+        else:
+            message = provider_message or 'DebridR n’a pas pu générer de lien téléchargeable pour cette URL.'
+            response_status = 400
+
+        host_status = await self._get_debridr_host_status(host)
+        if host_status:
+            message = f'{message} {host_status}'
+
+        return web.json_response({'status': 'error', 'error': message}, status=response_status)
+
+    async def _authenticate_with_debridr(self, session: aiohttp.ClientSession) -> Tuple[bool, int, str]:
+        """Attach the optional premium account to the current DebridR session."""
+        if not DEBRIDR_ACCOUNT_KEY:
+            return True, 0, ''
+
+        async with session.post(
+            f'{DEBRIDR_BASE_URL}/account/login',
+            data={'key': DEBRIDR_ACCOUNT_KEY},
+        ) as response:
+            status_code = response.status
+            response_html = await response.text()
+
+        page_text = BeautifulSoup(response_html, 'html.parser').get_text(' ', strip=True).lower()
+        rejected = any(marker in page_text for marker in ('invalid key', 'enter your key', 'login failed'))
+        return 200 <= status_code < 300 and not rejected, status_code, response_html
+
+    async def _resolve_debridr_direct_download(
+        self,
+        session: aiohttp.ClientSession,
+        result_url: str,
+        go_url: str,
+    ) -> Tuple[str, int, str]:
+        """Resolve DebridR's result page to its final CDN URL without downloading it."""
+        async with session.get(go_url, headers={'Referer': result_url}) as go_response:
+            go_status = go_response.status
+            go_html = await go_response.text()
+            go_page_url = str(go_response.url)
+
+        if not 200 <= go_status < 300:
+            return '', go_status, go_html
+
+        go_soup = BeautifulSoup(go_html, 'html.parser')
+        download_button = go_soup.select_one('a.dl[href]')
+        if not download_button:
+            return '', go_status, go_html
+
+        current_url = urljoin(go_page_url, str(download_button.get('href', '')).strip())
+        referer = go_page_url
+        for _ in range(3):
+            parsed_url = urlparse(current_url)
+            if parsed_url.scheme not in ('http', 'https') or not parsed_url.netloc:
+                return '', 502, ''
+
+            async with session.get(
+                current_url,
+                headers={'Referer': referer},
+                allow_redirects=False,
+            ) as download_response:
+                status_code = download_response.status
+                location = str(download_response.headers.get('Location', '')).strip()
+
+                if status_code in (301, 302, 303, 307, 308) and location:
+                    next_url = urljoin(current_url, location)
+                    next_host = (urlparse(next_url).hostname or '').lower().removeprefix('www.')
+                    if next_host and next_host != 'debridr.com' and not next_host.endswith('.debridr.com'):
+                        return next_url, status_code, ''
+                    referer = current_url
+                    current_url = next_url
+                    continue
+
+                if 200 <= status_code < 300:
+                    # A provider may serve the file from /dl directly instead of redirecting.
+                    content_type = str(download_response.headers.get('Content-Type', '')).lower()
+                    if 'text/html' not in content_type:
+                        return current_url, status_code, ''
+                    response_html = await download_response.text()
+                    return '', status_code, response_html
+
+                response_html = await download_response.text()
+                return '', status_code, response_html
+
+        return '', 502, ''
+
+    async def _unlock_with_debridr(self, link: str) -> Response:
+        """Submit DebridR's public form and extract its generated download URL."""
+        parsed_link = None
+        try:
+            parsed_link = urlparse(link)
+            source_host = (parsed_link.hostname or '').lower().removeprefix('www.')
+        except (TypeError, ValueError):
+            source_host = ''
+
+        if not parsed_link or parsed_link.scheme not in ('http', 'https') or not source_host:
+            return web.json_response({
+                'status': 'error',
+                'error': 'Lien invalide. Utilisez une URL HTTP ou HTTPS complète.'
+            }, status=400)
+
+        if source_host == 'debridr.com' or source_host.endswith('.debridr.com'):
+            return web.json_response({
+                'status': 'error',
+                'error': 'Un lien DebridR ne peut pas être débridé à nouveau.'
+            }, status=400)
+
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml',
+            'User-Agent': 'Movix/1.0 (+https://movix.online)',
+        }
+        timeout = ClientTimeout(total=DEBRIDR_REQUEST_TIMEOUT)
+
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                authenticated, auth_status, auth_html = await self._authenticate_with_debridr(session)
+                if not authenticated:
+                    logger.warning('[DEBRID][DEBRIDR] Premium account authentication was rejected')
+                    return web.json_response({
+                        'status': 'error',
+                        'error': self._extract_debridr_page_error(auth_html) or 'La clé de compte DebridR a été refusée.'
+                    }, status=401 if auth_status in (401, 403) else 502)
+
+                async with session.get(f'{DEBRIDR_BASE_URL}/') as form_response:
+                    form_status = form_response.status
+                    form_html = await form_response.text()
+                    form_url = str(form_response.url)
+
+                if form_status != 200:
+                    return await self._debridr_error_response(form_status, form_html, source_host)
+
+                seed, bits, action = self._extract_debridr_pow(form_html)
+                if not seed:
+                    logger.warning('[DEBRID][DEBRIDR] Form layout changed or proof-of-work fields are missing')
+                    return web.json_response({
+                        'status': 'error',
+                        'error': 'La page DebridR a changé. Le connecteur doit être mis à jour.'
+                    }, status=502)
+
+                nonce = await asyncio.to_thread(self._solve_debridr_pow, seed, bits)
+                if nonce is None:
+                    logger.warning('[DEBRID][DEBRIDR] Proof-of-work could not be completed within the configured limit')
+                    return web.json_response({
+                        'status': 'error',
+                        'error': 'DebridR demande une vérification qui n’a pas pu être finalisée. Réessayez plus tard.'
+                    }, status=503)
+
+                payload = {'url': link, 'pow_seed': seed, 'pow_nonce': str(nonce)}
+                async with session.post(
+                    urljoin(form_url, action),
+                    data=payload,
+                    headers={'Referer': form_url},
+                ) as result_response:
+                    result_status = result_response.status
+                    result_html = await result_response.text()
+                    result_url = str(result_response.url)
+
+                direct_link = ''
+                direct_status = 502
+                direct_html = ''
+                filename = ''
+                filesize = 0
+                if 200 <= result_status < 300:
+                    result_soup = BeautifulSoup(result_html, 'html.parser')
+                    download_element = result_soup.select_one('a.dl[href]')
+                    if download_element:
+                        go_link = urljoin(result_url, str(download_element.get('href', '')).strip())
+                        direct_link, direct_status, direct_html = await self._resolve_debridr_direct_download(
+                            session,
+                            result_url,
+                            go_link,
+                        )
+                        filename_element = result_soup.select_one('.fname')
+                        size_element = result_soup.select_one('.fsize')
+                        filename = filename_element.get_text(' ', strip=True) if filename_element else ''
+                        filesize = self._parse_debrid_filesize(
+                            size_element.get_text(' ', strip=True) if size_element else ''
+                        )
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return web.json_response({
+                'status': 'error',
+                'error': 'Impossible de joindre DebridR. Réessayez dans quelques instants.'
+            }, status=502)
+
+        if not 200 <= result_status < 300:
+            return await self._debridr_error_response(result_status, result_html, source_host)
+
+        if not direct_link:
+            return await self._debridr_error_response(direct_status, direct_html or result_html, source_host)
+
+        parsed_download_link = urlparse(direct_link)
+        if parsed_download_link.scheme not in ('http', 'https') or not parsed_download_link.netloc:
+            logger.warning('[DEBRID][DEBRIDR] Result page returned an invalid download URL')
+            return web.json_response({
+                'status': 'error',
+                'error': 'DebridR a renvoyé un lien de téléchargement invalide.'
+            }, status=502)
+
+        return web.json_response({
+            'status': 'success',
+            'data': {
+                'link': direct_link,
+                'filename': filename or self._guess_filename_from_url(link) or 'download.bin',
+                'filesize': filesize,
+                'host': source_host,
+            }
+        })
+
     async def debrid_unlock_handler(self, request: Request) -> Response:
         """Unlock a link via the selected debrid provider."""
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
             data = await request.json()
-            link = data.get('link', '').strip()
-            password = data.get('password', '').strip()
+            if not isinstance(data, dict):
+                return web.json_response({'status': 'error', 'error': 'Requête invalide'}, status=400)
+
+            raw_link = data.get('link', '')
+            raw_password = data.get('password', '')
+            link = raw_link.strip() if isinstance(raw_link, str) else ''
+            password = raw_password.strip() if isinstance(raw_password, str) else ''
             provider = (str(data.get('provider', 'deepbrid')).strip().lower() or 'deepbrid').replace('-', '')
 
             if not link:
@@ -1753,6 +2095,9 @@ class ProxyServer:
 
             if provider == 'realdebrid':
                 return await self._unlock_with_realdebrid(link, password)
+
+            if provider == 'debridr':
+                return await self._unlock_with_debridr(link)
 
             return await self._unlock_with_deepbrid(link, password)
 
@@ -2666,17 +3011,6 @@ class ProxyServer:
             target_host = 'vmwesa.online'
         
         # Service-specific headers
-        if self.RE_NIGGAFLIX.search(target_url):
-            return {
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Connection': 'keep-alive',
-                'Host': target_host,
-                'Origin': 'https://rivestream.org',
-                'Referer': 'https://rivestream.org/',
-                'User-Agent': 'Mozilla/5.0 Firefox/141.0'
-            }
-        
         if self.RE_VMWESA.search(target_url):
             return {
                 'Accept': '*/*',
@@ -2710,9 +3044,10 @@ class ProxyServer:
                 'Host': target_host,
                 'Origin': 'https://fsvid.lol',
                 'Referer': 'https://fsvid.lol/',
+                'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
                 'User-Agent': 'Mozilla/5.0 Chrome/139.0.0.0'
             }
-        
+
         if self.RE_SIBNET.search(target_url):
             return {'Accept': '*/*'}
         
@@ -2736,9 +3071,10 @@ class ProxyServer:
                 'Host': target_host,
                 'Origin': 'https://vidzy.org',
                 'Referer': 'https://vidzy.org/',
+                'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
                 'User-Agent': 'Mozilla/5.0 Chrome/141.0.0.0'
             }
-        
+
         if self.RE_BANDWIDTH.search(target_url):
             return {
                 'Accept': '*/*',
@@ -3242,65 +3578,91 @@ class ProxyServer:
             return None
 
         # Current Fsvid/Vidzy pages derive the XOR key for each byte from an
-        # affine expression, then optionally reverse the decoded byte sequence.
-        # Capture the page's variable names and parameters instead of evaluating
-        # remote JavaScript or hard-coding today's seed/step values.
+        # affine expression that also mixes in the sum of location.hostname's
+        # char codes, and reverse the decoded byte sequence either before or
+        # after the loop. Capture the page's variable names and parameters
+        # instead of evaluating remote JavaScript or hard-coding today's values.
         rolling_xor_pattern = re.compile(
-            r'(?:var\s+)?(?P<raw_bytes>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)'
-            r'(?:\s*,\s*(?P<bytes>[A-Za-z_$][\w$]*)\s*=\s*(?P=raw_bytes)\.split\(\s*["\']["\']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["\']["\']\s*\))?'
+            r'(?:var\s+)?(?P<bytes>[A-Za-z_$][\w$]*)\s*=\s*atob\('
+            r'\s*[A-Za-z_$][\w$]*\s*\)'
+            r'(?:\s*,\s*(?P<pre_reverse>[A-Za-z_$][\w$]*)\s*=\s*(?P=bytes)'
+            r'\.split\(\s*["\']["\']\s*\)\s*\.reverse\(\s*\)\s*'
+            r'\.join\(\s*["\']["\']\s*\))?'
             r'.{0,512}?for\s*\(\s*var\s+(?P<index>[A-Za-z_$][\w$]*)'
-            r'\s*=\s*0\s*;\s*(?P=index)\s*<\s*(?:[A-Za-z_$][\w$]*)\.length\s*;'
+            r'\s*=\s*0\s*;\s*(?P=index)\s*<\s*[A-Za-z_$][\w$]*\.length\s*;'
             r'\s*(?P=index)\+\+\s*\)\s*\{'
             r'.{0,512}?(?:var\s+)?(?P<key>[A-Za-z_$][\w$]*)\s*=\s*\('
             r'\s*(?P<key_expr>.{1,128}?)\s*\)\s*&\s*'
             r'(?P<mask>0[xX][0-9a-fA-F]+|\d+)\s*;'
             r'.{0,512}?(?P<output>[A-Za-z_$][\w$]*)\s*\+=\s*'
-            r'String\.fromCharCode\(\s*(?:[A-Za-z_$][\w$]*)\.charCodeAt\(\s*(?P=index)\s*\)\s*\^\s*(?P=key)\s*\)'
-            r'.{0,256}?\}\s*return\b'
-            r'.{1,512}?\)\s*\(\s*["\']'
+            r'String\.fromCharCode\(\s*[A-Za-z_$][\w$]*\.charCodeAt\('
+            r'\s*(?P=index)\s*\)\s*\^\s*(?P=key)\s*\)'
+            r'.{0,256}?\}\s*(?P<tail>return\b.{1,512}?)\)\s*\(\s*["\']'
             r'(?P<payload>[A-Za-z0-9+/_=-]{1,32768})["\']\s*\)',
             re.DOTALL,
         )
+        numeric_literal = re.compile(r'^(?:0[xX][0-9a-fA-F]+|\d+)$')
+        identifier = re.compile(r'^[A-Za-z_$][\w$]*$')
 
-        def parse_rolling_expression(expression: str, index_name: str, mask: int) -> Optional[Tuple[int, int]]:
-            expr = expression.strip().replace(' ', '')
-            if not expr.startswith(('+', '-')):
-                expr = '+' + expr
-            terms = re.findall(r'[-+][^+-]+', expr)
+        def hostname_char_sum(mask: int) -> int:
+            """Replay the page's `for (c of location.hostname) H = (H + c) & mask`."""
+            hostname = (urlparse(embed_url).hostname or '').lower()
+            total = 0
+            for character in hostname:
+                total = (total + ord(character)) & mask
+            return total
+
+        def parse_rolling_parameters(
+            expression: str,
+            index_name: str,
+            mask: int,
+        ) -> Optional[Tuple[int, int]]:
+            """Split `0x3d+i*89+H` style key expressions into (seed, step)."""
+            normalized = re.sub(r'[\s()]', '', expression)
+            if not normalized:
+                return None
+            if normalized[0] not in '+-':
+                normalized = '+' + normalized
+
+            terms = re.findall(r'[-+][^+-]+', normalized)
+            if not terms or ''.join(terms) != normalized:
+                return None
+
             seed = 0
             step = 0
-            
-            hostname_sum = 0
-            if re.search(r'location(?:\.hostname|\[[\'"]hostname[\'"]\])?', script) or 'charCodeAt' in script:
-                try:
-                    parsed = urlparse(embed_url)
-                    hostname = parsed.hostname or ''
-                    hostname_sum = sum(ord(c) for c in hostname) & mask
-                except Exception:
-                    hostname_sum = 0
-
-            index_pattern = re.escape(index_name)
+            host_sum = None
             for term in terms:
-                sign = -1 if term.startswith('-') else 1
-                t = term[1:].strip('()')
-                if re.search(r'\b' + index_pattern + r'\b', t):
-                    parts = t.split('*')
-                    if len(parts) == 1:
-                        step += sign * 1
-                    elif len(parts) == 2:
-                        num_part = parts[0] if parts[1] == index_name else parts[1]
-                        step += sign * int(num_part, 0)
-                elif re.match(r'^(?:0[xX][0-9a-fA-F]+|\d+)$', t):
-                    seed += sign * int(t, 0)
-                elif re.match(r'^[A-Za-z_$][\w$]*$', t):
-                    seed += sign * hostname_sum
-
+                sign = -1 if term[0] == '-' else 1
+                body = term[1:]
+                if not body:
+                    return None
+                factors = body.split('*')
+                if index_name in factors:
+                    others = [factor for factor in factors if factor != index_name]
+                    if not others:
+                        step += sign
+                        continue
+                    if len(others) != 1 or not numeric_literal.match(others[0]):
+                        return None
+                    step += sign * int(others[0], 0)
+                elif numeric_literal.match(body):
+                    seed += sign * int(body, 0)
+                elif identifier.match(body):
+                    # The only non-numeric term these players use is the
+                    # hostname checksum computed just above the loop.
+                    if host_sum is None:
+                        host_sum = hostname_char_sum(mask)
+                    seed += sign * host_sum
+                else:
+                    return None
             return seed, step
 
         for match in rolling_xor_pattern.finditer(script):
             try:
                 mask = int(match.group('mask'), 0)
-                parameters = parse_rolling_expression(
+                if not 0 <= mask <= 0xFF:
+                    continue
+                parameters = parse_rolling_parameters(
                     match.group('key_expr'),
                     match.group('index'),
                     mask,
@@ -3308,31 +3670,24 @@ class ProxyServer:
                 if parameters is None:
                     continue
                 seed, step = parameters
-                if not (
-                    0 <= seed <= 0xFFFFFFFF
-                    and 0 <= step <= 0xFFFFFFFF
-                    and 0 <= mask <= 0xFF
-                ):
+                if not (-0xFFFFFFFF <= seed <= 0xFFFFFFFF and -0xFFFFFFFF <= step <= 0xFFFFFFFF):
                     continue
 
                 payload = match.group('payload')
                 payload += '=' * (-len(payload) % 4)
                 encrypted = base64.b64decode(payload, altchars=b'-_', validate=True)
-
-                reverse_before = bool(match.group('bytes'))
-                if reverse_before:
+                if match.group('pre_reverse'):
                     encrypted = encrypted[::-1]
-
                 decoded_bytes = bytes(
                     value ^ ((seed + index * step) & mask)
                     for index, value in enumerate(encrypted)
                 )
-
-                reverse_after = '.reverse(' in script[match.start('output'):match.end()] and 'return' in script[match.start('output'):match.end()]
-                if reverse_after:
+                if not match.group('pre_reverse') and re.search(
+                    r'\.reverse\(\s*\)\s*\.join',
+                    match.group('tail'),
+                ):
                     decoded_bytes = decoded_bytes[::-1]
-
-                candidate = normalize(decoded_bytes.decode('utf-8', errors='ignore'))
+                candidate = normalize(decoded_bytes.decode('utf-8'))
                 if candidate:
                     return candidate
             except (ValueError, UnicodeDecodeError, binascii.Error):
@@ -4067,8 +4422,22 @@ class ProxyServer:
                 "Referer": f"{seek_origin}/",
             }
         
+        # Same guard as on the redirect below: never relay the Fsvid/Vidzy decoy
+        # stream, even when it reaches us through a stale cache or a crafted url.
+        if service_name in ('fsvid', 'vidzy') and 'troll' in target_url.lower():
+            logger.warning(
+                "[%s-PROXY] Decoy target refused for %s",
+                service_name.upper(),
+                redact_url_for_log(target_url),
+            )
+            return web.json_response(
+                {"error": "Upstream returned a decoy stream"},
+                status=502,
+                headers=CORS_HEADERS,
+            )
+
         self._request_count += 1
-        
+
         headers = self._with_browser_fetch_metadata(default_headers)
         
         # Detect content type
@@ -4221,6 +4590,23 @@ class ProxyServer:
                                 status=502,
                                 headers=CORS_HEADERS,
                             )
+                    # Fsvid/Vidzy answer a request they judge illegitimate with a
+                    # 302 towards their decoy stream. Following it would play the
+                    # troll video, so surface the rejection instead.
+                    if (
+                        service_name in ('fsvid', 'vidzy')
+                        and 'troll' in redirected.lower()
+                    ):
+                        logger.warning(
+                            "[%s-PROXY] Decoy redirect refused for %s",
+                            service_name.upper(),
+                            redact_url_for_log(target_url),
+                        )
+                        return web.json_response(
+                            {"error": "Upstream returned a decoy stream"},
+                            status=502,
+                            headers=CORS_HEADERS,
+                        )
                     proxied_location = f"{route}?" + urllib.parse.urlencode({
                         "url": redirected,
                         **forwarded_proxy_params,
@@ -4493,6 +4879,7 @@ class ProxyServer:
             'Accept': 'application/vnd.apple.mpegurl,*/*',
             'Origin': 'https://fsvid.lol',
             'Referer': 'https://fsvid.lol/',
+            'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
             'User-Agent': 'Mozilla/5.0 Chrome/139.0.0.0'
         })
 
@@ -4573,6 +4960,7 @@ class ProxyServer:
             'Accept': 'application/vnd.apple.mpegurl,*/*',
             'Origin': 'https://vidzy.org',
             'Referer': 'https://vidzy.org/',
+            'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
             'User-Agent': 'Mozilla/5.0 Chrome/141.0.0.0'
         })
     
