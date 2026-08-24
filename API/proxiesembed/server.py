@@ -1073,8 +1073,11 @@ class ProxyServer:
     RE_FAMILYRESTREAM = re.compile(r'familyrestream\.com', re.IGNORECASE)
     RE_SOSPLAY = re.compile(r'srvagu|6522236688\.shop|vuunov|1396168994\.live', re.IGNORECASE)
     RE_WITV = re.compile(r'lansdrud\.space', re.IGNORECASE)
-    RE_UQLOAD_EMBED = re.compile(r'uqload\.(is|cx|com|net|bz|org|to|io|co)/(embed-)?[^/]+\.html', re.IGNORECASE)
-    RE_UQLOAD = re.compile(r'uqload\.(is|cx|com|bz|net|org|to|io|co)', re.IGNORECASE)
+    # Uqload change régulièrement de TLD (.is, .bz, .cx, .vc, …) : on matche
+    # `uqload.<tld>` génériquement plutôt qu'une liste figée qui casse à chaque
+    # rotation de miroir. La validation stricte reste faite par uqload_utils.
+    RE_UQLOAD_EMBED = re.compile(r'uqload\.[a-z]{2,24}/(embed-)?[^/]+\.html', re.IGNORECASE)
+    RE_UQLOAD = re.compile(r'\buqload\.[a-z]{2,24}(?=[/:?#]|$)', re.IGNORECASE)
     RE_DROPCDN = re.compile(r'dropcdn', re.IGNORECASE)
     RE_SERVERSICURO = re.compile(r'serversicuro', re.IGNORECASE)
     RE_MERI = re.compile(r'merichunidya\.com', re.IGNORECASE)
@@ -3055,7 +3058,7 @@ class ProxyServer:
             try:
                 uqload_origin = get_uqload_site_origin(target_url)
             except ValueError:
-                uqload_origin = 'https://uqload.bz'
+                uqload_origin = 'https://uqload.vc'
             return {
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity;q=1, *;q=0',

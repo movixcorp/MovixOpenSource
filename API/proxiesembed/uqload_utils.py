@@ -6,17 +6,12 @@ import re
 from urllib.parse import urlparse
 
 
-UQLOAD_ROOT_DOMAINS = (
-    "uqload.is",
-    "uqload.bz",
-    "uqload.cx",
-    "uqload.com",
-    "uqload.net",
-    "uqload.org",
-    "uqload.to",
-    "uqload.io",
-    "uqload.co",
-)
+# Uqload fait tourner son domaine (.is, .bz, .cx, .vc, …) et les anciens
+# miroirs redirigent en 301 vers le domaine actif. Une énumération figée
+# cassait l'extraction à chaque rotation, donc on valide le domaine
+# enregistrable `uqload.<tld>`. La garde SSRF reste équivalente : seul un
+# hôte dont les deux derniers labels forment `uqload.<tld>` est accepté.
+UQLOAD_ROOT_RE = re.compile(r"^uqload\.[a-z]{2,24}$")
 
 PACKER_SIGNATURE_RE = re.compile(
     r"eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,"
@@ -38,14 +33,11 @@ VIDEO_ID_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 
 def get_uqload_root_domain(hostname: str | None) -> str | None:
     host = str(hostname or "").lower().rstrip(".")
-    return next(
-        (
-            root
-            for root in UQLOAD_ROOT_DOMAINS
-            if host == root or host.endswith(f".{root}")
-        ),
-        None,
-    )
+    labels = host.split(".")
+    if len(labels) < 2:
+        return None
+    root = ".".join(labels[-2:])
+    return root if UQLOAD_ROOT_RE.fullmatch(root) else None
 
 
 def parse_allowed_uqload_url(raw_url: str):

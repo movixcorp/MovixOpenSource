@@ -1,13 +1,13 @@
 {
-  "version": "2.5.16",
-  "buildNumber": 25,
+  "version": "2.5.17",
+  "buildNumber": 26,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72577173,
-  "apkSha256": "34e0bebbe5884bd7f751280aaf3aedc7579d764e34084621bcb2d16779a42977",
+  "apkSizeBytes": 72577389,
+  "apkSha256": "0593c4d5ea54e1920182ad3f80188fd95f400e98ad138ebbee13c5bbd3f0866e",
   "mandatory": false,
   "releasedAt": "2026-08-24T00:00:00.000Z",
   "releaseNotes": {
-    "fr": "Fsvid et Vidzy relancent à nouveau, et la vidéo leurre est désormais refusée au lieu d'être lue.",
-    "en": "Fsvid and Vidzy play again, and the decoy video is now rejected instead of played."
+    "fr": "Uqload fonctionne à nouveau après son changement de domaine.",
+    "en": "Uqload works again after its domain change."
   }
 }

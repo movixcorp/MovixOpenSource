@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.14
+// @version      1.4.15
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -419,7 +419,7 @@
 
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-      version: "1.4.14",
+      version: "1.4.15",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -624,6 +624,7 @@
     origin: "Origin",
     range: "Range",
     referer: "Referer",
+    "sec-ch-ua": "Sec-Ch-Ua",
     "user-agent": "User-Agent",
   };
   const CAST_SOURCE_MAX_URL_LENGTH = 16384;
@@ -1570,27 +1571,21 @@
       "al\\s*\\(\\s*function\\s*\\(\\s*p\\s*,\\s*a\\s*,\\s*c\\s*,\\s*k\\s*,\\s*e\\s*,\\s*d\\s*\\)",
   );
 
-  const UQLOAD_ROOT_DOMAINS = Object.freeze([
-    "uqload.is",
-    "uqload.bz",
-    "uqload.cx",
-    "uqload.com",
-    "uqload.net",
-    "uqload.org",
-    "uqload.to",
-    "uqload.io",
-    "uqload.co",
-  ]);
+  // Uqload change régulièrement de TLD (.is, .bz, .cx, .vc, …) et les miroirs
+  // redirigent vers le domaine actif. Une liste figée casse l'extraction à
+  // chaque rotation, donc on valide le domaine enregistrable `uqload.<tld>`
+  // plutôt qu'une énumération. La garde SSRF reste équivalente : seul un hôte
+  // dont le domaine enregistrable est `uqload.<tld>` est accepté.
+  const UQLOAD_ROOT_PATTERN = /^uqload\.[a-z]{2,24}$/;
 
   function getUqloadRootDomain(hostname) {
     const host = String(hostname || "")
       .toLowerCase()
       .replace(/\.$/, "");
-    return (
-      UQLOAD_ROOT_DOMAINS.find(
-        (root) => host === root || host.endsWith(`.${root}`),
-      ) || null
-    );
+    const labels = host.split(".");
+    if (labels.length < 2) return null;
+    const root = labels.slice(-2).join(".");
+    return UQLOAD_ROOT_PATTERN.test(root) ? root : null;
   }
 
   function parseAllowedUqloadUrl(rawUrl) {
@@ -3405,7 +3400,7 @@
     vidzy: (url) => url.toLowerCase().includes("vidzy"),
     vidmoly: (url) => url.toLowerCase().includes("vidmoly"),
     sibnet: (url) => url.toLowerCase().includes("sibnet.ru"),
-    uqload: (url) => /uqload\.(is|cx|com|bz|net|org|to|io|co)/i.test(url),
+    uqload: (url) => /\buqload\.[a-z]{2,24}(?=[/:?#]|$)/i.test(url),
     doodstream: (url) => {
       const lower = url.toLowerCase();
       return (
@@ -3618,14 +3613,26 @@
 
     try {
       const parsedUrl = new URL(url);
-      // Sibnet redirects to CDN subdomains (e.g. dv97.sibnet.ru),
-      // so we use a wildcard pattern to cover all subdomains.
-      const domainPattern =
-        type === "seekstreaming"
-          ? getSeekStreamingPlaybackRulePattern(url)
-          : type === "sibnet"
-            ? "*://*.sibnet.ru/*"
-            : `*://${parsedUrl.hostname}/*`;
+      const labels = parsedUrl.hostname.split(".");
+      const registrable =
+        labels.length > 2 ? labels.slice(-2).join(".") : parsedUrl.hostname;
+      // Sibnet redirects to CDN subdomains (e.g. dv97.sibnet.ru), and Fsvid/Vidzy
+      // rotate their media across sibling hosts too (s1/s2.fsvid.lol,
+      // v1..v4.vidzy.org, media served from vidzy.cc). A rule pinned to the exact
+      // hostname of the extracted m3u8 leaves those hosts unmatched, so the player
+      // fetches their segments with the site's own Origin and the CDN answers 403.
+      let domainPattern = `*://${parsedUrl.hostname}/*`;
+      if (type === "seekstreaming") {
+        domainPattern = getSeekStreamingPlaybackRulePattern(url);
+      } else if (type === "sibnet") {
+        domainPattern = "*://*.sibnet.ru/*";
+      } else if (type === "vidzy") {
+        // Same referer on the apex and on every sub-host, so one rule covers both.
+        domainPattern = `*://*${registrable}/*`;
+      } else if (type === "fsvid" && parsedUrl.hostname !== registrable) {
+        // The fsvid apex needs the fs13.lol referer, so only widen the CDN hosts.
+        domainPattern = `*://*.${registrable}/*`;
+      }
       if (!domainPattern) return null;
       return { domainPattern, headers: hdrs };
     } catch (e) {
