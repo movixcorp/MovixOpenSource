@@ -267,6 +267,10 @@ const NotificationsPopup: React.FC<NotificationsPopupProps> = ({ onClose, onNoti
             <span className="font-semibold">{notification.fromUsername}</span> {t('notifications.reportDismissed')}
           </span>
         );
+      case 'content_movie_available':
+      case 'content_episode_available':
+      case 'content_season_available':
+        return <span>{notification.content}</span>;
       default:
         return (
           <span>{t('notifications.newNotification')}</span>

@@ -12,6 +12,7 @@ Le service tourne en mode cluster via `server.js` : un master lance plusieurs wo
 - commentaires, likes, listes partagées, Wishboard et soumission de liens
 - Live TV, proxies, debrid et intégrations de scraping
 - VIP, invoices, wrapped et features communautaires
+- notifications quotidiennes quand un film, un épisode ou une saison suivie devient réellement lisible
 
 ## Démarrage
 
@@ -55,6 +56,8 @@ npm run db:init -- --dry-run
 
 Le dry-run se connecte tout de même à la base configurée dans `.env`. Il ne doit donc pas être confondu avec une vérification locale hors connexion.
 
+Les notifications de disponibilité utilisent les tables `content_notification_trackers` et `content_notification_events`. Il faut donc exécuter `npm run db:init` avant d'activer le planificateur sur une base existante. Le premier scan crée une référence sans envoyer les disponibilités historiques ; les scans suivants n'alertent que les nouvelles transitions et regroupent les épisodes d'une même série.
+
 ## Architecture
 
 ```text
@@ -73,6 +76,7 @@ API/Mainapi/
 |-- top10Routes.js            # Classements
 |-- wrappedRoutes.js          # Wrapped
 |-- linkSubmissionsRoutes.js  # Soumission de liens
+|-- services/contentNotifications/ # Scan quotidien, disponibilité et Web Push
 |-- utils/                    # Cache, proxies, axios helpers, VIP, etc.
 |-- cache/                    # Caches disque
 `-- exportscripts/            # SQL et scripts de migration

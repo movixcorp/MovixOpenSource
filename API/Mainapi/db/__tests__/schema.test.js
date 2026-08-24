@@ -5,6 +5,7 @@ const EXPECTED_TABLES = [
   'access_keys', 'account_links', 'admins', 'banned_users',
   'comments', 'comment_replies', 'comment_reactions', 'notifications',
   'likes', 'reports', 'user_notification_preferences', 'push_subscriptions',
+  'content_notification_trackers', 'content_notification_events',
   'shared_lists', 'user_sessions', 'films', 'series', 'link_submissions',
   'download_links_history', 'help_feedback', 'wishboard_requests',
   'wishboard_votes', 'wishboard_notes', 'wishboard_status_history',

@@ -1,7 +1,8 @@
 import axios from 'axios';
 
 const API_URL = import.meta.env.VITE_MAIN_API;
-const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY;
+const CONFIGURED_VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY;
+let vapidPublicKeyPromise: Promise<string | null> | null = null;
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
@@ -56,18 +57,36 @@ export function hasDismissedPermanently(): boolean {
   return localStorage.getItem('push_banner_dismissed_permanently') === 'true';
 }
 
+export function resetPushBannerDismissal(): void {
+  localStorage.removeItem('push_banner_dismissed_at');
+  localStorage.removeItem('push_banner_dismissed_permanently');
+}
+
+async function getVapidPublicKey(): Promise<string | null> {
+  if (CONFIGURED_VAPID_PUBLIC_KEY) return CONFIGURED_VAPID_PUBLIC_KEY;
+  if (!vapidPublicKeyPromise) {
+    vapidPublicKeyPromise = axios
+      .get(`${API_URL}/api/comments/notifications/push/vapid-key`)
+      .then((response) => response.data?.publicKey || null)
+      .catch(() => null);
+  }
+  return vapidPublicKeyPromise;
+}
+
 /** Demande la permission et souscrit aux push notifications */
 export async function subscribeToPush(): Promise<boolean> {
-  if (!isPushSupported() || !VAPID_PUBLIC_KEY) return false;
+  if (!isPushSupported()) return false;
 
   try {
+    const vapidPublicKey = await getVapidPublicKey();
+    if (!vapidPublicKey) return false;
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') return false;
 
     const registration = await navigator.serviceWorker.ready;
     const subscription = await registration.pushManager.subscribe({
       userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
     });
 
     const token = localStorage.getItem('auth_token');
@@ -79,6 +98,7 @@ export async function subscribeToPush(): Promise<boolean> {
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
+    resetPushBannerDismissal();
     return true;
   } catch (error) {
     console.error('Erreur lors de la souscription push:', error);
