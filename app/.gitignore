@@ -17,6 +17,10 @@ xcuserdata
 DerivedData
 *.hmap
 *.ipa
+# Exception : l'IPA non signée publiée par le workflow ios-unsigned est
+# volontairement suivie, comme movix-android.apk, pour être téléchargeable
+# depuis raw.githubusercontent.
+!movix-ios-unsigner.ipa
 *.xcuserstate
 ios/.xcode.env.local
 **/.xcode.env.local
