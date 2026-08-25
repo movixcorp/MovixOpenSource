@@ -7,20 +7,18 @@ import HLSPlayer from '../../components/HLSPlayer';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
-import { extractM3u8FromEmbed, extractVoeM3u8, extractUqloadFile, extractVidzyM3u8, extractFsvidM3u8, extractOneUploadSources, isOneUploadEmbed, isVoeEmbed, extractDoodStreamFile, extractSeekStreamingM3u8, isDoodStreamEmbed, isSeekStreamingEmbed, isDoodStreamExtractionEnabled, isSeekStreamingExtractionEnabled, type M3u8Result } from '../../utils/extractM3u8';
-import { expandSeekStreamingSources, type SeekStreamingHlsSource } from '../../utils/seekStreamingCandidates';
+import { extractM3u8FromEmbed, extractUqloadFile, extractVidzyM3u8, extractFsvidM3u8, extractDoodStreamFile, isDoodStreamExtractionEnabled, registerServerResolvedSources, type M3u8Result } from '../../utils/extractM3u8';
+import type { SeekStreamingHlsSource } from '../../utils/seekStreamingCandidates';
+import { runExtractionPass } from '../../utils/runExtractionPass';
 import { pickAutoSelectedSource, sortHostersByPriority, type SourceAvailability } from '../../utils/sourceAutoSelect';
 import type { TopLevelSourceId } from '../../types/sourcePriority';
 import { getSourcePriorityPrefs, subscribeToPriorityChanges } from '../../utils/sourcePriorityPrefs';
 import { detectHoster } from '../../utils/hosterRegistry';
 import { setLastPlayer } from '../../utils/lastPlayerPref';
 import { getTmdbId } from '../../utils/idEncoder';
-import { generateRivestreamSecretKey } from '../../utils/rivestreamSecretKey';
 import { useWrappedTracker } from '../../hooks/useWrappedTracker';
 import { isUserVip, getVipHeaders } from '../../utils/authUtils';
 import { isExtensionAvailable } from '../../utils/extensionProxy';
-import { RIVESTREAM_PROXIES } from '../../config/rivestreamProxy';
-import { buildProxyUrl } from '../../config/runtime';
 import { getTmdbLanguage } from '../../i18n';
 import { useProfile } from '../../context/ProfileContext';
 import { isContentAllowed, getClassificationLabel } from '../../utils/certificationUtils';
@@ -35,25 +33,6 @@ import {
 } from '../../utils/hlsAutoFallbackGuard';
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
-
-// Constante pour contrôler la vérification VIP pour Rivestream
-const ENABLE_RIVESTREAM_VIP_CHECK = false;
-
-// Helper function to check if Rivestream is available (VIP check if enabled)
-const isRivestreamAvailable = (): boolean => {
-  if (!ENABLE_RIVESTREAM_VIP_CHECK) {
-    return true; // Si la vérification VIP est désactivée, Rivestream est toujours disponible
-  }
-  return isUserVip();
-};
-
-// Helper function to generate proxy URL for fsvid sources
-const getProxyUrl = (url: string): string => {
-  if (url.toLowerCase().includes('fsvid')) {
-    return buildProxyUrl(url);
-  }
-  return url;
-};
 
 const normalizeUqloadEmbedUrl = (url: string): string => {
   return url
@@ -230,7 +209,7 @@ interface NightflixSource {
   label?: string;
 }
 
-type PlayerSourceType = 'primary' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'multi' | 'omega' | 'darkino' | 'mp4' | 'coflix' | 'frembed' | 'custom' | 'nexus_hls' | 'nexus_file' | 'fstream' | 'wiflix' | 'j1f' | 'swiftflow' | 'viper' | 'vidmoly' | 'dropload' | 'adfree' | 'rivestream_hls' | 'rivestream' | 'bravo' | 'kisskh' | number;
+type PlayerSourceType = 'primary' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'multi' | 'omega' | 'darkino' | 'mp4' | 'coflix' | 'frembed' | 'custom' | 'nexus_hls' | 'nexus_file' | 'fstream' | 'wiflix' | 'j1f' | 'swiftflow' | 'viper' | 'vidmoly' | 'dropload' | 'adfree' | 'bravo' | 'kisskh' | number;
 
 function formatPremidSourceDetail(...parts: Array<string | null | undefined>) {
   const normalizedParts = parts
@@ -244,6 +223,14 @@ function formatPremidSourceDetail(...parts: Array<string | null | undefined>) {
 }
 
 // Helper functions - Check custom links from MySQL API
+// Config commune des appels catalogue en contexte de lecture : `resolve=1`
+// demande la résolution serveur des m3u8, la clé VIP l'autorise.
+//
+// Une fonction et non une constante : `checkMovieAvailability` vit au niveau
+// module, hors du composant, et la clé VIP doit de toute façon être relue à
+// chaque appel plutôt que figée au chargement.
+const resolveRequest = () => ({ params: { resolve: 1 }, headers: { ...getVipHeaders() } });
+
 const checkMovieAvailability = async (movieId: string) => {
   try {
     const customLinks: string[] = [];
@@ -251,7 +238,11 @@ const checkMovieAvailability = async (movieId: string) => {
 
     // Fetch custom links from MySQL API
     try {
-      const response = await axios.get(`${MAIN_API}/api/links/movie/${movieId}`);
+      // `resolve=1` : le serveur résout les m3u8 des liens communautaires de ce
+      // film (ils viennent de sa base, pas du client). Enregistré tout de suite,
+      // la table `m3u8ByPlayer` serait perdue en aval.
+      const response = await axios.get(`${MAIN_API}/api/links/movie/${movieId}`, resolveRequest());
+      registerServerResolvedSources(response.data);
 
       if (response.data && response.data.success && response.data.data && response.data.data.links) {
         const rawLinks = response.data.data.links;
@@ -351,23 +342,6 @@ function getMultiFromCoflix(coflixData: CoflixResponse | null) {
   );
 }
 
-// Interface pour la réponse Rivestream
-interface RivestreamResponse {
-  data?: {
-    sources?: Array<{
-      quality: number;
-      url: string;
-      source: string;
-      size?: string;
-      format?: string;
-    }>;
-    captions?: Array<{
-      label: string;
-      file: string;
-    }>;
-  };
-}
-
 const WatchMovie: React.FC = () => {
   const { tmdbid: encodedId } = useParams<{ tmdbid: string }>();
 
@@ -463,13 +437,6 @@ const WatchMovie: React.FC = () => {
   // PurStream (Bravo) HLS states
   const [purstreamSources, setPurstreamSources] = useState<{ url: string; label: string }[]>([]);
   const canUseBravo = isUserVip() || isExtensionAvailable();
-
-  // Rivestream VO/VOSTFR HLS states
-  const [rivestreamSources, setRivestreamSources] = useState<{ url: string; label: string; quality: number; service: string; category: string }[]>([]);
-  const [selectedRivestreamSource, setSelectedRivestreamSource] = useState<number>(0);
-  const [loadingRivestream, setLoadingRivestream] = useState(false);
-  const [rivestreamLoaded, setRivestreamLoaded] = useState(false);
-  const [rivestreamCaptions, setRivestreamCaptions] = useState<{ label: string; file: string }[]>([]);
 
   // Bump à chaque changement de prefs de priorité pour re-trier les sortedX.
   const [prefsVersion, setPrefsVersion] = useState<number>(0);
@@ -586,9 +553,6 @@ const WatchMovie: React.FC = () => {
 
   const currentSourceRef = useRef<string>('darkino');
 
-  // Ref to track if we're loading Rivestream sources (to keep menu open)
-  const isLoadingRivestreamRef = useRef(false);
-
   // Ref tracking the URL currently active in the player (videoSource or embedUrl).
   // Used to reject stale auto-fallback sourceChange events from an unmounted/previous player.
   const currentActiveUrlRef = useRef<string>('');
@@ -634,14 +598,6 @@ const WatchMovie: React.FC = () => {
         videoSource
         || nexusFileSources[selectedNexusFileSource]?.url
         || '';
-    } else if (
-      selectedSource === 'rivestream'
-      || selectedSource === 'rivestream_hls'
-    ) {
-      directSourceUrl =
-        videoSource
-        || rivestreamSources[selectedRivestreamSource]?.url
-        || '';
     } else if (selectedSource === 'bravo' || selectedSource === 'kisskh') {
       directSourceUrl = videoSource || '';
     }
@@ -658,12 +614,10 @@ const WatchMovie: React.FC = () => {
     mp4Sources,
     nexusFileSources,
     nexusHlsSources,
-    rivestreamSources,
     selectedDarkinoSource,
     selectedMp4Source,
     selectedNexusFileSource,
     selectedNexusHlsSource,
-    selectedRivestreamSource,
     selectedSource,
     videoSource,
   ]);
@@ -908,7 +862,9 @@ const WatchMovie: React.FC = () => {
           return { customLinks: [], mp4Links: [], frembedAvailable: false }; // Default/error state
         }).finally(() => setLoadingFrembed(false));
 
-      const coflixPromise = axios.get(`${MAIN_API}/api/tmdb/movie/${id}`)
+      // `resolve=1` : le serveur résout lui-même les m3u8 de ce film. Réservé
+      // à la lecture — la navigation ne doit pas déclencher d'extraction.
+      const coflixPromise = axios.get(`${MAIN_API}/api/tmdb/movie/${id}`, resolveRequest())
         .then(response => response.data)
         .catch(error => {
           console.error('Error fetching Coflix sources:', error);
@@ -956,8 +912,12 @@ const WatchMovie: React.FC = () => {
       // =========== CHECK FSTREAM SOURCE ==========
       const fstreamPromise = (async () => {
         try {
-          // Envoyer la clé VIP via header pour vérification côté serveur
+          // La clé VIP part en header, et `resolve=1` demande au serveur de
+          // résoudre lui-même les m3u8 du film. Sans ce paramètre il n'extrait
+          // pas, pour ne pas travailler en double avec les clients qui
+          // ignorent encore `m3u8Url`.
           const fstreamResponse = await axios.get(`${MAIN_API}/api/fstream/movie/${id}`, {
+            params: { resolve: 1 },
             headers: { ...getVipHeaders() }
           });
           return fstreamResponse.data;
@@ -968,7 +928,7 @@ const WatchMovie: React.FC = () => {
       })().finally(() => setLoadingFstream(false));
 
       // =========== CHECK WIFLIX (LYNX) SOURCE ===========
-      const wiflixPromise: Promise<WiflixMovieResponse | null> = axios.get(`${MAIN_API}/api/wiflix/movie/${id}`)
+      const wiflixPromise: Promise<WiflixMovieResponse | null> = axios.get(`${MAIN_API}/api/wiflix/movie/${id}`, resolveRequest())
         .then(response => response.data as WiflixMovieResponse)
         .catch(error => {
           console.error('Error fetching Wiflix/Lynx source:', error);
@@ -976,7 +936,7 @@ const WatchMovie: React.FC = () => {
         }).finally(() => setLoadingWiflix(false));
 
       // =========== CHECK J1F (1JOUR1FILM) SOURCE ===========
-      const j1fPromise: Promise<J1fMovieResponse | null> = axios.get(`${MAIN_API}/api/j1f/movie/${id}`)
+      const j1fPromise: Promise<J1fMovieResponse | null> = axios.get(`${MAIN_API}/api/j1f/movie/${id}`, resolveRequest())
         .then(response => response.data as J1fMovieResponse)
         .catch(error => {
           console.error('Error fetching 1jour1film source:', error);
@@ -984,7 +944,7 @@ const WatchMovie: React.FC = () => {
         }).finally(() => setLoadingJ1f(false));
 
       // =========== CHECK SWIFTFLOW SOURCE ===========
-      const swiftflowPromise: Promise<SwiftflowMovieResponse | null> = axios.get(`${MAIN_API}/api/swiftflow/movie/${id}`)
+      const swiftflowPromise: Promise<SwiftflowMovieResponse | null> = axios.get(`${MAIN_API}/api/swiftflow/movie/${id}`, resolveRequest())
         .then(response => response.data as SwiftflowMovieResponse)
         .catch(error => {
           console.error('Error fetching SwiftFlow source:', error);
@@ -992,7 +952,7 @@ const WatchMovie: React.FC = () => {
         }).finally(() => setLoadingSwiftflow(false));
 
       // =========== CHECK VIPER (CPASMAL) SOURCE ===========
-      const viperPromise: Promise<ViperMovieResponse | null> = axios.get(`${MAIN_API}/api/cpasmal/movie/${id}`)
+      const viperPromise: Promise<ViperMovieResponse | null> = axios.get(`${MAIN_API}/api/cpasmal/movie/${id}`, resolveRequest())
         .then(response => response.data as ViperMovieResponse)
         .catch(error => {
           console.error('Error fetching Viper/Cpasmal source:', error);
@@ -1023,6 +983,14 @@ const WatchMovie: React.FC = () => {
         j1fPromise,
         swiftflowPromise
       ]);
+
+      // Mémorise les m3u8 que le serveur a résolues pour ces catalogues.
+      // C'est la SEULE façon dont une m3u8 parvient au client : il n'existe
+      // plus d'endpoint acceptant une URL à extraire.
+      [
+        coflixResult, omegaResult, purstreamResult, fstreamResult,
+        wiflixResult, viperResult, j1fResult, swiftflowResult,
+      ].forEach(registerServerResolvedSources);
 
       // =========== DÉBUT DES EXTRACTIONS (APRÈS LES REQUÊTES PRINCIPALES) ===========
       console.log('🔄 Début des extractions M3U8...');
@@ -1250,211 +1218,40 @@ const WatchMovie: React.FC = () => {
             console.log(`✅ Added ${validDroploadResults.length} Firebase Dropload HLS sources`);
           }
         }
-      // Process Firebase custom links for VOE.SX and UQLOAD extraction
+      // Process Firebase custom links — passe d'extraction générique
       if (customLinks.length > 0) {
-        // VOE.SX (HLS) - Paralléliser
-        try {
-          const voeLinks = customLinks.filter(url => typeof url === 'string' && url.toLowerCase().includes('voe.'));
-          console.log(`[VOE/UQLOAD][MOVIE] Found ${voeLinks.length} VOE links from Firebase`, voeLinks);
-
-          if (voeLinks.length > 0) {
-            const voePromises = voeLinks.map(async (voeUrl) => {
-              try {
-                console.log('[VOE/UQLOAD][MOVIE] Extracting VOE m3u8 from Firebase link:', voeUrl);
-                const voeResult = await extractVoeM3u8(voeUrl);
-                if (voeResult?.success && voeResult.hlsUrl) {
-                  return { url: voeResult.hlsUrl, label: 'Voe HLS 720p' };
-                }
-              } catch (e) {
-                console.error('❌ Error extracting VOE m3u8 from Firebase link:', e);
-              }
-              return null;
-            });
-
-            const voeResults = await Promise.all(voePromises);
-            const validVoeResults = voeResults.filter(result => result !== null);
-            finalHlsSources = [...finalHlsSources, ...validVoeResults];
-            console.log(`[VOE/UQLOAD][MOVIE] Added ${validVoeResults.length} VOE HLS sources from Firebase`);
-          }
-        } catch { }
-
-        // UQLOAD (File MP4) - Paralléliser
-        try {
-          const uqLinks = customLinks.filter(url => typeof url === 'string' && url.toLowerCase().includes('uqload'));
-          console.log(`[VOE/UQLOAD][MOVIE] Found ${uqLinks.length} UQLOAD links from Firebase`, uqLinks);
-
-          if (uqLinks.length > 0) {
-            const uqPromises = uqLinks.map(async (uqUrl) => {
-              try {
-                console.log('[VOE/UQLOAD][MOVIE] Extracting UQLOAD file from Firebase link:', uqUrl);
-                const uqResult = await extractUqloadFile(normalizeUqloadEmbedUrl(uqUrl), MAIN_API);
-                if (uqResult?.success && uqResult.m3u8Url) {
-                  return { url: uqResult.m3u8Url, label: 'Uqload 360p' };
-                }
-              } catch (e) {
-                console.error('❌ Error extracting UQLOAD from Firebase link:', e);
-              }
-              return null;
-            });
-
-            const uqResults = await Promise.all(uqPromises);
-            const validUqResults = uqResults.filter(result => result !== null);
-            finalFileSources = [...finalFileSources, ...validUqResults];
-            console.log(`[VOE/UQLOAD][MOVIE] Added ${validUqResults.length} UQLOAD file sources from Firebase`);
-          }
-        } catch { }
-
-        // DOODSTREAM from Firebase custom links
-        try {
-          const doodLinks = customLinks.filter((url: string) => typeof url === 'string' && isDoodStreamEmbed(url));
-          if (doodLinks.length > 0) {
-            console.log(`[DOODSTREAM/FIREBASE][MOVIE] Found ${doodLinks.length} DoodStream links from Firebase`);
-            const doodPromises = doodLinks.map(async (doodUrl: string) => {
-              try {
-                const doodResult = await extractDoodStreamFile(doodUrl);
-                if (doodResult?.success && doodResult.m3u8Url) {
-                  return { url: doodResult.m3u8Url, label: 'DoodStream' };
-                }
-              } catch (e) {
-                console.error('❌ Error extracting DoodStream from Firebase link:', e);
-              }
-              return null;
-            });
-            const doodResults = await Promise.all(doodPromises);
-            const validDoodResults = doodResults.filter(result => result !== null);
-            finalFileSources = [...finalFileSources, ...validDoodResults];
-            console.log(`✅ Added ${validDoodResults.length} DoodStream sources from Firebase`);
-          }
-        } catch { }
-
-        // SEEKSTREAMING from Firebase custom links
-        try {
-          const seekLinks = customLinks.filter((url: string) => typeof url === 'string' && isSeekStreamingEmbed(url));
-          if (seekLinks.length > 0) {
-            console.log(`[SEEKSTREAMING/FIREBASE][MOVIE] Found ${seekLinks.length} SeekStreaming links from Firebase`);
-            const seekPromises = seekLinks.map(async (seekUrl: string) => {
-              try {
-                const seekResult = await extractSeekStreamingM3u8(seekUrl);
-                  return expandSeekStreamingSources(seekResult, {
-                    label: 'SeekStreaming HLS',
-                    seekEmbedUrl: seekUrl,
-                  });
-              } catch (e) {
-                console.error('❌ Error extracting SeekStreaming from Firebase link:', e);
-              }
-              return [];
-            });
-            const seekResults = await Promise.all(seekPromises);
-            const validSeekResults = seekResults.flat();
-            finalHlsSources = [...finalHlsSources, ...validSeekResults];
-            console.log(`✅ Added ${validSeekResults.length} SeekStreaming HLS sources from Firebase`);
-          }
-        } catch { }
+        const customPass = await runExtractionPass(
+          customLinks
+            .filter((url: unknown): url is string => typeof url === 'string' && !!url)
+            .map((url: string) => ({ url })),
+          MAIN_API,
+          {
+            origin: 'custom',
+            context: { category: 'moviesTv', topLevel: 'custom' },
+          },
+        );
+        finalHlsSources = [...finalHlsSources, ...customPass.hls];
+        finalFileSources = [...finalFileSources, ...customPass.file];
       }
 
-      // Process Coflix MULTI links for VOE.SX and UQLOAD extraction (ignore Omega)
+      // Process Coflix MULTI links — passe d'extraction générique (ignore Omega)
       if (coflixResult && Array.isArray(coflixResult.player_links) && coflixResult.player_links.length > 0) {
-        const decodedLinks = coflixResult.player_links
-          .map((p: any) => getCoflixPreferredUrl(p))
-          .filter((u: string) => !!u);
-
-        // VOE.SX from MULTI - Paralléliser
-        const voeMulti = decodedLinks.filter((u: string) => u.toLowerCase().includes('voe.'));
-        if (voeMulti.length > 0) {
-          const voeMultiPromises = voeMulti.map(async (vUrl: string) => {
-            try {
-              const voeResult = await extractVoeM3u8(vUrl);
-              if (voeResult?.success && voeResult.hlsUrl) {
-                return { url: voeResult.hlsUrl, label: 'Voe HLS 720p' };
-              }
-            } catch (e) {
-              console.error('❌ Error extracting VOE m3u8 from MULTI link:', e);
-            }
-            return null;
-          });
-
-          const voeMultiResults = await Promise.all(voeMultiPromises);
-          const validVoeMultiResults = voeMultiResults.filter(result => result !== null);
-          finalHlsSources = [...finalHlsSources, ...validVoeMultiResults];
-          console.log(`✅ Added ${validVoeMultiResults.length} VOE HLS sources from MULTI`);
-        }
-
-        // UQLOAD from MULTI - Paralléliser
-        const uqMulti = decodedLinks.filter((u: string) => u.toLowerCase().includes('uqload'));
-        if (uqMulti.length > 0) {
-          const uqMultiPromises = uqMulti.map(async (uUrl: string) => {
-            try {
-              const uqResult = await extractUqloadFile(normalizeUqloadEmbedUrl(uUrl), MAIN_API);
-              if (uqResult?.success && uqResult.m3u8Url) {
-                return { url: uqResult.m3u8Url, label: 'Uqload 360p' };
-              }
-            } catch (e) {
-              console.error('❌ Error extracting UQLOAD from MULTI link:', e);
-            }
-            return null;
-          });
-
-          const uqMultiResults = await Promise.all(uqMultiPromises);
-          const validUqMultiResults = uqMultiResults.filter(result => result !== null);
-          finalFileSources = [...finalFileSources, ...validUqMultiResults];
-          console.log(`✅ Added ${validUqMultiResults.length} UQLOAD file sources from MULTI`);
-        }
-
-        // --- DoodStream extraction from MULTI decoded links ---
-        if (isDoodStreamExtractionEnabled()) {
-          const doodMultiLinks = decodedLinks.filter((u: string) => isDoodStreamEmbed(u));
-          if (doodMultiLinks.length > 0) {
-            console.log(`🎬 Found ${doodMultiLinks.length} DoodStream links in MULTI`);
-            const doodMultiPromises = doodMultiLinks.map(async (doodUrl: string) => {
-              try {
-                const result = await extractDoodStreamFile(doodUrl);
-                if (result && result.success && result.m3u8Url) {
-                  const isVostfr = doodUrl.toLowerCase().includes('vostfr');
-                  return {
-                    url: result.m3u8Url,
-                    label: 'DoodStream' + (isVostfr ? ' VOSTFR' : ' VF'),
-                    source: 'doodstream-multi' as const,
-                    isDirect: true
-                  };
-                }
-                return null;
-              } catch (e) {
-                console.error('❌ DoodStream MULTI extraction failed:', e);
-                return null;
-              }
-            });
-            const doodMultiResults = await Promise.all(doodMultiPromises);
-            const validDoodMulti = doodMultiResults.filter(result => result !== null);
-            finalFileSources = [...finalFileSources, ...validDoodMulti];
-            console.log(`✅ Added ${validDoodMulti.length} DoodStream file sources from MULTI`);
-          }
-        }
-
-        // --- SeekStreaming extraction from MULTI decoded links ---
-        if (isSeekStreamingExtractionEnabled()) {
-          const seekMultiLinks = decodedLinks.filter((u: string) => isSeekStreamingEmbed(u));
-          if (seekMultiLinks.length > 0) {
-            console.log(`🎬 Found ${seekMultiLinks.length} SeekStreaming links in MULTI`);
-            const seekMultiPromises = seekMultiLinks.map(async (seekUrl: string) => {
-              try {
-                const result = await extractSeekStreamingM3u8(seekUrl);
-                const isVostfr = seekUrl.toLowerCase().includes('vostfr');
-                return expandSeekStreamingSources(result, {
-                  label: 'SeekStreaming' + (isVostfr ? ' VOSTFR' : ' VF'),
-                  source: 'seekstreaming-multi' as const,
-                  seekEmbedUrl: seekUrl,
-                });
-              } catch (e) {
-                console.error('❌ SeekStreaming MULTI extraction failed:', e);
-                return [];
-              }
-            });
-            const seekMultiResults = await Promise.all(seekMultiPromises);
-            const validSeekMulti = seekMultiResults.flat();
-            finalHlsSources = [...finalHlsSources, ...validSeekMulti];
-            console.log(`✅ Added ${validSeekMulti.length} SeekStreaming HLS sources from MULTI`);
-          }
-        }
+        const coflixPass = await runExtractionPass(
+          coflixResult.player_links
+            .map((p: any) => ({
+              url: getCoflixPreferredUrl(p),
+              label: typeof p?.player === 'string' ? p.player : '',
+              player: typeof p?.player === 'string' ? p.player : '',
+            }))
+            .filter((source: { url: string }) => !!source.url),
+          MAIN_API,
+          {
+            origin: 'coflix',
+            context: { category: 'moviesTv', topLevel: 'coflix' },
+          },
+        );
+        finalHlsSources = [...finalHlsSources, ...coflixPass.hls];
+        finalFileSources = [...finalFileSources, ...coflixPass.file];
       }
 
       console.log('🎯 Final HLS sources after supervideo/dropload processing:', finalHlsSources);
@@ -1481,7 +1278,9 @@ const WatchMovie: React.FC = () => {
             const source = {
               url: player.url,
               label: `${category} - ${player.player} ${player.quality}`,
-              category: category
+              category: category,
+              // Rempli par mainapi quand il a déjà résolu la source.
+              m3u8Url: player.m3u8Url
             };
 
             // Séparer les sources fsvid et premium des autres sources
@@ -1510,6 +1309,22 @@ const WatchMovie: React.FC = () => {
         // Paralléliser les extractions M3U8 pour vidzy et fsvid
         const fstreamExtractionPromises: Promise<{ type: string; result: M3u8Result | null; originalSource: { url: string; label: string; category: string } }>[] = [];
 
+        // mainapi a pu résoudre la source côté serveur : dans ce cas on
+        // réutilise sa m3u8 signée au lieu de relancer une extraction.
+        // Renvoie null si rien n'a été pré-résolu.
+        const serverResolvedSource = (
+          source: { url: string; label: string; category: string; m3u8Url?: string },
+          type: string
+        ) => (
+          source.m3u8Url
+            ? Promise.resolve({
+                type,
+                result: { m3u8Url: source.m3u8Url, success: true } as M3u8Result,
+                originalSource: source
+              })
+            : null
+        );
+
         // Extraire M3U8 des sources vidzy
         const vidzySources = fstreamProcessedSources.filter(source =>
           source.url.toLowerCase().includes('vidzy')
@@ -1519,6 +1334,7 @@ const WatchMovie: React.FC = () => {
           console.log(`🎬 Found ${vidzySources.length} vidzy sources, extracting M3U8...`);
           vidzySources.forEach(vidzySource => {
             fstreamExtractionPromises.push(
+              serverResolvedSource(vidzySource, 'vidzy') ??
               extractVidzyM3u8(vidzySource.url, MAIN_API).then(result => ({
                 type: 'vidzy',
                 result,
@@ -1533,6 +1349,7 @@ const WatchMovie: React.FC = () => {
           console.log(`🎬 Found ${fsvidSources.length} fsvid sources, extracting M3U8...`);
           fsvidSources.forEach(fsvidSource => {
             fstreamExtractionPromises.push(
+              serverResolvedSource(fsvidSource, 'fsvid') ??
               extractFsvidM3u8(fsvidSource.url, MAIN_API).then(result => ({
                 type: 'fsvid',
                 result,
@@ -1551,6 +1368,7 @@ const WatchMovie: React.FC = () => {
           console.log(`🎬 Found ${uqloadSources.length} uqload sources, extracting M3U8...`);
           uqloadSources.forEach(uqloadSource => {
             fstreamExtractionPromises.push(
+              serverResolvedSource(uqloadSource, 'uqload') ??
               extractUqloadFile(normalizeUqloadEmbedUrl(uqloadSource.url), MAIN_API).then(result => ({
                 type: 'uqload',
                 result,
@@ -1653,231 +1471,22 @@ const WatchMovie: React.FC = () => {
         console.log('✅ Wiflix/Lynx sources processed:', wiflixProcessedSources.length);
         console.log('🎯 Wiflix VF sources found:', vfSources.length);
 
-        // =========== EXTRACTION ONEUPLOAD DEPUIS WIFLIX ===========
-        console.log('🔍 Extracting OneUpload sources from Wiflix...');
-
-        // Identifier les sources OneUpload dans Wiflix
-        const oneUploadSources = wiflixProcessedSources.filter(source =>
-          isOneUploadEmbed(source.url)
-        );
-
-        if (oneUploadSources.length > 0) {
-          console.log(`🎬 Found ${oneUploadSources.length} OneUpload sources in Wiflix, extracting...`);
-
-          // Paralléliser les extractions OneUpload
-          const oneUploadExtractionPromises = oneUploadSources.map(async (oneUploadSource) => {
-            try {
-              const result = await extractOneUploadSources(oneUploadSource.url);
-              return { result, originalSource: oneUploadSource };
-            } catch (error) {
-              console.error('Error extracting OneUpload source:', error);
-              return { result: null, originalSource: oneUploadSource };
-            }
-          });
-
-          const oneUploadExtractionResults = await Promise.all(oneUploadExtractionPromises);
-
-          // Traiter les résultats OneUpload et les ajouter aux sources Nexus
-          oneUploadExtractionResults.forEach(({ result, originalSource }) => {
-            if (result?.success) {
-              if (result.hlsUrl) {
-                // Source HLS trouvée
-                finalHlsSources.push({
-                  url: result.hlsUrl,
-                  label: `Nexus ${originalSource.category} - OneUpload HLS`
-                });
-                console.log(`✅ Added OneUpload HLS source: ${result.hlsUrl}`);
-              } else if (result.m3u8Url) {
-                // Source MP4 ou autre trouvée
-                finalFileSources.push({
-                  url: result.m3u8Url,
-                  label: `Nexus ${originalSource.category} - OneUpload`
-                });
-                console.log(`✅ Added OneUpload file source: ${result.m3u8Url}`);
-              }
-            } else {
-              console.log(`❌ Failed to extract OneUpload source: ${originalSource.url}`);
-            }
-          });
-
-          console.log(`✅ OneUpload extraction completed. HLS sources: ${finalHlsSources.length}, File sources: ${finalFileSources.length}`);
-        } else {
-          console.log('ℹ️ No OneUpload sources found in Wiflix');
-        }
-
-        // =========== EXTRACTION VOE DEPUIS WIFLIX ===========
-        console.log('🔍 Extracting VOE sources from Wiflix...');
-
-        // Identifier les sources VOE dans Wiflix
-        const voeSources = wiflixProcessedSources.filter(source =>
-          isVoeEmbed(source.url)
-        );
-
-        if (voeSources.length > 0) {
-          console.log(`🎬 Found ${voeSources.length} VOE sources in Wiflix, extracting...`);
-
-          // Paralléliser les extractions VOE
-          const voeExtractionPromises = voeSources.map(async (voeSource) => {
-            try {
-              console.log(`[VOE/WIFLIX][MOVIE] Extracting VOE m3u8 from Wiflix link: ${voeSource.url}`);
-              const voeResult = await extractVoeM3u8(voeSource.url);
-              return { result: voeResult, originalSource: voeSource };
-            } catch (error) {
-              console.error('Error extracting VOE source:', error);
-              return { result: null, originalSource: voeSource };
-            }
-          });
-
-          const voeExtractionResults = await Promise.all(voeExtractionPromises);
-
-          // Traiter les résultats VOE et les ajouter aux sources HLS
-          const validVoeResults: { url: string; label: string }[] = [];
-          voeExtractionResults.forEach(({ result, originalSource }) => {
-            if (result?.success && result.hlsUrl) {
-              validVoeResults.push({
-                url: result.hlsUrl,
-                label: `Voe HLS ${originalSource.category}`
-              });
-              console.log(`✅ Added VOE HLS source: ${result.hlsUrl}`);
-            } else {
-              console.log(`❌ Failed to extract VOE source: ${originalSource.url}`);
-            }
-          });
-
-          if (validVoeResults.length > 0) {
-            // Prioriser les sources VF puis VOSTFR pour VOE
-            const voeVfSources = validVoeResults.filter(s => s.label.includes('VF'));
-            const voeVostfrSources = validVoeResults.filter(s => s.label.includes('VOSTFR'));
-            const prioritizedVoeSources = [...voeVfSources, ...voeVostfrSources];
-
-            finalHlsSources = [...prioritizedVoeSources, ...finalHlsSources];
-            console.log(`✅ VOE extraction completed. Added ${validVoeResults.length} VOE HLS sources to final sources`);
-          } else {
-            console.log('❌ No valid VOE sources extracted from Wiflix');
-          }
-        } else {
-          console.log('ℹ️ No VOE sources found in Wiflix');
-        }
-
-        // =========== EXTRACTION UQLOAD DEPUIS WIFLIX ===========
-        console.log('🔍 Extracting UQLOAD sources from Wiflix...');
-
-        // Identifier les sources UQLOAD dans Wiflix
-        const uqloadSources = wiflixProcessedSources.filter(source =>
-          source.url.toLowerCase().includes('uqload')
-        );
-
-        if (uqloadSources.length > 0) {
-          console.log(`🎬 Found ${uqloadSources.length} UQLOAD sources in Wiflix, extracting...`);
-
-          // Paralléliser les extractions UQLOAD
-          const uqloadExtractionPromises = uqloadSources.map(async (uqloadSource) => {
-            try {
-              console.log(`[UQLOAD/WIFLIX][MOVIE] Extracting UQLOAD file from Wiflix link: ${uqloadSource.url}`);
-              const uqloadResult = await extractUqloadFile(normalizeUqloadEmbedUrl(uqloadSource.url), MAIN_API);
-              return { result: uqloadResult, originalSource: uqloadSource };
-            } catch (error) {
-              console.error('Error extracting UQLOAD source:', error);
-              return { result: null, originalSource: uqloadSource };
-            }
-          });
-
-          const uqloadExtractionResults = await Promise.all(uqloadExtractionPromises);
-
-          // Traiter les résultats UQLOAD et les ajouter aux sources File
-          const validUqloadResults: { url: string; label: string }[] = [];
-          uqloadExtractionResults.forEach(({ result, originalSource }) => {
-            if (result?.success && result.m3u8Url) {
-              validUqloadResults.push({
-                url: result.m3u8Url,
-                label: `Uqload ${originalSource.category}`
-              });
-              console.log(`✅ Added UQLOAD file source: ${result.m3u8Url}`);
-            } else {
-              console.log(`❌ Failed to extract UQLOAD source: ${originalSource.url}`);
-            }
-          });
-
-          if (validUqloadResults.length > 0) {
-            // Prioriser les sources VF puis VOSTFR pour UQLOAD
-            const uqloadVfSources = validUqloadResults.filter(s => s.label.includes('VF'));
-            const uqloadVostfrSources = validUqloadResults.filter(s => s.label.includes('VOSTFR'));
-            const prioritizedUqloadSources = [...uqloadVfSources, ...uqloadVostfrSources];
-
-            finalFileSources = [...prioritizedUqloadSources, ...finalFileSources];
-            console.log(`✅ UQLOAD extraction completed. Added ${validUqloadResults.length} UQLOAD file sources to final sources`);
-          } else {
-            console.log('❌ No valid UQLOAD sources extracted from Wiflix');
-          }
-        } else {
-          console.log('ℹ️ No UQLOAD sources found in Wiflix');
-        }
-
-        // --- DoodStream extraction from Wiflix ---
-        if (isDoodStreamExtractionEnabled()) {
-          const doodWiflixSources = wiflixProcessedSources.filter(source =>
-            isDoodStreamEmbed(source.url)
-          );
-          if (doodWiflixSources.length > 0) {
-            console.log(`🎬 Found ${doodWiflixSources.length} DoodStream sources in Wiflix, extracting...`);
-            const doodPromises = doodWiflixSources.map(async (source) => {
-              try {
-                const result = await extractDoodStreamFile(source.url);
-                if (result && result.success && result.m3u8Url) {
-                  const isVostfr = source.label?.toLowerCase().includes('vostfr') || source.category?.toLowerCase().includes('vostfr');
-                  return {
-                    url: result.m3u8Url,
-                    label: 'DoodStream' + (isVostfr ? ' VOSTFR' : ' VF'),
-                    source: 'doodstream-wiflix' as const,
-                    isDirect: true,
-                    isVostfr
-                  };
-                }
-                return null;
-              } catch (e) {
-                console.error('❌ DoodStream Wiflix extraction failed:', e);
-                return null;
-              }
-            });
-            const doodResults = await Promise.all(doodPromises);
-            const validDood = doodResults.filter(r => r !== null);
-            const vfDood = validDood.filter(r => !r.isVostfr);
-            const vostfrDood = validDood.filter(r => r.isVostfr);
-            finalFileSources = [...vfDood, ...finalFileSources, ...vostfrDood];
-            console.log(`✅ Added ${validDood.length} DoodStream file sources from Wiflix`);
-          }
-        }
-
-        // --- SeekStreaming extraction from Wiflix ---
-        if (isSeekStreamingExtractionEnabled()) {
-          const seekWiflixSources = wiflixProcessedSources.filter(source =>
-            isSeekStreamingEmbed(source.url)
-          );
-          if (seekWiflixSources.length > 0) {
-            console.log(`🎬 Found ${seekWiflixSources.length} SeekStreaming sources in Wiflix, extracting...`);
-            const seekPromises = seekWiflixSources.map(async (source) => {
-              try {
-                const result = await extractSeekStreamingM3u8(source.url);
-                const isVostfr = source.label?.toLowerCase().includes('vostfr')
-                  || source.category?.toLowerCase().includes('vostfr');
-                return expandSeekStreamingSources(result, {
-                  label: `SeekStreaming${isVostfr ? ' VOSTFR' : ' VF'}`,
-                  source: 'seekstreaming-wiflix' as const,
-                  isVostfr,
-                  seekEmbedUrl: source.url,
-                });
-              } catch (e) {
-                console.error('❌ SeekStreaming Wiflix extraction failed:', e);
-                return [];
-              }
-            });
-            const validSeek = (await Promise.all(seekPromises)).flat();
-            const vfSeek = validSeek.filter(r => !r.isVostfr);
-            const vostfrSeek = validSeek.filter(r => r.isVostfr);
-            finalHlsSources = [...vfSeek, ...finalHlsSources, ...vostfrSeek];
-            console.log(`✅ Added ${validSeek.length} SeekStreaming HLS sources from Wiflix`);
-          }
-        }
+        // =========== EXTRACTION M3U8 DEPUIS WIFLIX (passe générique) ===========
+        const wiflixPass = await runExtractionPass(wiflixProcessedSources, MAIN_API, {
+          origin: 'wiflix',
+          context: { category: 'moviesTv', topLevel: 'wiflix' },
+        });
+        // VF devant, VOSTFR derrière — l'ordre historique de ce bloc.
+        finalHlsSources = [
+          ...wiflixPass.hls.filter(s => !s.isVostfr),
+          ...finalHlsSources,
+          ...wiflixPass.hls.filter(s => s.isVostfr),
+        ];
+        finalFileSources = [
+          ...wiflixPass.file.filter(s => !s.isVostfr),
+          ...finalFileSources,
+          ...wiflixPass.file.filter(s => s.isVostfr),
+        ];
       } else {
         setWiflixData(null);
         console.log('❌ No Wiflix/Lynx sources available');
@@ -1919,6 +1528,16 @@ const WatchMovie: React.FC = () => {
 
       setJ1fSources(j1fProcessedSources);
 
+      // --- Passe d'extraction m3u8 générique (tous hosters supportés) ---
+      if (j1fProcessedSources.length > 0) {
+        const j1fPass = await runExtractionPass(j1fProcessedSources, MAIN_API, {
+          origin: 'j1f',
+          context: { category: 'moviesTv', topLevel: 'j1f' },
+        });
+        finalHlsSources = [...finalHlsSources, ...j1fPass.hls];
+        finalFileSources = [...finalFileSources, ...j1fPass.file];
+      }
+
       // =========== TRAITEMENT DES RÉSULTATS SWIFTFLOW ===========
       let swiftflowProcessedSources: { url: string; label: string; category: string }[] = [];
 
@@ -1951,6 +1570,16 @@ const WatchMovie: React.FC = () => {
       }
 
       setSwiftflowSources(swiftflowProcessedSources);
+
+      // --- Passe d'extraction m3u8 générique (tous hosters supportés) ---
+      if (swiftflowProcessedSources.length > 0) {
+        const swiftflowPass = await runExtractionPass(swiftflowProcessedSources, MAIN_API, {
+          origin: 'swiftflow',
+          context: { category: 'moviesTv', topLevel: 'swiftflow' },
+        });
+        finalHlsSources = [...finalHlsSources, ...swiftflowPass.hls];
+        finalFileSources = [...finalFileSources, ...swiftflowPass.file];
+      }
 
       // =========== TRAITEMENT DES RÉSULTATS VIPER ===========
       const viperProcessedSources: { url: string; label: string; quality: string; language: string }[] = [];
@@ -1989,175 +1618,27 @@ const WatchMovie: React.FC = () => {
       }
       setViperSources(viperProcessedSources);
 
-      // =========== EXTRACTION VOE DEPUIS VIPER ===========
+      // =========== EXTRACTION M3U8 DEPUIS VIPER (passe générique) ===========
+      // Remplace les anciens blocs voe / uqload / doodstream / seekstreaming
+      // écrits à la main : `runExtractionPass` route chaque lien vers
+      // l'extracteur correspondant, donc tout hoster supporté est couvert
+      // d'office, y compris ceux ajoutés plus tard.
       if (viperProcessedSources.length > 0) {
-        console.log('🔍 Extracting VOE sources from Viper...');
-
-        // Identifier les sources VOE dans Viper (soit par label, soit par URL)
-        const voeViperSources = viperProcessedSources.filter(source =>
-          source.label.toLowerCase().includes('voe') || isVoeEmbed(source.url)
-        );
-
-        if (voeViperSources.length > 0) {
-          console.log(`🎬 Found ${voeViperSources.length} VOE sources in Viper, extracting...`);
-
-          // Paralléliser les extractions VOE
-          const voeExtractionPromises = voeViperSources.map(async (voeSource) => {
-            try {
-              console.log(`[VOE/VIPER][MOVIE] Extracting VOE m3u8 from Viper link: ${voeSource.url}`);
-              const voeResult = await extractVoeM3u8(voeSource.url);
-              return { result: voeResult, originalSource: voeSource };
-            } catch (error) {
-              console.error('Error extracting VOE source from Viper:', error);
-              return { result: null, originalSource: voeSource };
-            }
-          });
-
-          const voeExtractionResults = await Promise.all(voeExtractionPromises);
-
-          // Traiter les résultats VOE et les ajouter aux sources HLS
-          const validVoeResults: { url: string; label: string }[] = [];
-          voeExtractionResults.forEach(({ result, originalSource }) => {
-            if (result?.success && result.hlsUrl) {
-              validVoeResults.push({
-                url: result.hlsUrl,
-                label: `Voe HLS ${originalSource.language}`
-              });
-              console.log(`✅ Added Viper VOE HLS source: ${result.hlsUrl}`);
-            } else {
-              console.log(`❌ Failed to extract Viper VOE source: ${originalSource.url}`);
-            }
-          });
-
-          if (validVoeResults.length > 0) {
-            // Prioriser VF
-            const vf = validVoeResults.filter(s => s.label.includes('VF'));
-            const vostfr = validVoeResults.filter(s => s.label.includes('VOSTFR'));
-
-            finalHlsSources = [...vf, ...vostfr, ...finalHlsSources];
-            console.log(`✅ Viper VOE extraction completed. Added ${validVoeResults.length} sources.`);
-          }
-        }
-      }
-
-      // =========== EXTRACTION UQLOAD DEPUIS VIPER ===========
-      if (viperProcessedSources.length > 0) {
-        console.log('🔍 Extracting UQLOAD sources from Viper...');
-
-        // Identifier les sources UQLOAD dans Viper
-        const uqloadViperSources = viperProcessedSources.filter(source =>
-          source.label.toLowerCase().includes('uqload') || source.url.toLowerCase().includes('uqload')
-        );
-
-        if (uqloadViperSources.length > 0) {
-          console.log(`🎬 Found ${uqloadViperSources.length} UQLOAD sources in Viper, extracting...`);
-
-          // Paralléliser les extractions UQLOAD
-          const uqloadExtractionPromises = uqloadViperSources.map(async (uqloadSource) => {
-            try {
-              console.log(`[UQLOAD/VIPER][MOVIE] Extracting UQLOAD file from Viper link: ${uqloadSource.url}`);
-              const uqloadResult = await extractUqloadFile(normalizeUqloadEmbedUrl(uqloadSource.url), MAIN_API);
-              return { result: uqloadResult, originalSource: uqloadSource };
-            } catch (error) {
-              console.error('Error extracting UQLOAD source from Viper:', error);
-              return { result: null, originalSource: uqloadSource };
-            }
-          });
-
-          const uqloadExtractionResults = await Promise.all(uqloadExtractionPromises);
-
-          // Traiter les résultats UQLOAD et les ajouter aux sources
-          const validUqloadResults: { url: string; label: string }[] = [];
-          uqloadExtractionResults.forEach(({ result, originalSource }) => {
-            if (result?.success && (result.hlsUrl || result.m3u8Url)) {
-              const extractedUrl = result.hlsUrl || result.m3u8Url || '';
-              validUqloadResults.push({
-                url: extractedUrl,
-                label: `Uqload ${originalSource.language}`
-              });
-              console.log(`✅ Added Viper UQLOAD source: ${extractedUrl}`);
-            } else {
-              console.log(`❌ Failed to extract Viper UQLOAD source: ${originalSource.url}`);
-            }
-          });
-
-          if (validUqloadResults.length > 0) {
-            // Prioriser VF
-            const vf = validUqloadResults.filter(s => s.label.includes('VF'));
-            const vostfr = validUqloadResults.filter(s => s.label.includes('VOSTFR'));
-
-            finalHlsSources = [...finalHlsSources, ...vf, ...vostfr];
-            console.log(`✅ Viper UQLOAD extraction completed. Added ${validUqloadResults.length} sources.`);
-          }
-        }
-
-        // --- DoodStream extraction from Viper ---
-        if (viperProcessedSources.length > 0 && isDoodStreamExtractionEnabled()) {
-          const doodViperSources = viperProcessedSources.filter((source) =>
-            source.label?.toLowerCase().includes('dood') || isDoodStreamEmbed(source.url)
-          );
-          
-          if (doodViperSources.length > 0) {
-            console.log(`🎬 Found ${doodViperSources.length} DoodStream sources in Viper, extracting...`);
-            const doodPromises = doodViperSources.map(async (source) => {
-              try {
-                const result = await extractDoodStreamFile(source.url);
-                if (result && result.success && result.m3u8Url) {
-                  const isVostfr = source.label?.toLowerCase().includes('vostfr') || source.language === 'VOSTFR';
-                  return {
-                    url: result.m3u8Url,
-                    label: 'DoodStream' + (isVostfr ? ' VOSTFR' : ' VF'),
-                    source: 'doodstream-viper' as const,
-                    isDirect: true,
-                    isVostfr
-                  };
-                }
-                return null;
-              } catch (e) {
-                console.error('❌ DoodStream Viper extraction failed:', e);
-                return null;
-              }
-            });
-            const doodResults = await Promise.all(doodPromises);
-            const validDood = doodResults.filter(r => r !== null);
-            const vfDood = validDood.filter(r => !r.isVostfr);
-            const vostfrDood = validDood.filter(r => r.isVostfr);
-            finalFileSources = [...vfDood, ...finalFileSources, ...vostfrDood];
-            console.log(`✅ Added ${validDood.length} DoodStream file sources from Viper`);
-          }
-        }
-
-        // --- SeekStreaming extraction from Viper ---
-        if (isSeekStreamingExtractionEnabled()) {
-          const allViperSourcesSeek = [...(viperResult?.links?.vf || []), ...(viperResult?.links?.vostfr || [])];
-          const seekViperSources = allViperSourcesSeek.filter((source: any) =>
-            source.label?.toLowerCase().includes('seekstream') || source.label?.toLowerCase().includes('embed4me') || isSeekStreamingEmbed(source.url)
-          );
-          if (seekViperSources.length > 0) {
-            console.log(`🎬 Found ${seekViperSources.length} SeekStreaming sources in Viper, extracting...`);
-            const seekPromises = seekViperSources.map(async (source: any) => {
-              try {
-                const result = await extractSeekStreamingM3u8(source.url);
-                const isVostfr = source.label?.toLowerCase().includes('vostfr')
-                  || (viperResult?.links?.vostfr || []).includes(source);
-                return expandSeekStreamingSources(result, {
-                  label: `SeekStreaming${isVostfr ? ' VOSTFR' : ' VF'}`,
-                  source: 'seekstreaming-viper' as const,
-                  isVostfr,
-                  seekEmbedUrl: source.url,
-                });
-              } catch (e) {
-                console.error('❌ SeekStreaming Viper extraction failed:', e);
-                return [];
-              }
-            });
-            const validSeek = (await Promise.all(seekPromises)).flat();
-            const vfSeek = validSeek.filter(r => !r.isVostfr);
-            const vostfrSeek = validSeek.filter(r => r.isVostfr);
-            finalHlsSources = [...vfSeek, ...finalHlsSources, ...vostfrSeek];
-            console.log(`✅ Added ${validSeek.length} SeekStreaming HLS sources from Viper`);
-          }
-        }
+        const viperPass = await runExtractionPass(viperProcessedSources, MAIN_API, {
+          origin: 'viper',
+          context: { category: 'moviesTv', topLevel: 'viper' },
+        });
+        // VF devant, VOSTFR derrière — l'ordre historique de ce bloc.
+        finalHlsSources = [
+          ...viperPass.hls.filter(s => !s.isVostfr),
+          ...finalHlsSources,
+          ...viperPass.hls.filter(s => s.isVostfr),
+        ];
+        finalFileSources = [
+          ...viperPass.file.filter(s => !s.isVostfr),
+          ...finalFileSources,
+          ...viperPass.file.filter(s => s.isVostfr),
+        ];
       }
 
       // Pré-tri par priorité hoster (M4) — le state stocke la liste ordonnée
@@ -2366,7 +1847,7 @@ const WatchMovie: React.FC = () => {
             );
             setSelectedSource('fstream');
             setSelectedFstreamSource(0);
-            setEmbedUrl(getProxyUrl(sortedFstreamLocal[0].url));
+            setEmbedUrl(sortedFstreamLocal[0].url);
             setEmbedType('fstream');
             currentSourceRef.current = 'fstream';
             setOnlyVostfrAvailable(false);
@@ -2502,9 +1983,9 @@ const WatchMovie: React.FC = () => {
             setOnlyVostfrAvailable(false);
             return true;
           }
-          // Les ids restants (vostfr, vox, rivestream_hls) ne sont pas
-          // auto-sélectionnables dans le flux Movie (vostfr = fallback final géré
-          // ci-dessous, vox = WatchTv uniquement, rivestream_hls déprécié).
+          // Les ids restants (vostfr, vox) ne sont pas auto-sélectionnables dans
+          // le flux Movie (vostfr = fallback final géré ci-dessous,
+          // vox = WatchTv uniquement).
           default:
             return false;
         }
@@ -2562,9 +2043,8 @@ const WatchMovie: React.FC = () => {
         // Priority-driven auto-select. Construit la liste d'availability à partir
         // des sources disponibles après toutes les extractions.
         // Note : 'vox' n'existe pas pour les films (WatchTv uniquement).
-        // 'vostfr' et 'rivestream_hls' restent marqués hasData:false car ils
-        // n'ont pas de fetch dédié côté film (vostfr = fallback final géré plus bas ;
-        // rivestream_hls est déprécié et retiré de TOP_LEVEL_SOURCE_IDS).
+        // 'vostfr' reste marqué hasData:false car il n'a pas de fetch dédié côté
+        // film (vostfr = fallback final géré plus bas).
         const availability: SourceAvailability[] = [
           { id: 'nexus_hls', hasData: finalHlsSources.length > 0 },
           { id: 'nexus_file', hasData: finalFileSources.length > 0 },
@@ -2581,7 +2061,6 @@ const WatchMovie: React.FC = () => {
           { id: 'custom', hasData: customLinks.length > 0 },
           { id: 'frembed', hasData: isFrembedAvailable },
           // Sources sans fetch dédié côté film — placées après, désactivées via hasData: false
-          { id: 'rivestream_hls', hasData: false },
           { id: 'vox', hasData: false },
           { id: 'vostfr', hasData: false },
         ];
@@ -2679,139 +2158,6 @@ const WatchMovie: React.FC = () => {
   }, [id]);
 
 
-  // Function to fetch Rivestream VO/VOSTFR HLS sources
-  const fetchRivestreamSources = useCallback(async () => {
-    // Vérifier si Rivestream est disponible (VIP check si activé)
-    if (!isRivestreamAvailable()) {
-      console.log('🚫 Rivestream sources are only available for VIP users');
-      setLoadingRivestream(false);
-      return;
-    }
-
-    if (!id || rivestreamLoaded) return;
-
-    console.log('🎬 Starting Rivestream VO/VOSTFR HLS source fetch for movie:', id);
-    isLoadingRivestreamRef.current = true; // Marquer le début du chargement
-    setLoadingRivestream(true);
-    setRivestreamLoaded(true);
-
-    const services = [
-      'flowcast',
-      'asiacloud',
-      'humpy',
-      'primevids',
-      'shadow',
-      'hindicast',
-      'animez',
-      'aqua',
-      'yggdrasil',
-      'putafilme',
-      'ophim'
-    ];
-
-    // Fonction pour traiter chaque service et retourner les sources et captions
-    const fetchService = async (service: string): Promise<{
-      sources: { url: string; label: string; quality: number; service: string; category: string }[];
-      captions: { label: string; file: string }[];
-    }> => {
-      try {
-        // Générer un secretKey dynamique basé sur l'ID du film
-        const secretKey = generateRivestreamSecretKey(id);
-        const url = buildProxyUrl(`https://rivestream.org/api/backendfetch?requestID=movieVideoProvider&id=${id}&service=${service}&secretKey=${secretKey}&proxyMode=noProxy`);
-        console.log(`🔍 Fetching Rivestream service: ${service} with secretKey: ${secretKey}`);
-
-        const response = await axios.get<RivestreamResponse>(url, { timeout: 10000 });
-
-        if (response.data?.data?.sources && response.data.data.sources.length > 0) {
-          const sources = response.data.data.sources
-            .map(source => {
-              // Remplacer le domaine si c'est un proxy Rivestream (détecté par le pattern proxy?url=)
-              let url = source.url;
-              if (url.includes('/proxy?url=')) {
-                try {
-                  const urlObj = new URL(url);
-                  urlObj.host = RIVESTREAM_PROXIES[0];
-                  url = urlObj.toString();
-                } catch (e) {
-                  url = url.replace(/^(https?:\/\/)[^\/]+/, `$1${RIVESTREAM_PROXIES[0]}`);
-                }
-              }
-
-              const mappedSource = {
-                url: url,
-                label: typeof source.quality === 'number' ? `${source.quality}p` : source.quality,
-                quality: typeof source.quality === 'number' ? source.quality : 720,
-                service: source.source,
-                category: service.toLowerCase() // Catégorie en minuscules pour correspondre au categoryOrder
-              };
-              return mappedSource;
-            });
-
-          // Collecter les captions si disponibles et les proxifier
-          const captions = response.data.data.captions?.map(caption => ({
-            label: caption.label,
-            file: buildProxyUrl(caption.file) // Proxifier l'URL pour contourner CORS
-          })) || [];
-
-          if (sources.length > 0) {
-            console.log(`✅ Found ${sources.length} sources from ${service}:`, sources);
-            if (captions.length > 0) {
-              console.log(`📝 Found ${captions.length} captions from ${service}:`, captions);
-            }
-            return { sources, captions };
-          }
-        }
-        return { sources: [], captions: [] };
-      } catch (error) {
-        console.error(`❌ Error fetching Rivestream service ${service}:`, error);
-        return { sources: [], captions: [] };
-      }
-    };
-
-    // Lancer toutes les requêtes en parallèle et collecter tous les résultats
-    try {
-      const allResults = await Promise.all(services.map(service => fetchService(service)));
-
-      // Fusionner toutes les sources
-      const collectedSources = allResults.flatMap(result => result.sources);
-
-      // Fusionner toutes les captions et dédupliquer
-      const allCaptions = allResults.flatMap(result => result.captions);
-
-      // Dédupliquer les captions par label (garder la première occurrence)
-      const uniqueCaptions = allCaptions.filter((caption, index, self) =>
-        index === self.findIndex(c => c.label === caption.label)
-      );
-
-      // Trier les captions : Français en premier, puis alphabétique
-      const sortedCaptions = uniqueCaptions.sort((a, b) => {
-        const aIsFrench = a.label.toLowerCase().includes('français') || a.label.toLowerCase().includes('french');
-        const bIsFrench = b.label.toLowerCase().includes('français') || b.label.toLowerCase().includes('french');
-
-        if (aIsFrench && !bIsFrench) return -1;
-        if (!aIsFrench && bIsFrench) return 1;
-        return a.label.localeCompare(b.label);
-      });
-
-      if (collectedSources.length === 0) {
-        console.log('⚠️ No Rivestream sources found for this movie');
-      } else {
-        // Trier par qualité (meilleure qualité en premier)
-        const sortedSources = collectedSources.sort((a, b) => b.quality - a.quality);
-        setRivestreamSources(sortedSources);
-        console.log(`✅ Total Rivestream sources collected: ${sortedSources.length}`, sortedSources);
-      }
-
-      if (sortedCaptions.length > 0) {
-        setRivestreamCaptions(sortedCaptions);
-        console.log(`✅ Total Rivestream captions collected: ${sortedCaptions.length}`, sortedCaptions);
-      }
-    } finally {
-      setLoadingRivestream(false);
-      isLoadingRivestreamRef.current = false; // Marquer la fin du chargement
-    }
-  }, [id, rivestreamLoaded]);
-
   // Function to handle next movie navigation
   const handleNextMovie = async (movieId: number) => {
     window.location.href = `/watch/movie/${movieId}`;
@@ -2852,19 +2198,7 @@ const WatchMovie: React.FC = () => {
         }
       }
 
-      const isRivestreamRetry =
-        type === 'rivestream_hls' && event.detail.id === 'rivestream_retry';
-      const isRivestreamTrigger =
-        type === 'rivestream_hls'
-        && !isRivestreamRetry
-        && (!url || url === '#')
-        && rivestreamSources.length === 0;
-      const rivestreamAllowed =
-        (type !== 'rivestream_hls' && type !== 'rivestream')
-        || isRivestreamRetry
-        || isRivestreamAvailable();
       const bravoAllowed = type !== 'bravo' || canUseBravo;
-      if (isRivestreamTrigger && !rivestreamAllowed) return;
 
       const acceptedPlaybackUrl = (() => {
         switch (type) {
@@ -2890,27 +2224,6 @@ const WatchMovie: React.FC = () => {
             return resolveAcceptedWatchSource({
               requestedSource: url,
               availableSources: nexusFileSources.map(source => source.url),
-              fallback: 'first',
-            });
-          case 'rivestream_hls':
-            if (isRivestreamTrigger) return null;
-            if (isRivestreamRetry) {
-              return resolveAcceptedWatchSource({
-                requestedSource: url,
-                allowed: rivestreamAllowed,
-              });
-            }
-            return resolveAcceptedWatchSource({
-              requestedSource: url,
-              availableSources: rivestreamSources.map(source => source.url),
-              allowed: rivestreamAllowed,
-              fallback: 'first',
-            });
-          case 'rivestream':
-            return resolveAcceptedWatchSource({
-              requestedSource: url,
-              availableSources: rivestreamSources.map(source => source.url),
-              allowed: rivestreamAllowed,
               fallback: 'first',
             });
           case 'bravo':
@@ -2939,16 +2252,13 @@ const WatchMovie: React.FC = () => {
           case 'viper':
             return resolveAcceptedWatchSource({ requestedSource: url });
           case 'fstream':
-            return resolveAcceptedWatchSource({
-              requestedSource: url,
-              transform: getProxyUrl,
-            });
+            return resolveAcceptedWatchSource({ requestedSource: url });
           default:
             return null;
         }
       })();
 
-      if (!isRivestreamTrigger && !acceptedPlaybackUrl) return;
+      if (!acceptedPlaybackUrl) return;
 
       if (acceptedPlaybackUrl) {
         syncHlsActiveSource(
@@ -2962,33 +2272,21 @@ const WatchMovie: React.FC = () => {
       // Filtre les events auto-fallback (sélection involontaire) ; setLastPlayer
       // valide en interne contre TOP_LEVEL_SOURCE_IDS et ignore les ids hors-liste.
       if (
-        !isRivestreamTrigger
-        && !isAutomaticFallback
+        !isAutomaticFallback
         && typeof type === 'string'
       ) {
         setLastPlayer(type === 'kisskh_main' ? 'kisskh' : type);
       }
 
       // When any source is picked from the menu, hide the "no content" message and the menu itself.
-      // Exception: ne pas fermer le menu pour rivestream_hls car c'est juste un déclencheur de chargement
-      // OU si on est en train de charger les sources Rivestream
-      if (!isRivestreamTrigger) {
-        setOnlyVostfrAvailable(false);
-        if (!isLoadingRivestreamRef.current) {
-          setShowEmbedQuality(false);
-        }
-      }
+      setOnlyVostfrAvailable(false);
+      setShowEmbedQuality(false);
 
       // Handle HLS source selections
-      if (type === 'darkino' || type === 'mp4' || type === 'nexus_hls' || type === 'nexus_file' || type === 'rivestream_hls' || type === 'rivestream' || type === 'bravo' || type === 'kisskh_main') {
-        // Ne pas cacher l'iframe si c'est juste le déclencheur de chargement Rivestream
-        if (!isRivestreamTrigger) {
-          setEmbedUrl(null); // Hide iframe
-          setEmbedType(null);
-        }
-        if (!isRivestreamTrigger) {
-          currentSourceRef.current = type === 'rivestream' ? 'rivestream_hls' : type;
-        }
+      if (type === 'darkino' || type === 'mp4' || type === 'nexus_hls' || type === 'nexus_file' || type === 'bravo' || type === 'kisskh_main') {
+        setEmbedUrl(null); // Hide iframe
+        setEmbedType(null);
+        currentSourceRef.current = type;
 
         if (type === 'darkino') {
           const index = darkinoSources.findIndex(s => s.m3u8 === acceptedPlaybackUrl);
@@ -3031,60 +2329,6 @@ const WatchMovie: React.FC = () => {
             setSelectedNexusFileSource(0);
             setSelectedSource('nexus_file');
             setVideoSource(nexusFileSources[0].url);
-          }
-        } else if (type === 'rivestream_hls' && isRivestreamRetry) {
-          // CAS PRIORITAIRE: retry avec un nouveau proxy - utiliser directement l'URL fournie
-          console.log('🔄 [WatchMovie] Rivestream proxy retry with new URL:', url);
-          setSelectedSource('rivestream_hls');
-          setVideoSource(acceptedPlaybackUrl);
-          setEmbedUrl(null);
-          setEmbedType(null);
-        } else if (type === 'rivestream_hls') {
-          // Vérifier si Rivestream est disponible (VIP check si activé)
-          console.log('🎬 [WatchMovie] Rivestream button clicked!', { rivestreamLoaded, loadingRivestream, sourcesCount: rivestreamSources.length });
-
-          // Charger les sources Rivestream si pas en cours de chargement
-          if (!loadingRivestream) {
-            // Si aucune source n'est disponible, (re)lancer le chargement
-            if (rivestreamSources.length === 0) {
-              console.log('🚀 [WatchMovie] Starting Rivestream fetch...');
-              // Réinitialiser rivestreamLoaded pour permettre un nouveau chargement
-              setRivestreamLoaded(false);
-              fetchRivestreamSources();
-            } else {
-              // Des sources sont déjà disponibles, sélectionner une source
-              console.log('✅ [WatchMovie] Rivestream sources already loaded, selecting source');
-              const index = rivestreamSources.findIndex(s => s.url === acceptedPlaybackUrl);
-              if (index !== -1) {
-                setSelectedRivestreamSource(index);
-                setSelectedSource('rivestream_hls');
-                setVideoSource(rivestreamSources[index].url);
-              } else {
-                // Fallback to first rivestream
-                setSelectedRivestreamSource(0);
-                setSelectedSource('rivestream_hls');
-                setVideoSource(rivestreamSources[0].url);
-              }
-            }
-          } else {
-            console.log('⏳ [WatchMovie] Rivestream is already loading...');
-          }
-        } else if (type === 'rivestream') {
-          // Sélection d'une source Rivestream spécifique depuis le menu déroulant
-          console.log('🎬 [WatchMovie] Rivestream individual source selected:', url);
-          const index = rivestreamSources.findIndex(s => s.url === acceptedPlaybackUrl);
-          if (index !== -1) {
-            setSelectedRivestreamSource(index);
-            setSelectedSource('rivestream_hls');
-            setVideoSource(rivestreamSources[index].url);
-            console.log(`✅ [WatchMovie] Playing Rivestream source #${index}: ${rivestreamSources[index].label}`);
-          } else {
-            console.log('⚠️ [WatchMovie] Rivestream source not found, falling back to first source');
-            if (rivestreamSources.length > 0) {
-              setSelectedRivestreamSource(0);
-              setSelectedSource('rivestream_hls');
-              setVideoSource(rivestreamSources[0].url);
-            }
           }
         } else if (type === 'bravo') {
           // Sélection d'une source Bravo (PurStream) depuis le menu déroulant
@@ -3129,7 +2373,7 @@ const WatchMovie: React.FC = () => {
             setSelectedFstreamSource(index);
           } else if (sortedFstream.length > 0) {
             setSelectedFstreamSource(0);
-            setEmbedUrl(getProxyUrl(sortedFstream[0].url));
+            setEmbedUrl(sortedFstream[0].url);
           }
         }
         // Handle Wiflix source selection
@@ -3190,14 +2434,12 @@ const WatchMovie: React.FC = () => {
     };
   }, [
     // State values used in logic
-    darkinoSources, mp4Sources, darkinoAvailable, nexusHlsSources, nexusFileSources, fstreamSources, wiflixSources, j1fSources, swiftflowSources, sortedFstream, sortedWiflix, sortedJ1f, sortedSwiftflow, viperSources, rivestreamSources, purstreamSources, kisskhSources, rivestreamLoaded, loadingRivestream, canUseBravo,
+    darkinoSources, mp4Sources, darkinoAvailable, nexusHlsSources, nexusFileSources, fstreamSources, wiflixSources, j1fSources, swiftflowSources, sortedFstream, sortedWiflix, sortedJ1f, sortedSwiftflow, viperSources, purstreamSources, kisskhSources, canUseBravo,
     // State setters
     setOnlyVostfrAvailable, setShowEmbedQuality, setEmbedUrl, setEmbedType,
-    setSelectedSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedFstreamSource, setSelectedWiflixSource, setSelectedViperSource, setSelectedRivestreamSource, setVideoSource,
-    // Functions
-    fetchRivestreamSources,
+    setSelectedSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedFstreamSource, setSelectedWiflixSource, setSelectedViperSource, setVideoSource,
     // Refs (currentSourceRef.current is mutated, so the ref object itself is a dependency)
-    currentSourceRef, isLoadingRivestreamRef, autoFallbackGuard
+    currentSourceRef, autoFallbackGuard
   ]);
 
   useEffect(() => {
@@ -3450,13 +2692,6 @@ const WatchMovie: React.FC = () => {
           source?.language,
         );
       }
-      case 'rivestream':
-      case 'rivestream_hls': {
-        const source =
-          rivestreamSources.find(entry => entry.url === videoSource) ||
-          rivestreamSources[selectedRivestreamSource];
-        return formatPremidSourceDetail(source?.label, source?.service);
-      }
       case 'bravo': {
         const source =
           purstreamSources.find(entry => entry.url === videoSource) ||
@@ -3607,9 +2842,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
@@ -3717,9 +2949,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
@@ -3822,9 +3051,6 @@ const WatchMovie: React.FC = () => {
             controls={true}
             nexusHlsSources={nexusHlsSources}
             nexusFileSources={nexusFileSources}
-            rivestreamSources={rivestreamSources}
-            rivestreamCaptions={rivestreamCaptions}
-            loadingRivestream={loadingRivestream}
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
@@ -3875,9 +3101,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
@@ -3939,9 +3162,6 @@ const WatchMovie: React.FC = () => {
             controls={true}
             nexusHlsSources={nexusHlsSources}
             nexusFileSources={nexusFileSources}
-            rivestreamSources={rivestreamSources}
-            rivestreamCaptions={rivestreamCaptions}
-            loadingRivestream={loadingRivestream}
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
@@ -4050,9 +3270,6 @@ const WatchMovie: React.FC = () => {
             controls={true}
             nexusHlsSources={nexusHlsSources}
             nexusFileSources={nexusFileSources}
-            rivestreamSources={rivestreamSources}
-            rivestreamCaptions={rivestreamCaptions}
-            loadingRivestream={loadingRivestream}
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
@@ -4103,9 +3320,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
@@ -4167,9 +3381,6 @@ const WatchMovie: React.FC = () => {
             controls={true}
             nexusHlsSources={nexusHlsSources}
             nexusFileSources={nexusFileSources}
-            rivestreamSources={rivestreamSources}
-            rivestreamCaptions={rivestreamCaptions}
-            loadingRivestream={loadingRivestream}
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
@@ -4220,9 +3431,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
@@ -4251,169 +3459,6 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
-        </div>
-      ) : selectedSource === 'rivestream_hls' && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
-        <div className="w-full h-full flex items-center justify-center">
-          {loadingRivestream ? (
-            <div className="flex flex-col items-center justify-center h-full bg-black">
-              <div className="loading-container">
-                <div className="loading-bar"></div>
-                <div className="loading-bar"></div>
-                <div className="loading-bar"></div>
-                <div className="loading-bar"></div>
-              </div>
-              <div className="text-white text-xl font-medium mt-6">{t('watch.loadingVostfrSources')}</div>
-            </div>
-          ) : rivestreamSources.length > 0 ? (
-            <>
-              <HLSPlayer
-                priorityCategory="moviesTv"
-                autoFallbackGuard={autoFallbackGuard}
-                key={`rivestream-${selectedRivestreamSource}-${id}-${videoSource}`}
-                src={videoSource || rivestreamSources[selectedRivestreamSource]?.url || ""}
-                className="w-full h-full"
-                autoPlay={true}
-                onError={() => {
-                  // Try next Rivestream source if available
-                  if (selectedRivestreamSource < rivestreamSources.length - 1) {
-                    const nextIndex = selectedRivestreamSource + 1;
-                    setSelectedRivestreamSource(nextIndex);
-                    setVideoSource(rivestreamSources[nextIndex].url);
-                  } else {
-                    // No more Rivestream sources, fallback to other sources
-                    if (nexusHlsSources.length > 0) {
-                      setSelectedSource('nexus_hls');
-                      setSelectedNexusHlsSource(0);
-                      setVideoSource(nexusHlsSources[0].url);
-                    } else if (darkinoSources.length > 0) {
-                      setSelectedSource('darkino');
-                      setSelectedDarkinoSource(0);
-                    }
-                  }
-                }}
-                nextMovie={nextMovie}
-                onNextMovie={handleNextMovie}
-                poster={posterPath ? `https://image.tmdb.org/t/p/w500${posterPath}` : undefined}
-                backdrop={backdropPath ? `https://image.tmdb.org/t/p/w1280${backdropPath}` : undefined}
-                movieId={id || undefined}
-                controls={true}
-                nexusHlsSources={nexusHlsSources}
-                nexusFileSources={nexusFileSources}
-                rivestreamSources={rivestreamSources}
-                rivestreamCaptions={rivestreamCaptions}
-                loadingRivestream={loadingRivestream}
-                darkinoSources={darkinoSources}
-                mp4Sources={mp4Sources}
-                frembedAvailable={frembedAvailable}
-                customSources={customSources}
-                omegaSources={sortedOmega}
-                coflixSources={sortedCoflix}
-                fstreamSources={sortedFstream}
-                wiflixSources={sortedWiflix}
-                      j1fSources={sortedJ1f}
-                      swiftflowSources={sortedSwiftflow}
-                viperSources={sortedViper}
-                kisskhSources={kisskhSources}
-                kisskhSubtitles={kisskhSubtitles}
-                loadingKisskh={loadingKisskh}
-
-                title={movieTitle}
-                initialTime={watchProgress}
-              />
-              {/* Sources Menu Overlay */}
-              <AnimatePresence>
-                {showEmbedQuality && (
-                  <motion.div
-                    key="embed-quality-menu"
-                    initial={{ opacity: 0, x: 300 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, x: 300 }}
-                    transition={{ duration: 0.3, ease: 'easeOut' }}
-                    className="fixed inset-0 z-[10000] bg-black/50 flex justify-end pointer-events-auto"
-                  >
-                    <div className="bg-black/95 border-l border-gray-800 shadow-2xl w-full max-w-md h-full overflow-y-auto z-[10000]">
-                      <div className="flex justify-between items-center p-4 border-b border-gray-700/60 sticky top-0 bg-black/95 z-10">
-                        <h3 className="text-white text-lg font-bold">{t('watch.changeSource')}</h3>
-                        <button
-                          onClick={() => setShowEmbedQuality(false)}
-                          className="text-gray-400 hover:text-red-500 transition-colors text-2xl font-bold focus:outline-none"
-                        >
-                          ×
-                        </button>
-                      </div>
-                      <div className="p-4">
-                        <HLSPlayer
-                          priorityCategory="moviesTv"
-                          autoFallbackGuard={autoFallbackGuard}
-                          src={''}
-                          className="hidden"
-                          movieId={id || undefined}
-                          controls={false}
-                          nexusHlsSources={nexusHlsSources}
-                          nexusFileSources={nexusFileSources}
-                          darkinoSources={darkinoSources}
-                          mp4Sources={mp4Sources}
-                          frembedAvailable={frembedAvailable}
-                          customSources={customSources}
-                          omegaSources={sortedOmega}
-                          coflixSources={sortedCoflix}
-                          fstreamSources={sortedFstream}
-                          wiflixSources={sortedWiflix}
-                      j1fSources={sortedJ1f}
-                      swiftflowSources={sortedSwiftflow}
-                          viperSources={sortedViper}
-                          kisskhSources={kisskhSources}
-                          kisskhSubtitles={kisskhSubtitles}
-                          loadingKisskh={loadingKisskh}
-
-                          autoPlay={false}
-                          onlyQualityMenu={true}
-                          embedType={embedType || undefined}
-                          embedUrl={embedUrl || undefined}
-                          title={movieTitle}
-                          initialTime={watchProgress}
-                        />
-                      </div>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </>
-          ) : (
-            <div className="flex flex-col items-center justify-center h-full bg-black">
-              <HLSPlayer
-                priorityCategory="moviesTv"
-                autoFallbackGuard={autoFallbackGuard}
-                src={''}
-                className="hidden"
-                movieId={id || undefined}
-                controls={false}
-                nexusHlsSources={nexusHlsSources}
-                nexusFileSources={nexusFileSources}
-                darkinoSources={darkinoSources}
-                mp4Sources={mp4Sources}
-                frembedAvailable={frembedAvailable}
-                customSources={customSources}
-                omegaSources={sortedOmega}
-                coflixSources={sortedCoflix}
-                fstreamSources={sortedFstream}
-                wiflixSources={sortedWiflix}
-                      j1fSources={sortedJ1f}
-                      swiftflowSources={sortedSwiftflow}
-                viperSources={sortedViper}
-                kisskhSources={kisskhSources}
-                kisskhSubtitles={kisskhSubtitles}
-                loadingKisskh={loadingKisskh}
-
-                autoPlay={false}
-                onlyQualityMenu={true}
-                embedType={embedType || undefined}
-                embedUrl={embedUrl || undefined}
-                title={movieTitle}
-                initialTime={watchProgress}
-              />
-            </div>
-          )}
         </div>
       ) : selectedSource === 'darkino' && darkinoSources.length > 0 && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -4451,9 +3496,6 @@ const WatchMovie: React.FC = () => {
             controls={true}
             nexusHlsSources={nexusHlsSources}
             nexusFileSources={nexusFileSources}
-            rivestreamSources={rivestreamSources}
-            rivestreamCaptions={rivestreamCaptions}
-            loadingRivestream={loadingRivestream}
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
@@ -4626,9 +3668,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
@@ -4733,9 +3772,6 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       nexusHlsSources={nexusHlsSources}
                       nexusFileSources={nexusFileSources}
-                      rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
-                      rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
-                      loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}

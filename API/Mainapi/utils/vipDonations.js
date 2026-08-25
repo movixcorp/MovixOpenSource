@@ -7,6 +7,7 @@ const { BIP32Factory } = require('bip32');
 const { invalidateVipCache } = require('../checkVip');
 const { fetchAddressTxs, fetchTipHeight } = require('./chainExplorer');
 const vipPaygate = require('./vipPaygate');
+const vipCryptoGate = require('./vipCryptoGate');
 
 bitcoin.initEccLib(ecc);
 
@@ -23,10 +24,11 @@ const VIP_PACKS = Object.freeze({
 const VIP_PAYMENT_METHODS = Object.freeze({
   btc: { type: 'crypto', coin: 'btc' },
   ltc: { type: 'crypto', coin: 'ltc' },
+  cryptogate: { type: 'cryptogate', coin: null },
   paygate_hosted: { type: 'paygate', coin: null },
   payblis: { type: 'payblis', coin: null }
 });
-const VIP_PAYMENT_METHOD_ENUM_SQL = "ENUM('btc', 'ltc', 'paygate_hosted', 'autobuy', 'payblis')";
+const VIP_PAYMENT_METHOD_ENUM_SQL = "ENUM('btc', 'ltc', 'cryptogate', 'paygate_hosted', 'autobuy', 'payblis')";
 
 const DEFAULT_SUPPORT_TELEGRAM_URL = 'https://t.me/movix_site';
 const FINAL_STATUSES = new Set(['delivered', 'cancelled']);
@@ -167,8 +169,28 @@ function isPaygatePaymentMethod(paymentMethod) {
   return paymentMethod === 'paygate_hosted';
 }
 
+function isCryptoGatePaymentMethod(paymentMethod) {
+  return paymentMethod === 'cryptogate';
+}
+
 function isPayblisPaymentMethod(paymentMethod) {
   return paymentMethod === 'payblis';
+}
+
+function isCryptoGateEnabled() {
+  const enabled = String(process.env.VIP_CRYPTOGATE_ENABLED || 'false').trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(enabled);
+}
+
+function isLegacyPaymentCreationEnabled() {
+  const enabled = String(
+    process.env.VIP_LEGACY_PAYMENT_CREATION_ENABLED || 'false'
+  ).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(enabled);
+}
+
+function getCryptoGateClient(context = {}) {
+  return context.cryptoGateClient || vipCryptoGate.createCryptoGateClient();
 }
 
 function isAutoBuyPaymentMethod(paymentMethod) {
@@ -804,11 +826,13 @@ function serializePublicInvoice(invoice) {
     trackingAddress: isPaygatePaymentMethod(paymentMethod)
       ? (invoice.paygate_tracking_address || invoice.payment_address || null)
       : null,
-    checkoutUrl: isPaygatePaymentMethod(paymentMethod)
-      ? resolvePaygateCheckoutUrl(invoice)
-      : isPayblisPaymentMethod(paymentMethod)
-        ? (invoice.payblis_checkout_url || null)
-        : null,
+    checkoutUrl: isCryptoGatePaymentMethod(paymentMethod)
+      ? (invoice.cryptogate_checkout_url || null)
+      : isPaygatePaymentMethod(paymentMethod)
+        ? resolvePaygateCheckoutUrl(invoice)
+        : isPayblisPaymentMethod(paymentMethod)
+          ? (invoice.payblis_checkout_url || null)
+          : null,
     addressType: isCryptoInvoice ? (invoice.address_type || null) : null,
     confirmations: isCryptoInvoice ? parseNumber(invoice.confirmations) : null,
     requiredConfirmations: isCryptoInvoice ? parseNumber(invoice.required_confirmations) : null,
@@ -849,20 +873,26 @@ function serializeAdminInvoice(invoice) {
     createdByUserType: invoice.created_by_user_type || null,
     createdBySessionId: invoice.created_by_session_id || null,
     createdIpHash: invoice.created_ip_hash || null,
-    payerEmail: invoice.paygate_payer_email || invoice.payblis_payer_email || null,
+    payerEmail: invoice.cryptogate_payer_email || invoice.paygate_payer_email || invoice.payblis_payer_email || null,
     temporaryWalletAddress: invoice.paygate_temporary_wallet_address || null,
-    paidCoin: invoice.paygate_paid_coin || null,
+    paidCoin: invoice.paygate_paid_coin || invoice.cryptogate_provider || null,
     paidValue: invoice.paygate_paid_value !== null && invoice.paygate_paid_value !== undefined
       ? roundFiat(invoice.paygate_paid_value)
       : null,
     paidTxid: invoice.paygate_paid_txid || invoice.payblis_transaction_id || null,
-    externalOrderId: invoice.payblis_ref_order || null,
+    externalOrderId: invoice.cryptogate_payment_id || invoice.payblis_ref_order || null,
     externalProductId: null,
-    externalGateway: invoice.payblis_ref_order ? 'payblis' : null,
-    externalCurrency: invoice.payblis_paid_currency || null,
-    externalAmount: invoice.payblis_paid_amount !== null && invoice.payblis_paid_amount !== undefined
-      ? roundFiat(invoice.payblis_paid_amount)
-      : null,
+    externalGateway: invoice.cryptogate_payment_id
+      ? 'cryptogate'
+      : invoice.payblis_ref_order
+        ? 'payblis'
+        : null,
+    externalCurrency: invoice.cryptogate_paid_currency || invoice.payblis_paid_currency || null,
+    externalAmount: invoice.cryptogate_paid_amount !== null && invoice.cryptogate_paid_amount !== undefined
+      ? roundFiat(invoice.cryptogate_paid_amount)
+      : invoice.payblis_paid_amount !== null && invoice.payblis_paid_amount !== undefined
+        ? roundFiat(invoice.payblis_paid_amount)
+        : null,
     payblisMethod: invoice.payblis_method || null,
     payblisCustomerName: invoice.payblis_customer_name || null,
     payblisIpnReceivedAt: fromSqlDateTime(invoice.payblis_ipn_received_at)?.toISOString() || null,
@@ -1051,6 +1081,20 @@ async function refreshInvoiceStatus(pool, invoiceInput, options = {}) {
       // Non-fatal — backup poll, don't escalate.
     }
     return fetchInvoiceById(pool, invoice.id);
+  }
+
+  if (isCryptoGatePaymentMethod(paymentMethod)) {
+    if (invoice.status === 'paid') {
+      const deliver = options.deliverInvoice || deliverInvoiceIfReady;
+      return deliver(
+        pool,
+        invoice.id,
+        options.actorType || 'system',
+        options.actorId || null,
+        'cryptogate_paid_recovery'
+      );
+    }
+    return expireAwaitingInvoiceIfOverdue(pool, invoice);
   }
 
   if (isPaygatePaymentMethod(paymentMethod)) {
@@ -1482,6 +1526,124 @@ async function createPaygateVipInvoice(pool, payload, context = {}) {
     if (error?.message === 'Adresse email invalide pour PayGate') throw error;
     throw mapPaygateServiceError(error, 'create_invoice', callbackReference);
   }
+}
+
+async function createCryptoGateVipInvoice(pool, payload, context = {}) {
+  const pack = payload.pack;
+  const recipientMode = payload.recipientMode;
+  const normalizedEmail = normalizeEmailAddress(payload.payerEmail)
+    || normalizeEmailAddress(context.auth?.email);
+
+  if (!pack || !recipientMode || !normalizedEmail) {
+    throw createVipInvoiceError('Adresse email invalide pour CryptoGate');
+  }
+  if (!isCryptoGateEnabled()) {
+    throw createVipInvoiceError('Paiement CryptoGate indisponible pour le moment', 503);
+  }
+  if (!String(process.env.VIP_CRYPTOGATE_API_KEY || '').trim()) {
+    const error = createVipInvoiceError('Configuration CryptoGate incomplète', 503);
+    error.code = 'CRYPTOGATE_API_KEY_MISSING';
+    throw error;
+  }
+  if (!String(process.env.VIP_CRYPTOGATE_WEBHOOK_SECRET || '').trim()) {
+    const error = createVipInvoiceError('Configuration CryptoGate incomplète', 503);
+    error.code = 'CRYPTOGATE_WEBHOOK_SECRET_MISSING';
+    throw error;
+  }
+
+  const publicId = `inv_${crypto.randomBytes(12).toString('hex')}`;
+  let payment;
+  try {
+    payment = await getCryptoGateClient(context).createPayment({
+      amount: pack.amountEur,
+      currency: 'EUR',
+      email: normalizedEmail,
+      orderId: publicId,
+      label: `Movix VIP ${buildDurationLabel(pack.vipYears)}`,
+      description: `Pack VIP Movix - ${buildDurationLabel(pack.vipYears)}`
+    });
+  } catch (error) {
+    const mapped = createVipInvoiceError(
+      error?.statusCode >= 500 ? 'Service CryptoGate temporairement indisponible' : (error?.message || 'Paiement CryptoGate invalide'),
+      error?.statusCode || 502
+    );
+    mapped.code = error?.code || 'CRYPTOGATE_CREATE_FAILED';
+    throw mapped;
+  }
+
+  const expirationMinutes = Math.max(
+    1,
+    parseNumber(process.env.VIP_INVOICE_EXPIRATION_MINUTES, DEFAULT_EXPIRATION_MINUTES)
+  );
+  const expiresAt = new Date(Date.now() + expirationMinutes * 60 * 1000);
+  const giftToken = recipientMode === 'gift'
+    ? `gift_${crypto.randomBytes(16).toString('hex')}`
+    : null;
+  const createdIpHash = hashIp(context.ipAddress);
+  const auth = context.auth || null;
+  const connection = await pool.getConnection();
+  let insertId;
+
+  try {
+    await connection.beginTransaction();
+    const [insertResult] = await connection.execute(
+      `INSERT INTO vip_invoices
+        (public_id, payment_method, status, coin, pack_eur, amount_eur, amount_usd,
+         amount_crypto_expected, amount_crypto_received, vip_years, recipient_mode,
+         payment_address, address_type, derivation_index, confirmations,
+         required_confirmations, tx_hash, qr_payload, gift_token, gift_sealed,
+         gift_unsealed_at, gift_unseal_count, gift_unsealed_by_ip_hash,
+         vip_key_value, created_by_user_id, created_by_user_type,
+         created_by_session_id, created_ip_hash, expires_at, next_check_at,
+         cryptogate_payment_id, cryptogate_checkout_url, cryptogate_payer_email,
+         created_at, updated_at)
+        VALUES
+        (?, 'cryptogate', 'awaiting_payment', NULL, ?, ?, 0, NULL, 0, ?, ?,
+         NULL, NULL, NULL, 0, 0, NULL, NULL, ?, 1, NULL, 0, NULL, NULL,
+         ?, ?, ?, ?, ?, NOW(), ?, ?, ?, NOW(), NOW())`,
+      [
+        publicId,
+        pack.amountEur,
+        pack.amountEur,
+        pack.vipYears,
+        recipientMode,
+        giftToken,
+        auth?.userId || null,
+        auth?.userType || null,
+        auth?.sessionId || null,
+        createdIpHash,
+        toSqlDateTime(expiresAt),
+        payment.paymentId,
+        payment.checkoutUrl,
+        normalizedEmail
+      ]
+    );
+    insertId = insertResult.insertId;
+
+    await logVipInvoiceEvent(
+      connection,
+      insertId,
+      'invoice_cryptogate_created',
+      'Invoice VIP CryptoGate créée.',
+      {
+        paymentMethod: 'cryptogate',
+        paymentId: payment.paymentId,
+        packEur: pack.amountEur,
+        vipYears: pack.vipYears,
+        recipientMode
+      },
+      auth ? 'user' : 'guest',
+      auth?.userId || null
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  return fetchInvoiceById(pool, insertId);
 }
 
 async function createPayblisVipInvoice(pool, { pack, recipientMode, payerEmail, auth }, context) {
@@ -2214,6 +2376,167 @@ async function markPayblisInvoicePaidFromRest(pool, invoiceInput, restPayload) {
   return refreshed;
 }
 
+function createCryptoGateWebhookError(code, statusCode, message = 'Webhook CryptoGate invalide') {
+  const error = createVipInvoiceError(message, statusCode);
+  error.code = code;
+  return error;
+}
+
+async function handleCryptoGateWebhook(pool, request = {}, deps = {}) {
+  const rawBody = request.rawBody;
+  const signature = String(request.signature || '').trim();
+  const webhookId = String(request.webhookId || '').trim().slice(0, 128) || null;
+  const webhookSecret = String(
+    deps.webhookSecret || process.env.VIP_CRYPTOGATE_WEBHOOK_SECRET || ''
+  ).trim();
+
+  if (!webhookSecret) {
+    throw createCryptoGateWebhookError(
+      'CRYPTOGATE_WEBHOOK_SECRET_MISSING',
+      503,
+      'Webhook CryptoGate non configuré'
+    );
+  }
+  if (!vipCryptoGate.verifyCryptoGateSignature(rawBody, signature, webhookSecret)) {
+    throw createCryptoGateWebhookError('CRYPTOGATE_WEBHOOK_SIGNATURE_INVALID', 401);
+  }
+
+  let webhook;
+  try {
+    webhook = vipCryptoGate.parseCryptoGateWebhook(rawBody);
+  } catch (error) {
+    throw createCryptoGateWebhookError(
+      error?.code || 'CRYPTOGATE_WEBHOOK_PAYLOAD_INVALID',
+      error?.statusCode || 400
+    );
+  }
+
+  const connection = await pool.getConnection();
+  let invoice;
+  let shouldDeliver = false;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      'SELECT * FROM vip_invoices WHERE public_id = ? FOR UPDATE',
+      [webhook.payment.orderId]
+    );
+    invoice = rows[0] || null;
+
+    if (!invoice) {
+      throw createCryptoGateWebhookError('CRYPTOGATE_INVOICE_NOT_FOUND', 404);
+    }
+    if (!isCryptoGatePaymentMethod(getInvoicePaymentMethod(invoice))) {
+      throw createCryptoGateWebhookError('CRYPTOGATE_INVOICE_METHOD_MISMATCH', 409);
+    }
+    if (String(invoice.cryptogate_payment_id || '') !== webhook.payment.id) {
+      throw createCryptoGateWebhookError('CRYPTOGATE_PAYMENT_ID_MISMATCH', 409);
+    }
+    if (
+      roundFiat(invoice.amount_eur) !== roundFiat(webhook.payment.amount)
+      || webhook.payment.currency !== 'EUR'
+    ) {
+      throw createCryptoGateWebhookError('CRYPTOGATE_WEBHOOK_AMOUNT_MISMATCH', 409);
+    }
+
+    const alreadyFinal = FINAL_STATUSES.has(invoice.status);
+    // payment.id is already bound to this invoice above. CryptoGate recommends
+    // deduplicating with payment.id + event; a retry may carry a new delivery id.
+    const isExactDuplicate = String(invoice.cryptogate_last_event || '') === webhook.event;
+
+    if (!alreadyFinal && !isExactDuplicate) {
+      if (webhook.event === 'payment.paid') {
+        await connection.execute(
+          `UPDATE vip_invoices
+            SET status = 'paid',
+                paid_at = COALESCE(paid_at, NOW()),
+                cryptogate_provider = ?,
+                cryptogate_paid_amount = ?,
+                cryptogate_paid_currency = ?,
+                cryptogate_last_webhook_id = ?,
+                cryptogate_last_event = ?,
+                cryptogate_webhook_received_at = NOW(),
+                updated_at = NOW()
+            WHERE id = ?`,
+          [
+            webhook.payment.provider || null,
+            roundFiat(webhook.payment.amount),
+            webhook.payment.currency,
+            webhookId,
+            webhook.event,
+            invoice.id
+          ]
+        );
+        shouldDeliver = true;
+      } else if (webhook.event === 'payment.confirming') {
+        if (!['paid', 'delivered', 'cancelled'].includes(invoice.status)) {
+          await connection.execute(
+            `UPDATE vip_invoices
+              SET status = 'confirming',
+                  cryptogate_provider = ?,
+                  cryptogate_last_webhook_id = ?,
+                  cryptogate_last_event = ?,
+                  cryptogate_webhook_received_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = ?`,
+            [webhook.payment.provider || null, webhookId, webhook.event, invoice.id]
+          );
+        }
+      } else if (!['paid', 'delivered'].includes(invoice.status)) {
+        await connection.execute(
+          `UPDATE vip_invoices
+            SET status = 'cancelled',
+                cryptogate_provider = ?,
+                cryptogate_last_webhook_id = ?,
+                cryptogate_last_event = ?,
+                cryptogate_webhook_received_at = NOW(),
+                updated_at = NOW()
+            WHERE id = ?`,
+          [webhook.payment.provider || null, webhookId, webhook.event, invoice.id]
+        );
+      }
+
+      await logVipInvoiceEvent(
+        connection,
+        invoice.id,
+        `invoice_cryptogate_${webhook.payment.status}`,
+        `Webhook CryptoGate ${webhook.event} traité.`,
+        {
+          paymentId: webhook.payment.id,
+          webhookId,
+          event: webhook.event,
+          amount: webhook.payment.amount,
+          currency: webhook.payment.currency,
+          provider: webhook.payment.provider || null
+        },
+        'system',
+        'cryptogate-webhook'
+      );
+    } else if (invoice.status === 'paid') {
+      shouldDeliver = true;
+    }
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  if (shouldDeliver) {
+    const deliver = deps.deliverInvoice || deliverInvoiceIfReady;
+    return deliver(
+      pool,
+      invoice.id,
+      'system',
+      'cryptogate-webhook',
+      'cryptogate_paid'
+    );
+  }
+
+  return FINAL_STATUSES.has(invoice.status) ? invoice : fetchInvoiceById(pool, invoice.id);
+}
+
 async function createVipInvoice(pool, payload, context = {}) {
   const pack = resolvePack(payload.packEur);
   const paymentMethod = normalizePaymentMethod(payload.paymentMethod, payload.coin);
@@ -2221,6 +2544,30 @@ async function createVipInvoice(pool, payload, context = {}) {
 
   if (!pack || !paymentMethod || !recipientMode) {
     throw createVipInvoiceError('Paramètres d\'invoice invalides');
+  }
+
+  if (
+    (isPaygatePaymentMethod(paymentMethod) || isPayblisPaymentMethod(paymentMethod))
+    && !isLegacyPaymentCreationEnabled()
+  ) {
+    const error = createVipInvoiceError(
+      'Ce moyen de paiement a été remplacé par CryptoGate',
+      410
+    );
+    error.code = 'VIP_LEGACY_PAYMENT_RETIRED';
+    throw error;
+  }
+
+  if (isCryptoGatePaymentMethod(paymentMethod)) {
+    return createCryptoGateVipInvoice(
+      pool,
+      {
+        pack,
+        recipientMode,
+        payerEmail: payload.payerEmail
+      },
+      context
+    );
   }
 
   if (isPaygatePaymentMethod(paymentMethod)) {
@@ -2650,7 +2997,7 @@ async function normalizeVipInvoicePaymentMethods(pool) {
     SET autobuy_gateway = COALESCE(NULLIF(autobuy_gateway, ''), payment_method),
         payment_method = 'autobuy'
     WHERE payment_method IS NOT NULL
-      AND payment_method NOT IN ('btc', 'ltc', 'paygate_hosted', 'autobuy', 'payblis')
+      AND payment_method NOT IN ('btc', 'ltc', 'cryptogate', 'paygate_hosted', 'autobuy', 'payblis')
   `);
 
   await pool.execute(`
@@ -2734,6 +3081,15 @@ async function ensureVipDonationsTables(pool) {
       paygate_paid_value DECIMAL(18,8) DEFAULT NULL,
       paygate_paid_txid_in VARCHAR(255) DEFAULT NULL,
       paygate_paid_txid VARCHAR(255) DEFAULT NULL,
+      cryptogate_payment_id VARCHAR(128) DEFAULT NULL,
+      cryptogate_checkout_url TEXT DEFAULT NULL,
+      cryptogate_payer_email VARCHAR(255) DEFAULT NULL,
+      cryptogate_provider VARCHAR(64) DEFAULT NULL,
+      cryptogate_paid_amount DECIMAL(18,2) DEFAULT NULL,
+      cryptogate_paid_currency VARCHAR(16) DEFAULT NULL,
+      cryptogate_last_webhook_id VARCHAR(128) DEFAULT NULL,
+      cryptogate_last_event VARCHAR(64) DEFAULT NULL,
+      cryptogate_webhook_received_at DATETIME DEFAULT NULL,
       autobuy_order_id VARCHAR(128) DEFAULT NULL,
       autobuy_product_id VARCHAR(128) DEFAULT NULL,
       autobuy_email VARCHAR(255) DEFAULT NULL,
@@ -2755,6 +3111,8 @@ async function ensureVipDonationsTables(pool) {
         (paygate_callback_reference),
       UNIQUE KEY uniq_vip_invoices_paygate_paid_txid_in
         (paygate_paid_txid_in),
+      UNIQUE KEY uniq_vip_invoices_cryptogate_payment_id
+        (cryptogate_payment_id),
       UNIQUE KEY uniq_vip_invoices_autobuy_order_id (autobuy_order_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
@@ -2906,6 +3264,61 @@ async function ensureVipDonationsTables(pool) {
     'vip_invoices',
     'autobuy_order_created_at',
     "`autobuy_order_created_at` DATETIME DEFAULT NULL AFTER `autobuy_total`"
+  );
+
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_payment_id',
+    "`cryptogate_payment_id` VARCHAR(128) DEFAULT NULL"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_checkout_url',
+    "`cryptogate_checkout_url` TEXT DEFAULT NULL AFTER `cryptogate_payment_id`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_payer_email',
+    "`cryptogate_payer_email` VARCHAR(255) DEFAULT NULL AFTER `cryptogate_checkout_url`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_provider',
+    "`cryptogate_provider` VARCHAR(64) DEFAULT NULL AFTER `cryptogate_payer_email`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_paid_amount',
+    "`cryptogate_paid_amount` DECIMAL(18,2) DEFAULT NULL AFTER `cryptogate_provider`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_paid_currency',
+    "`cryptogate_paid_currency` VARCHAR(16) DEFAULT NULL AFTER `cryptogate_paid_amount`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_last_webhook_id',
+    "`cryptogate_last_webhook_id` VARCHAR(128) DEFAULT NULL AFTER `cryptogate_paid_currency`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_last_event',
+    "`cryptogate_last_event` VARCHAR(64) DEFAULT NULL AFTER `cryptogate_last_webhook_id`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'cryptogate_webhook_received_at',
+    "`cryptogate_webhook_received_at` DATETIME DEFAULT NULL AFTER `cryptogate_last_event`"
   );
 
   // Payblis columns (added 2026-04-21).
@@ -3077,6 +3490,13 @@ async function ensureVipDonationsTables(pool) {
     'uniq_vip_invoices_autobuy_order_id',
     'UNIQUE INDEX `uniq_vip_invoices_autobuy_order_id` (`autobuy_order_id`)'
   );
+  await ensureUniqueSingleColumnIndex(
+    pool,
+    'vip_invoices',
+    'uniq_vip_invoices_cryptogate_payment_id',
+    'cryptogate_payment_id',
+    'UNIQUE INDEX `uniq_vip_invoices_cryptogate_payment_id` (`cryptogate_payment_id`)'
+  );
 }
 
 module.exports = {
@@ -3084,6 +3504,7 @@ module.exports = {
   STATUS_REASONS,
   DEFAULT_EXPIRATION_MINUTES,
   createVipInvoice,
+  handleCryptoGateWebhook,
   handlePaygateCallback,
   handlePayblisIpn,
   markPayblisInvoicePaidFromRest,

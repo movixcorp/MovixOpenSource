@@ -1,11 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, {
+  useCallback, useEffect, useMemo, useRef, useState,
+} from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useLightMode } from '../context/LightModeContext';
-import { ChevronRight, Gauge, Loader2 } from 'lucide-react';
+import { ChevronRight, ExternalLink, Gauge, Loader2 } from 'lucide-react';
 import ReactCountryFlag from 'react-country-flag';
 import { Select, SelectTrigger, SelectContent, SelectItem } from '@/components/ui/select';
 import CustomDropdown from './CustomDropdown';
-import { BgColorPickerPanel } from './Settings/BgColorPickerPanel';
+import { computeFacets, filterTracks } from '../services/subtitles/index.ts';
+import type { SubtitleFilters, SubtitleTrack } from '../services/subtitles/index.ts';
+import { SubtitleStyleControls } from './subtitles/SubtitleStyleControls';
+import SkipSegmentsPanel from './Settings/SkipSegmentsPanel';
+import * as skipSegmentPrefs from '../utils/skipSegmentPrefs';
 import { PinButton } from './ui/PinButton';
 import { HLSQualitySelector } from './HLSQualitySelector';
 import { HLSServerSelector } from './HLSServerSelector';
@@ -24,6 +30,15 @@ import type {
   HosterId, PriorityCategory, TopLevelSourceId, LanguageId,
 } from '../types/sourcePriority';
 import type { KisskhSource, KisskhSubtitleTrack } from '../types/kisskh';
+import type { SubtitlePreferencePatch, SubtitlePreferences } from '../utils/subtitlePreferences';
+import {
+  AUTOPLAY_SECONDS_MAX,
+  PERCENTAGE_MAX,
+  PERCENTAGE_MIN,
+  TIME_BEFORE_END_MAX,
+  TIME_BEFORE_END_MIN,
+  type NextContentPrefs,
+} from '../utils/nextContentPrefs';
 
 /**
  * Milestone 4 — mapping des `source_main` types (labels internes du panneau
@@ -46,7 +61,6 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   vox_main: 'vox',
   kisskh_main: 'kisskh',
   bravo_main: 'bravo',
-  rivestream_main: 'rivestream_hls',
   vostfr_main: 'vostfr',
   frembed_main: 'frembed',
   mp4: 'mp4',
@@ -57,12 +71,12 @@ interface HLSPlayerSettingsPanelProps extends Record<string, any> {
   kisskhSources?: KisskhSource[];
   kisskhSubtitles?: KisskhSubtitleTrack[];
   loadingKisskh?: boolean;
+  subtitlePreferences: SubtitlePreferences;
+  patchSubtitlePreferences: (patch: SubtitlePreferencePatch) => void;
+  previewSubtitlePreferences: (patch: SubtitlePreferencePatch) => void;
+  commitSubtitlePreferences: () => void;
+  resetSubtitleAppearance: () => void;
 }
-
-// Mapping OpenSubtitles language codes to ISO country codes for flags
-const langToCountry: Record<string, string> = {
-  fre: 'FR', eng: 'GB', spa: 'ES', ita: 'IT', ger: 'DE', por: 'PT', rus: 'RU', jpn: 'JP', zht: 'TW', chi: 'CN', ara: 'SA', tur: 'TR', ukr: 'UA', pol: 'PL', nld: 'NL', swe: 'SE', dan: 'DK', fin: 'FI', nor: 'NO', hun: 'HU', ron: 'RO', ces: 'CZ', slk: 'SK', ell: 'GR', heb: 'IL', kor: 'KR', vie: 'VN', tha: 'TH', hin: 'IN', ind: 'ID', tam: 'IN', ben: 'BD', bul: 'BG', hrv: 'HR', srp: 'RS', slv: 'SI', est: 'EE', lav: 'LV', lit: 'LT', cat: 'ES', glg: 'ES', oci: 'FR'
-};
 
 // Translation target language codes with their country codes for flags
 const TRANSLATION_LANGS = [
@@ -72,7 +86,22 @@ const TRANSLATION_LANGS = [
   { code: 'zh', country: 'CN' }, { code: 'ar', country: 'SA' }, { code: 'hi', country: 'IN' },
   { code: 'tr', country: 'TR' }, { code: 'nl', country: 'NL' }, { code: 'pl', country: 'PL' },
   { code: 'uk', country: 'UA' }, { code: 'id', country: 'ID' }, { code: 'ms', country: 'MY' },
-  { code: 'km', country: 'KH' },
+  { code: 'km', country: 'KH' }, { code: 'bg', country: 'BG' }, { code: 'cs', country: 'CZ' },
+  { code: 'da', country: 'DK' }, { code: 'el', country: 'GR' }, { code: 'fi', country: 'FI' },
+  { code: 'he', country: 'IL' }, { code: 'hu', country: 'HU' }, { code: 'no', country: 'NO' },
+  { code: 'ro', country: 'RO' }, { code: 'sk', country: 'SK' }, { code: 'sv', country: 'SE' },
+  { code: 'th', country: 'TH' }, { code: 'vi', country: 'VN' }, { code: 'bn', country: 'BD' },
+  { code: 'ta', country: 'IN' }, { code: 'ur', country: 'PK' }, { code: 'fa', country: 'IR' },
+  { code: 'sr', country: 'RS' }, { code: 'hr', country: 'HR' }, { code: 'sl', country: 'SI' },
+  { code: 'lt', country: 'LT' }, { code: 'lv', country: 'LV' }, { code: 'et', country: 'EE' },
+  { code: 'sw', country: 'KE' }, { code: 'af', country: 'ZA' }, { code: 'ca', country: 'ES' },
+  { code: 'gl', country: 'ES' }, { code: 'is', country: 'IS' }, { code: 'ga', country: 'IE' },
+  { code: 'mr', country: 'IN' }, { code: 'ne', country: 'NP' }, { code: 'pa', country: 'IN' },
+  { code: 'te', country: 'IN' }, { code: 'ml', country: 'IN' }, { code: 'gu', country: 'IN' },
+  { code: 'kn', country: 'IN' }, { code: 'my', country: 'MM' }, { code: 'am', country: 'ET' },
+  { code: 'hy', country: 'AM' }, { code: 'ka', country: 'GE' }, { code: 'az', country: 'AZ' },
+  { code: 'kk', country: 'KZ' }, { code: 'uz', country: 'UZ' }, { code: 'lo', country: 'LA' },
+  { code: 'si', country: 'LK' },
 ] as const;
 
 const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
@@ -121,7 +150,6 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     embedUrl,
     onlyQualityMenu,
     embedType,
-    loadingRivestream,
     handleSourceChange,
     renderSourceQualityMeta,
     renderCopySourceButton,
@@ -135,7 +163,6 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     showJ1fMenu,
     showSwiftflowMenu,
     showNexusMenu,
-    showRivestreamMenu,
     showBravoMenu,
     showViperMenu,
     showVoxMenu,
@@ -146,9 +173,6 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     wiflixSources,
     j1fSources,
     swiftflowSources,
-    rivestreamSources,
-    rivestreamCaptions,
-    getOriginalUrl,
     capitalizeFirstLetter,
     getCoflixPreferredUrl,
     getLanguageName,
@@ -159,10 +183,9 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     episodeNumber,
     seasonNumber,
     movieId,
-    selectedExternalLang,
-    externalLanguages,
-    externalLangsLoading,
-    handleExternalLanguageSelect,
+    externalTracks = [] as SubtitleTrack[],
+    externalProviderErrors = [] as Array<{ provider: string; message: string }>,
+    preferredSubtitleLang,
     externalLoading,
     translateSubsTo,
     setTranslateSubsTo,
@@ -177,27 +200,37 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     loadExternalSubtitle,
     setLoadingSubtitle,
     selectedExternalSub,
-    externalSubs,
     setCurrentSubtitle,
     setSubtitleContainerVisible,
     refreshActiveCues,
-    subtitleStyle,
-    updateSubtitleFontSize,
-    updateSubtitleBackgroundOpacity,
-    updateSubtitleColor,
-    formatDelay,
-    resetSubtitleDelay,
-    updateSubtitleDelay,
+    subtitlePreferences,
+    patchSubtitlePreferences,
+    previewSubtitlePreferences,
+    commitSubtitlePreferences,
+    resetSubtitleAppearance,
     playbackSpeed,
     handlePlaybackSpeedChange,
     saveProgressEnabled,
     setSaveProgressEnabled,
     autoNextEpisodeEnabled,
     setAutoNextEpisodeEnabled,
-    nextContentThresholdMode,
-    setNextContentThresholdMode,
-    nextContentThresholdValue,
-    setNextContentThresholdValue,
+    keepFullscreenOnEpisodeChange,
+    setKeepFullscreenOnEpisodeChange,
+    resumePlaybackOnEpisodeChange,
+    setResumePlaybackOnEpisodeChange,
+    nextPrefs,
+    onNextPrefsChange,
+    skipSettings,
+    segmentProviderStatus,
+    segmentProviderDetail,
+    onSkipSettingsChange,
+    onSegmentTypeChange,
+    onSegmentColorChange,
+    onProviderToggle,
+    onProviderReorder,
+    onSkipSettingsReset,
+    onOpenSegmentStudio,
+    communitySubmissionCount,
     resetCurrentProgress,
     audioEnhancerMode,
     handleAudioEnhancerChange,
@@ -223,15 +256,74 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
   } = props;
 
   const category: PriorityCategory = priorityCategory === 'anime' ? 'anime' : 'moviesTv';
-  const [showExternalResults, setShowExternalResults] = useState(true);
 
-  useEffect(() => {
-    if (selectedExternalSub) setShowExternalResults(false);
-  }, [selectedExternalSub]);
+  // Réglages de la proposition « À suivre ». `props` est typé `Record<string,
+  // any>` : on renomme ici une bonne fois pour retrouver le type réel.
+  const nextContent = nextPrefs as NextContentPrefs;
+  const setNextContent = onNextPrefsChange as (patch: Partial<NextContentPrefs>) => void;
 
+  /**
+   * Le déclenchement « au générique » peut-il fonctionner ?
+   *
+   * Les séquences sont filtrées par les réglages de saut : couper le type
+   * « générique » là-bas prive aussi ce déclencheur. Sans ce contrôle, la
+   * bascule resterait sur « au générique » sans jamais rien faire.
+   */
+  const creditsSegmentsAvailable = Boolean(
+    skipSettings && (
+      skipSegmentPrefs.resolveSegmentMode(skipSettings, 'outro') !== 'off'
+      || skipSegmentPrefs.resolveSegmentMode(skipSettings, 'credits') !== 'off'
+    ),
+  );
+
+  const choiceClass = (active: boolean) =>
+    `flex-1 px-3 py-2 text-sm rounded-lg transition-colors ${active
+      ? 'bg-red-600 text-white font-medium'
+      : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`;
+
+  /** Remplissage rouge d'un curseur, comme les autres réglages du panneau. */
+  const sliderFill = (value: number, min: number, max: number) => {
+    const ratio = max > min ? ((value - min) / (max - min)) * 100 : 0;
+    return `linear-gradient(to right, #dc2626 0%, #dc2626 ${ratio}%, #374151 ${ratio}%, #374151 100%)`;
+  };
+
+  const [subtitleFilters, setSubtitleFilters] = useState<SubtitleFilters>({
+    lang: 'all',
+    source: 'all',
+    query: '',
+  });
+  const [visibleResultCount, setVisibleResultCount] = useState(60);
+
+  const subtitleFacets = useMemo(
+    () => computeFacets(externalTracks, subtitleFilters),
+    [externalTracks, subtitleFilters],
+  );
+  const filteredTracks = useMemo(
+    () => filterTracks(externalTracks, subtitleFilters),
+    [externalTracks, subtitleFilters],
+  );
+
+  // Defaut : la langue de l'interface (recue via `preferredSubtitleLang`,
+  // deja calculee dans HLSPlayer.tsx a partir de i18n.language) si elle est
+  // presente dans les resultats, sinon « toutes ». Ne s'applique qu'une fois
+  // par jeu de resultats, pour ne pas ecraser un choix manuel de l'utilisateur.
+  const defaultLangAppliedRef = useRef<string>('');
   useEffect(() => {
-    setShowExternalResults(true);
-  }, [selectedExternalLang]);
+    const signature = `${externalTracks.length}:${externalTracks[0]?.id ?? ''}`;
+    if (!externalTracks.length || defaultLangAppliedRef.current === signature) return;
+    defaultLangAppliedRef.current = signature;
+
+    const uiLang = preferredSubtitleLang || 'fr';
+    const hasUiLang = externalTracks.some((track: SubtitleTrack) => track.lang === uiLang);
+    // Reinitialise aussi source et query : sinon une puce de source qui n'existe
+    // plus dans les nouvelles facettes reste "selectionnee" sans rien surligner,
+    // et comme le compteur de langue applique le filtre de source, toutes les
+    // langues tombent a zero (l'utilisateur croit qu'il n'y a pas de sous-titres).
+    setSubtitleFilters(prev => ({
+      ...prev, lang: hasUiLang ? uiLang : 'all', source: 'all', query: '',
+    }));
+    setVisibleResultCount(60);
+  }, [externalTracks, preferredSubtitleLang]);
 
   // ===== Milestone 3 — sort hoster lists by user priority =====
   // Re-render when priority prefs change (e.g. user reorders in Settings).
@@ -288,8 +380,8 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
 
   /**
    * Milestone 4 — détection rapide du hoster depuis une URL (pour les menus
-   * qui n'utilisent pas `enrichAndSort`, ex. omega, coflix, fstream, wiflix,
-   * rivestream). Retourne null si pas un hoster connu → PinButton non affiché.
+   * qui n'utilisent pas `enrichAndSort`, ex. omega, coflix, fstream,
+   * wiflix). Retourne null si pas un hoster connu → PinButton non affiché.
    * Le param `label` permet de retomber sur le nom du lecteur quand l'URL
    * finale est un CDN nu (cas darkino / nexus_hls extrait).
    */
@@ -552,7 +644,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto custom-scrollbar p-4" data-lenis-prevent>
+            <div className="flex-1 overflow-x-hidden overflow-y-auto custom-scrollbar p-4" data-lenis-prevent>
               <AnimatePresence mode="wait">
                 {settingsTab === 'quality' && (
                   <motion.div
@@ -645,13 +737,13 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                               <div className="mb-2 flex items-stretch gap-2">
                                 <button
                                   onClick={() => handleSourceChange(source.type, source.id, source.url)}
-                                  disabled={(source.type === 'rivestream_hls' && loadingRivestream) || (source.type === 'kisskh_main' && loadingKisskh)}
+                                  disabled={source.type === 'kisskh_main' && loadingKisskh}
                                   className={`w-full flex-1 px-4 py-3 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isActive ? 'bg-gray-800 border-l-4 border-red-600 pl-3' : 'bg-gray-900/60 text-white'
-                                    } ${onlyQualityMenu && embedType && embedUrl && source.type === embedType && source.url === embedUrl ? 'ring-2 ring-red-500 bg-gray-800/80' : ''} ${(source.type === 'rivestream_hls' && loadingRivestream) ? 'opacity-70 cursor-not-allowed' : ''
+                                    } ${onlyQualityMenu && embedType && embedUrl && source.type === embedType && source.url === embedUrl ? 'ring-2 ring-red-500 bg-gray-800/80' : ''} ${''
                                     }`}
                                 >
                                   <div className="min-w-0 flex flex-1 flex-col">
-                                    <span className={`${isActive ? 'text-red-600 font-medium' : 'text-white'} ${(source.type === 'rivestream_hls' && loadingRivestream) ? 'animate-pulse' : ''
+                                    <span className={`${isActive ? 'text-red-600 font-medium' : 'text-white'} ${''
                                       }`}>
                                       {source.label}
                                       {topLevelForPin && pinnedSourceId === topLevelForPin && (
@@ -661,7 +753,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                     {group.type === 'hls' && (source.mediaType === 'mp4' || source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                                   </div>
                                   <div className="ml-3 flex items-center gap-2">
-                                    {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
+                                    {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
                                       <ChevronRight className={`w-4 h-4 transition-transform ${(source.type === 'darkino_main' && showDarkinoMenu) ||
                                         (source.type === 'omega_main' && showOmegaMenu) ||
                                         (source.type === 'multi_main' && showCoflixMenu) ||
@@ -670,7 +762,6 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                         (source.type === 'j1f_main' && showJ1fMenu) ||
                                         (source.type === 'swiftflow_main' && showSwiftflowMenu) ||
                                         (source.type === 'nexus_main' && showNexusMenu) ||
-                                        (source.type === 'rivestream_main' && showRivestreamMenu) ||
                                         (source.type === 'bravo_main' && showBravoMenu) ||
                                         (source.type === 'viper_main' && showViperMenu) ||
                                         (source.type === 'vox_main' && showVoxMenu)
@@ -981,7 +1072,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                               </div>
                                               {categorySources.map((fstreamSource: any) => {
                                                 const index = fstreamSources.findIndex((s: any) => s === fstreamSource);
-                                                const isFstreamActive = embedType === 'fstream' && getOriginalUrl(embedUrl || '') === fstreamSource.decoded_url;
+                                                const isFstreamActive = embedType === 'fstream' && (embedUrl || '') === fstreamSource.decoded_url;
                                                 const hosterId = detectHosterFromUrl(fstreamSource.decoded_url, fstreamSource.label);
                                                 return (
                                                   <div key={`fstream_${index}`} className="mb-2 ml-4 flex items-stretch gap-2">
@@ -1312,6 +1403,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {[
+                                        { id: '111movies', label: '111Movies' },
                                         { id: 'peachify', label: 'Peachify' },
                                         { id: 'vostfr', label: 'Videasy' },
                                         { id: 'vidlink', label: 'Vidlink' },
@@ -1322,13 +1414,15 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                         // (épisode spécial / Spéciaux TMDB) tombe dans le fallback '#' qui fait
                                         // charger la page courante en boucle dans l'iframe.
                                         const sourceUrl = movieId ?
-                                          vostfrSource.id === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
+                                          vostfrSource.id === '111movies' ? `https://111movies.net/movie/${movieId}` :
+                                            vostfrSource.id === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
                                             vostfrSource.id === 'vidlink' ? `https://vidlink.pro/movie/${movieId}` :
                                               vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
                                                 vostfrSource.id === 'vostfr' ? `https://player.videasy.net/movie/${movieId}` :
                                                   `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
                                           (tvShowId != null && seasonNumber != null && episodeNumber != null) ?
-                                            vostfrSource.id === 'peachify' ? `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626` :
+                                            vostfrSource.id === '111movies' ? `https://111movies.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
+                                              vostfrSource.id === 'peachify' ? `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626` :
                                               vostfrSource.id === 'vidlink' ? `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
                                                 vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}` :
                                                   vostfrSource.id === 'vostfr' ? `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
@@ -1408,103 +1502,6 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                   )}
                                 </AnimatePresence>
                               )}
-                              {/* Sous-menu Rivestream */}
-                              {source.type === 'rivestream_main' && (
-                                <AnimatePresence>
-                                  {showRivestreamMenu && (
-                                    <motion.div
-                                      initial={{ opacity: 0, y: -5 }}
-                                      animate={{ opacity: 1, y: 0 }}
-                                      exit={{ opacity: 0 }}
-                                      transition={getTransition({ duration: 0.15 })}
-                                      className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
-                                    >
-                                      {rivestreamSources && rivestreamSources.length > 0 ? (() => {
-                                        // Organiser les sources par catégorie (service)
-                                        const sourcesByCategory = rivestreamSources.reduce((acc, source) => {
-                                          const category = source.category || 'Other';
-                                          if (!acc[category]) acc[category] = [];
-                                          acc[category].push(source);
-                                          return acc;
-                                        }, {} as Record<string, typeof rivestreamSources>);
-
-                                        // Définir l'ordre et les emojis des catégories
-                                        const categoryOrder = [
-                                          { key: 'flowcast', emoji: '🌊' },
-                                          { key: 'asiacloud', emoji: '☁️' },
-                                          { key: 'hindicast', flagCode: 'IN' },
-                                          { key: 'aqua', emoji: '💧' },
-                                          { key: 'humpy', emoji: '🎬' },
-                                          { key: 'primevids', emoji: '⭐' },
-                                          { key: 'shadow', emoji: '🌑' },
-                                          { key: 'animez', emoji: '🎭' },
-                                          { key: 'yggdrasil', emoji: '🌳' },
-                                          { key: 'putafilme', emoji: '🎞️' },
-                                          { key: 'ophim', emoji: '🎥' }
-                                        ];
-
-                                        return categoryOrder.map((cat) => {
-                                          const categorySources = sourcesByCategory[cat.key];
-                                          if (!categorySources || categorySources.length === 0) return null;
-
-                                          return (
-                                            <div key={`rivestream_category_${cat.key}`} className="mb-3">
-                                              {/* En-tête de catégorie */}
-                                              <div className="flex items-center gap-2 mb-2 px-2">
-                                                <span className="text-lg">{'flagCode' in cat ? <ReactCountryFlag countryCode={cat.flagCode} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /> : cat.emoji}</span>
-                                                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-                                                  {cat.key} ({categorySources.length})
-                                                </span>
-                                              </div>
-                                              {/* Sources de la catégorie */}
-                                              {categorySources.map((rivestreamSource, index) => {
-                                                const globalIndex = rivestreamSources.findIndex(s => s.url === rivestreamSource.url);
-                                                const isRivestreamActive = src === rivestreamSource.url;
-                                                const rivestreamHoster = detectHosterFromUrl(rivestreamSource.url, rivestreamSource.label || rivestreamSource.service);
-                                                return (
-                                                  <motion.div
-                                                    key={`rivestream_${cat.key}_${index}`}
-                                                    initial={{ opacity: 0 }}
-                                                    animate={{ opacity: 1 }}
-                                                    transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
-                                                    className="mb-1 ml-4 flex items-stretch gap-2"
-                                                  >
-                                                    <button
-                                                      onClick={() => handleSourceChange('rivestream', `rivestream_${globalIndex}`, rivestreamSource.url)}
-                                                      className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isRivestreamActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
-                                                    >
-                                                      <div className="min-w-0 flex flex-1 flex-col">
-                                                        <span className={isRivestreamActive ? 'text-red-600 font-medium' : 'text-white'}>
-                                                          {rivestreamSource.label}
-                                                          {rivestreamHoster && pinnedHosterId === rivestreamHoster && (
-                                                            <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
-                                                          )}
-                                                        </span>
-                                                        {renderSourceQualityMeta(rivestreamSource.url, isRivestreamActive, rivestreamSource.quality, rivestreamSource.label)}
-                                                      </div>
-                                                      <div className="ml-3 flex items-center gap-2">
-                                                        <span className="text-xs text-gray-400">{rivestreamSource.service}</span>
-                                                        {isRivestreamActive && <span className="text-xs px-2 py-0.5 bg-red-600 text-white rounded-full">{t('watch.active')}</span>}
-                                                      </div>
-                                                    </button>
-                                                    {renderHosterPin(rivestreamHoster)}
-                                                    {renderCopySourceButton(rivestreamSource.url)}
-                                                  </motion.div>
-                                                );
-                                              })}
-                                            </div>
-                                          );
-                                        }).filter(Boolean);
-                                      })() : (
-                                        <div className="px-4 py-2 text-sm text-gray-400">
-                                        {t('watch.noSources')}
-                                        </div>
-                                      )}
-                                    </motion.div>
-                                  )}
-                                </AnimatePresence>
-                              )}
-
                               {/* Sous-menu Viper */}
                               {source.type === 'viper_main' && (
                                 <AnimatePresence>
@@ -1783,86 +1780,6 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       </div>
                     )}
 
-                    {/* Rivestream subtitles section */}
-                    {rivestreamCaptions && rivestreamCaptions.length > 0 && (
-                      <div className="mb-4 border-t border-gray-800 pt-3">
-                        <h4 className="text-gray-400 text-xs uppercase tracking-wider mb-2 px-2">{t('watch.rivestreamSubtitles')}</h4>
-                        <div className="space-y-1 px-2">
-                          {rivestreamCaptions.map((caption, idx) => {
-                            const id = `rivestream:${idx}`;
-                            return (
-                              <button
-                                key={id}
-                                onClick={async () => {
-                                  // Charger le sous-titre Rivestream via fetch et blob
-                                  const video = videoRef.current;
-                                  if (!video) return;
-
-                                  setLoadingSubtitle(true);
-
-                                  try {
-                                    // Fetch le fichier de sous-titres via le proxy
-                                    const response = await fetch(caption.file);
-                                    const srtContent = await response.text();
-
-                                    // Convertir SRT en VTT
-                                    const vttContent = 'WEBVTT\n\n' + srtContent
-                                      .replace(/\r\n/g, '\n')
-                                      .replace(/^\s*\d+\s*$/gm, '') // Supprimer les numéros de séquence
-                                      .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2') // Convertir virgules en points
-                                      .trim();
-
-                                    // Créer un blob URL
-                                    const blob = new Blob([vttContent], { type: 'text/vtt' });
-                                    const blobUrl = URL.createObjectURL(blob);
-
-                                    // Créer l'élément track
-                                    const trackEl = document.createElement('track');
-                                    trackEl.kind = 'subtitles';
-                                    trackEl.label = caption.label;
-                                    trackEl.srclang = caption.label.toLowerCase().includes('français') || caption.label.toLowerCase().includes('french') ? 'fr' : 'en';
-                                    trackEl.src = blobUrl;
-                                    trackEl.default = false;
-
-                                    video.appendChild(trackEl);
-
-                                    // Activer le track
-                                    const enableTrack = () => {
-                                      const textTrack = Array.from(video.textTracks).find(
-                                        t => (t as any).label === trackEl.label
-                                      );
-                                      if (textTrack) {
-                                        // Désactiver tous les autres tracks
-                                        Array.from(video.textTracks).forEach(t => t.mode = 'disabled');
-                                        textTrack.mode = 'hidden';
-                                        setCurrentSubtitle(id);
-                                        setSubtitleContainerVisible(true);
-                                        refreshActiveCues(video, textTrack, subtitleStyle.delay);
-                                        setLoadingSubtitle(false);
-                                      }
-                                    };
-
-                                    trackEl.addEventListener('load', enableTrack);
-                                    setTimeout(enableTrack, 200);
-                                  } catch (error) {
-                                    console.error('Error loading Rivestream subtitle:', error);
-                                    setLoadingSubtitle(false);
-                                  }
-                                }}
-                                className={`w-full px-3 py-2 text-sm text-left hover:bg-gray-800/50 rounded mb-1 ${currentSubtitle === id ? 'bg-gray-800 border-l-4 border-red-600 pl-3 text-red-600 font-medium' : 'text-white'
-                                  }`}
-                              >
-                                <div className="flex justify-between items-center">
-                                  <span>{caption.label}</span>
-                                  {currentSubtitle === id && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.active')}</span>}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-
                     {/* External subtitles section */}
                     <div className="mt-4 border-t border-gray-800 pt-3">
                       <h4 className="text-gray-400 text-xs uppercase tracking-wider mb-2 px-2">{t('watch.externalSubtitles')}</h4>
@@ -1882,112 +1799,152 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                           </div>
                         )}
 
-                        <div className="mb-2">
-                          <label className="text-xs text-gray-300 block mb-1">{t('watch.chooseLanguage')}</label>
-                          {externalLangsLoading ? (
-                            <div className="text-xs text-gray-400 px-3 py-2">{t('watch.loadingAvailableLanguages')}</div>
-                          ) : externalLanguages.length === 0 && ((tvShowId && seasonNumber && episodeNumber) || movieId) ? (
-                            <div className="text-xs text-gray-400 px-3 py-2">{t('watch.noExternalSubtitlesAvailable')}</div>
-                          ) : (
-                            <Select
-                              value={selectedExternalLang || ''}
-                              onValueChange={(val) => handleExternalLanguageSelect(val)}
-                            >
-                              <SelectTrigger disabled={!((tvShowId && seasonNumber && episodeNumber) || movieId)}>
-                                {selectedExternalLang && externalLanguages.find(l => l.code === selectedExternalLang) ? (
+                        {externalProviderErrors.map((error: { provider: string; message: string }) => (
+                          <div key={error.provider} className="text-xs text-amber-400 mb-2 px-2 py-1 bg-amber-900/20 rounded">
+                            {t('watch.sourceUnavailable', { provider: error.provider })}
+                          </div>
+                        ))}
+
+                        {externalLoading ? (
+                          <div className="text-xs text-gray-400 px-2 py-2">{t('watch.searchingSubtitles')}</div>
+                        ) : externalTracks.length === 0 ? (
+                          // Contenu non selectionne : le message ci-dessus (watch.selectContentForSubs)
+                          // couvre deja ce cas, pas besoin d'enchainer avec "aucun sous-titre disponible".
+                          // seasonNumber/episodeNumber peuvent valoir 0 (episodes speciaux) -> `!= null`.
+                          ((tvShowId != null && seasonNumber != null && episodeNumber != null) || movieId != null) && (
+                            <div className="text-xs text-gray-400 px-2 py-2">{t('watch.noExternalSubtitlesAvailable')}</div>
+                          )
+                        ) : (
+                          <>
+                            {/* Filtre langue */}
+                            <div className="mb-2">
+                              <label className="text-xs text-gray-300 block mb-1">{t('watch.chooseLanguage')}</label>
+                              <Select
+                                value={subtitleFilters.lang}
+                                onValueChange={(val) => {
+                                  setSubtitleFilters(prev => ({ ...prev, lang: val }));
+                                  setVisibleResultCount(60);
+                                }}
+                              >
+                                <SelectTrigger>
                                   <span className="flex items-center gap-2 truncate">
-                                    <ReactCountryFlag
-                                      countryCode={langToCountry[selectedExternalLang] || 'UN'}
-                                      svg
-                                      style={{ width: 18, height: 18, borderRadius: '3px' }}
-                                    />
-                                    {externalLanguages.find(l => l.code === selectedExternalLang)!.label}
+                                    {subtitleFilters.lang === 'all'
+                                      ? t('watch.filterAllLanguages')
+                                      : getLanguageName?.(subtitleFilters.lang)}
                                   </span>
-                                ) : (
-                                  <span className="truncate text-white/40">{t('watch.chooseLanguage')}</span>
-                                )}
-                              </SelectTrigger>
-                              <SelectContent>
-                                {externalLanguages.map((lang) => (
-                                  <SelectItem key={lang.code} value={lang.code}>
-                                    <span className="flex items-center gap-2">
-                                      <ReactCountryFlag
-                                        countryCode={langToCountry[lang.code] || 'UN'}
-                                        svg
-                                        style={{ width: 18, height: 18, borderRadius: '3px' }}
-                                      />
-                                      {lang.label}
-                                    </span>
-                                  </SelectItem>
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {subtitleFacets.languages.map(option => (
+                                    <SelectItem key={option.value} value={option.value}>
+                                      <span className="flex items-center gap-2">
+                                        {option.value === 'all'
+                                          ? t('watch.filterAllLanguages')
+                                          : getLanguageName?.(option.value)}
+                                        <span className="text-gray-500 text-xs">({option.count})</span>
+                                      </span>
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            </div>
+
+                            {/* Filtre source */}
+                            <div className="mb-2">
+                              <label className="text-xs text-gray-300 block mb-1">{t('watch.filterBySource')}</label>
+                              <div className="flex flex-wrap gap-1.5">
+                                {subtitleFacets.sources.map(option => (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setSubtitleFilters(prev => ({ ...prev, source: option.value }));
+                                      setVisibleResultCount(60);
+                                    }}
+                                    className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                                      subtitleFilters.source === option.value
+                                        ? 'bg-red-800/60 border-red-600 text-white'
+                                        : 'bg-gray-900/40 border-gray-700/60 text-gray-300 hover:bg-gray-800/60'
+                                    }`}
+                                  >
+                                    {option.value === 'all' ? t('watch.filterAllSources') : option.value}
+                                    <span className="ml-1 text-gray-400">{option.count}</span>
+                                  </button>
                                 ))}
-                              </SelectContent>
-                            </Select>
-                          )}
-                        </div>
+                              </div>
+                            </div>
 
-                        {externalLoading && (
-                          <div className="text-xs text-gray-400 px-2 py-1">{t('watch.searchingSubtitles')}</div>
-                        )}
+                            {/* Recherche libre */}
+                            <div className="mb-2">
+                              <input
+                                type="text"
+                                value={subtitleFilters.query}
+                                onChange={(e) => {
+                                  const next = e.target.value;
+                                  setSubtitleFilters(prev => ({ ...prev, query: next }));
+                                  setVisibleResultCount(60);
+                                }}
+                                placeholder={t('watch.searchByRelease')}
+                                className="w-full px-3 py-2 text-sm bg-gray-900/60 border border-gray-700/60 rounded text-white placeholder:text-white/30 focus:outline-none focus:border-red-600"
+                              />
+                            </div>
 
-                        {!externalLoading && showExternalResults && externalSubs.length > 0 && (
-                          <div className="mt-2">
+                            {/* Resultats */}
                             <div className="flex items-center justify-between mb-2">
                               <h5 className="text-sm text-white">{t('watch.subtitleResults')}</h5>
-                              <span className="text-xs text-gray-400 italic ml-2">{t('watch.subtitleRetryHint')}</span>
+                              <span className="text-xs text-gray-400">
+                                {t('watch.resultsCount', { count: filteredTracks.length })}
+                              </span>
                             </div>
-                            <div className="space-y-2 pr-2">
-                              {externalSubs.map((sub, idx) => {
-                                const id = `external:${sub.IDSubtitle || sub.IDSubtitleFile || idx}`;
-                                return (
+
+                            {filteredTracks.length === 0 ? (
+                              <div className="text-xs text-gray-400 px-2 py-1">{t('watch.noResultsForFilters')}</div>
+                            ) : (
+                              <div className="space-y-2 pr-2">
+                                {filteredTracks.slice(0, visibleResultCount).map(track => (
                                   <button
-                                    key={id}
-                                    onClick={() => {
-                                      loadExternalSubtitle(sub);
-                                    }}
-                                    className={`w-full px-3 py-2 text-sm text-left hover:bg-gray-800/50 rounded flex justify-between items-center ${currentSubtitle === id ? 'bg-red-800/60 ring-1 ring-red-600' : 'bg-gray-900/40 text-white'}`}
+                                    key={track.id}
+                                    onClick={() => loadExternalSubtitle(track)}
+                                    className={`w-full px-3 py-2 text-sm text-left hover:bg-gray-800/50 rounded flex justify-between items-center ${
+                                      selectedExternalSub?.id === track.id
+                                        ? 'bg-red-800/60 ring-1 ring-red-600'
+                                        : 'bg-gray-900/40 text-white'
+                                    }`}
                                   >
                                     <div className="min-w-0 flex-1 pr-3">
-                                      <div className="font-medium text-white whitespace-normal break-words [overflow-wrap:anywhere]">{sub.SubFileName || sub.MovieReleaseName || `Subtitle ${idx + 1}`}</div>
-                                      <div className="text-xs text-gray-400">
-                                        {(externalLanguages.find(l => l.code === sub.SubLanguageID)?.label || sub.LanguageName || sub.SubLanguageID) || t('common.unknown')} • {sub.SubFormat || 'srt'}
-                                        {tvShowId != null && seasonNumber != null && episodeNumber != null && (
-                                          <span className="ml-2 text-blue-400">
-                                            S{seasonNumber}E{episodeNumber}
-                                          </span>
-                                        )}
+                                      <div className="font-medium text-white whitespace-normal break-words [overflow-wrap:anywhere]">
+                                        {track.label}
+                                      </div>
+                                      <div className="text-xs text-gray-400 flex items-center gap-2 mt-0.5">
+                                        <span>{getLanguageName?.(track.lang) || track.lang}</span>
+                                        <span>•</span>
+                                        <span>{track.format}</span>
+                                        <span className="px-1.5 py-0.5 rounded bg-gray-800/80 text-gray-300">
+                                          {track.source}
+                                        </span>
                                       </div>
                                     </div>
-                                    <div className="text-xs text-gray-300 shrink-0">{sub.SubDownloadsCnt ? `${sub.SubDownloadsCnt} DL` : ''}</div>
+                                    {track.downloads != null && (
+                                      <div className="text-xs text-gray-300 shrink-0">{track.downloads} DL</div>
+                                    )}
                                   </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        )}
-
-                        {!externalLoading && showExternalResults && selectedExternalLang && externalSubs.length === 0 && (
-                          <div className="text-xs text-gray-400 px-2 py-1">
-                            {t('watch.noSubtitleFound')}
-                            {tvShowId != null && seasonNumber != null && episodeNumber != null && (
-                              <div className="mt-1 text-blue-400">
-                                {t('watch.searchingFor', { season: seasonNumber, episode: episodeNumber })}
+                                ))}
                               </div>
                             )}
-                          </div>
+
+                            {filteredTracks.length > visibleResultCount && (
+                              <button
+                                type="button"
+                                onClick={() => setVisibleResultCount(count => count + 60)}
+                                className="mt-2 w-full px-3 py-2 text-sm text-white bg-gray-900/60 hover:bg-gray-800 rounded-lg border border-gray-700/60 transition-colors"
+                              >
+                                {t('watch.showMoreResults')}
+                              </button>
+                            )}
+                          </>
                         )}
 
                         {loadingSubtitle && (
                           <div className="text-xs text-gray-400 px-2 py-1">{t('watch.loadingSubtitle')}</div>
-                        )}
-                        {/* La piste sélectionnée est désormais visible dans les sous-titres intégrés. */}
-                        {selectedExternalSub && !showExternalResults && (
-                          <button
-                            type="button"
-                            onClick={() => setShowExternalResults(true)}
-                            className="mt-3 w-full px-3 py-2 text-sm text-white bg-gray-900/60 hover:bg-gray-800 rounded-lg border border-gray-700/60 transition-colors"
-                          >
-                            {t('watch.changeSubtitle')}
-                          </button>
                         )}
                       </div>
                     </div>
@@ -2132,174 +2089,22 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     transition={getTransition({ duration: 0.25 })}
                     className="w-full pr-2 space-y-4"
                   >
-                    {/* Taille de police */}
-                    <div className="mb-3">
-                      <div className="flex justify-between items-center mb-2">
-                        <h3 className="text-base font-semibold text-white">{t('watch.textSize')}</h3>
-                        <span className="text-sm text-gray-300">{subtitleStyle.fontSize.toFixed(1)} {t('watch.remUnit')}</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.5"
-                        max="3"
-                        step="0.1"
-                        value={subtitleStyle.fontSize}
-                        onChange={(e) => updateSubtitleFontSize(parseFloat(e.target.value))}
-                        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-red-600"
-                        style={{
-                          background: `linear-gradient(to right, #dc2626 0%, #dc2626 ${((subtitleStyle.fontSize - 0.5) / 2.5) * 100}%, #374151 ${((subtitleStyle.fontSize - 0.5) / 2.5) * 100}%, #374151 100%)`
-                        }}
-                      />
-                      <div className="flex justify-between text-xs text-gray-400 mt-1">
-                        <span>{t('watch.smallSize')}</span>
-                        <span>{t('watch.mediumSize')}</span>
-                        <span>{t('watch.largeSize')}</span>
-                      </div>
-                    </div>
-
-                    {/* Fond */}
-                    <div className="mb-3">
-                      <div className="flex justify-between items-center mb-2">
-                        <h3 className="text-base font-semibold text-white">{t('watch.backgroundTransparency')}</h3>
-                        <span className="text-sm text-gray-300">{Math.round(subtitleStyle.backgroundOpacity * 100)}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.05"
-                        value={subtitleStyle.backgroundOpacity}
-                        onChange={(e) => updateSubtitleBackgroundOpacity(parseFloat(e.target.value))}
-                        className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-red-600"
-                        style={{
-                          background: `linear-gradient(to right, #dc2626 0%, #dc2626 ${subtitleStyle.backgroundOpacity * 100}%, #374151 ${subtitleStyle.backgroundOpacity * 100}%, #374151 100%)`
-                        }}
-                      />
-                      <div className="flex justify-between text-xs text-gray-400 mt-1">
-                        <span>{t('watch.transparentLabel')}</span>
-                        <span>{t('watch.semiLabel')}</span>
-                        <span>{t('watch.opaqueLabel')}</span>
-                      </div>
-                    </div>
-
-                    {/* Couleur */}
-                    <div className="mb-3">
-                      <div className="flex justify-between items-center mb-2">
-                        <h3 className="text-base font-semibold text-white">{t('watch.textColor')}</h3>
-                        <span className="text-sm text-gray-300 uppercase">{subtitleStyle.color}</span>
-                      </div>
-                      <div className="flex flex-col gap-2">
-                        <div className="flex flex-wrap gap-2 mb-1">
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#ffffff')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#ffffff' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#ffffff' }}
-                            title={t('watch.whiteColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#fcd34d')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#fcd34d' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#fcd34d' }}
-                            title={t('watch.yellowColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#3b82f6')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#3b82f6' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#3b82f6' }}
-                            title={t('watch.blueColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#22c55e')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#22c55e' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#22c55e' }}
-                            title={t('watch.greenColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#ef4444')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#ef4444' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#ef4444' }}
-                            title={t('watch.redColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#06b6d4')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#06b6d4' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#06b6d4' }}
-                            title={t('watch.cyanColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#d946ef')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#d946ef' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#d946ef' }}
-                            title={t('watch.magentaColor')}
-                          />
-                          <motion.button
-                            whileTap={tapProp({ scale: 0.95 })}
-                            onClick={() => updateSubtitleColor('#000000')}
-                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#000000' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
-                            style={{ backgroundColor: '#000000' }}
-                            title={t('watch.blackColor')}
-                          />
-                        </div>
-                        <BgColorPickerPanel
-                          committedHex={subtitleStyle.color}
-                          hint={t('watch.customColorHint') || 'Choisissez une couleur de texte personnalisée.'}
-                          onCommit={updateSubtitleColor}
-                          layout="column"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Décalage */}
-                    <div className="mb-3">
-                      <h3 className="text-base font-semibold text-white mb-2">{t('watch.timeOffset')}</h3>
-                      <div className="mb-2 flex justify-between items-center px-2">
-                        <span className="text-sm text-gray-300">{t('watch.currentLabel')} <span className="text-white font-medium">{formatDelay(subtitleStyle.delay)}</span></span>
-                        <motion.button
-                          whileTap={tapProp({ scale: 0.95 })}
-                          onClick={resetSubtitleDelay}
-                          className="px-3 py-1 text-sm rounded bg-red-600 text-white font-bold"
-                        >
-                          {t('watch.resetLabel')}
-                        </motion.button>
-                      </div>
-                      <div className="grid grid-cols-4 gap-2">
-                        <motion.button
-                          whileTap={tapProp({ scale: 0.95 })}
-                          onClick={() => updateSubtitleDelay(-3)}
-                          className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
-                        >
-                          {t('watch.subtitleDelayBackLong')}
-                        </motion.button>
-                        <motion.button
-                          whileTap={tapProp({ scale: 0.95 })}
-                          onClick={() => updateSubtitleDelay(-0.5)}
-                          className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
-                        >
-                          {t('watch.subtitleDelayBackShort')}
-                        </motion.button>
-                        <motion.button
-                          whileTap={tapProp({ scale: 0.95 })}
-                          onClick={() => updateSubtitleDelay(0.5)}
-                          className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
-                        >
-                          {t('watch.subtitleDelayForwardShort')}
-                        </motion.button>
-                        <motion.button
-                          whileTap={tapProp({ scale: 0.95 })}
-                          onClick={() => updateSubtitleDelay(3)}
-                          className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
-                        >
-                          {t('watch.subtitleDelayForwardLong')}
-                        </motion.button>
-                      </div>
-                    </div>
+                    <a
+                      href="/settings#subtitles"
+                      onClick={() => setShowSettings(false)}
+                      className="flex min-h-11 items-center justify-between gap-3 rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-sm font-medium text-cyan-100 transition-colors hover:bg-cyan-400/15"
+                    >
+                      <span>{t('watch.moreSubtitleSettings')}</span>
+                      <ExternalLink className="h-4 w-4 shrink-0" />
+                    </a>
+                    <SubtitleStyleControls
+                      preferences={subtitlePreferences}
+                      onChange={patchSubtitlePreferences}
+                      onPreviewChange={previewSubtitlePreferences}
+                      onCommitPreview={commitSubtitlePreferences}
+                      onReset={resetSubtitleAppearance}
+                      density="compact"
+                    />
                   </motion.div>
                 )}
 
@@ -2431,81 +2236,180 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       <p className="text-xs text-gray-400 mt-1 px-1">{t('watch.autoNextEpisodeDesc')}</p>
                     </div>
 
-                    {/* Next Content Threshold Configuration */}
+                    {/* Toggle Keep Fullscreen On Episode Change (séries / animes uniquement) */}
+                    {(tvShowId || isAnime) && (
+                      <div className="mb-3 pt-4 border-t border-gray-700/60">
+                        <h3 className="text-base font-semibold text-white mb-2">{t('watch.keepFullscreen')}</h3>
+                        <button
+                          onClick={() => setKeepFullscreenOnEpisodeChange(!keepFullscreenOnEpisodeChange)}
+                          className={`w-full px-4 py-3 text-sm text-left rounded-lg flex justify-between items-center transition-colors ${keepFullscreenOnEpisodeChange ? 'bg-green-600/30 hover:bg-green-600/40 text-green-300' : 'bg-red-600/30 hover:bg-red-600/40 text-red-300'
+                            }`}
+                        >
+                          <span>{keepFullscreenOnEpisodeChange ? t('watch.enabled') : t('watch.disabled')}</span>
+                          <div className={`w-10 h-5 flex items-center rounded-full p-1 transition-colors ${keepFullscreenOnEpisodeChange ? 'bg-green-500' : 'bg-gray-600'}`}>
+                            <motion.div
+                              className="w-3.5 h-3.5 bg-white rounded-full shadow-md"
+                              layout
+                              transition={getTransition({ type: "spring", stiffness: 700, damping: 30 })}
+                              style={{ marginLeft: keepFullscreenOnEpisodeChange ? 'auto' : '0px' }}
+                            />
+                          </div>
+                        </button>
+                        <p className="text-xs text-gray-400 mt-1 px-1">{t('watch.keepFullscreenDesc')}</p>
+                      </div>
+                    )}
+
+                    {/* Toggle Resume Playback On Episode Change (séries / animes uniquement) */}
+                    {(tvShowId || isAnime) && (
+                      <div className="mb-3 pt-4 border-t border-gray-700/60">
+                        <h3 className="text-base font-semibold text-white mb-2">{t('watch.resumePlayback')}</h3>
+                        <button
+                          onClick={() => setResumePlaybackOnEpisodeChange(!resumePlaybackOnEpisodeChange)}
+                          className={`w-full px-4 py-3 text-sm text-left rounded-lg flex justify-between items-center transition-colors ${resumePlaybackOnEpisodeChange ? 'bg-green-600/30 hover:bg-green-600/40 text-green-300' : 'bg-red-600/30 hover:bg-red-600/40 text-red-300'
+                            }`}
+                        >
+                          <span>{resumePlaybackOnEpisodeChange ? t('watch.enabled') : t('watch.disabled')}</span>
+                          <div className={`w-10 h-5 flex items-center rounded-full p-1 transition-colors ${resumePlaybackOnEpisodeChange ? 'bg-green-500' : 'bg-gray-600'}`}>
+                            <motion.div
+                              className="w-3.5 h-3.5 bg-white rounded-full shadow-md"
+                              layout
+                              transition={getTransition({ type: "spring", stiffness: 700, damping: 30 })}
+                              style={{ marginLeft: resumePlaybackOnEpisodeChange ? 'auto' : '0px' }}
+                            />
+                          </div>
+                        </button>
+                        <p className="text-xs text-gray-400 mt-1 px-1">{t('watch.resumePlaybackDesc')}</p>
+                      </div>
+                    )}
+
+                    {/* Proposition « À suivre » : forme, déclenchement, décompte */}
                     <div className="mb-3 pt-4 border-t border-gray-700/60">
                       <h3 className="text-base font-semibold text-white mb-2">{t('watch.nextContentPopup')}</h3>
 
-                      {/* Mode Selection */}
+                      {/* Forme */}
                       <div className="mb-3">
-                        <p className="text-xs text-gray-400 mb-2">{t('watch.showPopup')}</p>
+                        <p className="text-xs text-gray-400 mb-2">{t('watch.nextContentDisplay')}</p>
                         <div className="flex gap-2">
                           <motion.button
                             whileTap={tapProp({ scale: 0.98 })}
-                            onClick={() => setNextContentThresholdMode('percentage')}
-                            className={`flex-1 px-3 py-2 text-sm rounded-lg transition-colors ${nextContentThresholdMode === 'percentage'
-                              ? 'bg-red-600 text-white font-medium'
-                              : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
-                              }`}
+                            onClick={() => setNextContent({ display: 'panel' })}
+                            className={choiceClass(nextContent.display === 'panel')}
+                          >
+                            {t('watch.displayPanel')}
+                          </motion.button>
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.98 })}
+                            onClick={() => setNextContent({ display: 'card' })}
+                            className={choiceClass(nextContent.display === 'card')}
+                          >
+                            {t('watch.displayCard')}
+                          </motion.button>
+                        </div>
+                        <p className="text-xs text-gray-400 mt-1 px-1">
+                          {nextContent.display === 'panel' ? t('watch.displayPanelDesc') : t('watch.displayCardDesc')}
+                        </p>
+                      </div>
+
+                      {/* Déclenchement */}
+                      <div className="mb-3">
+                        <p className="text-xs text-gray-400 mb-2">{t('watch.nextContentTrigger')}</p>
+                        <div className="flex gap-2">
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.98 })}
+                            onClick={() => setNextContent({ trigger: 'segment' })}
+                            className={choiceClass(nextContent.trigger === 'segment')}
+                          >
+                            {t('watch.triggerSegment')}
+                          </motion.button>
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.98 })}
+                            onClick={() => setNextContent({ trigger: 'threshold' })}
+                            className={choiceClass(nextContent.trigger === 'threshold')}
+                          >
+                            {t('watch.triggerThreshold')}
+                          </motion.button>
+                        </div>
+                        <p className="text-xs text-gray-400 mt-1 px-1">
+                          {nextContent.trigger === 'segment'
+                            ? t('watch.triggerSegmentDesc')
+                            : t('watch.triggerThresholdDesc')}
+                        </p>
+                        {nextContent.trigger === 'segment' && !creditsSegmentsAvailable && (
+                          <p className="text-xs text-amber-300 mt-1 px-1">
+                            {t('watch.triggerSegmentUnavailable')}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Seuil : réglage principal, ou repli du déclenchement au générique */}
+                      <div className="mb-3">
+                        <p className="text-xs text-gray-400 mb-2">
+                          {nextContent.trigger === 'segment' ? t('watch.thresholdFallback') : t('watch.showPopup')}
+                        </p>
+                        <div className="flex gap-2">
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.98 })}
+                            onClick={() => setNextContent({ thresholdMode: 'percentage' })}
+                            className={choiceClass(nextContent.thresholdMode === 'percentage')}
                           >
                             {t('watch.percentage')}
                           </motion.button>
                           <motion.button
                             whileTap={tapProp({ scale: 0.98 })}
-                            onClick={() => setNextContentThresholdMode('timeBeforeEnd')}
-                            className={`flex-1 px-3 py-2 text-sm rounded-lg transition-colors ${nextContentThresholdMode === 'timeBeforeEnd'
-                              ? 'bg-red-600 text-white font-medium'
-                              : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
-                              }`}
+                            onClick={() => setNextContent({ thresholdMode: 'timeBeforeEnd' })}
+                            className={choiceClass(nextContent.thresholdMode === 'timeBeforeEnd')}
                           >
                             {t('watch.timeBeforeEnd')}
                           </motion.button>
                         </div>
                       </div>
 
-                      {/* Value Configuration */}
-                      {nextContentThresholdMode === 'percentage' ? (
+                      {/* Les deux valeurs sont mémorisées séparément : passer d'un
+                          mode à l'autre ne transforme plus « 5 min » en « 300 % ». */}
+                      {nextContent.thresholdMode === 'percentage' ? (
                         <div className="mb-3">
                           <div className="flex justify-between items-center mb-2">
-                            <span className="text-sm text-gray-300">{t('watch.atPercentOfVideo', { value: nextContentThresholdValue.toFixed(0) })}</span>
+                            <span className="text-sm text-gray-300">
+                              {t('watch.atPercentOfVideo', { value: nextContent.percentage.toFixed(0) })}
+                            </span>
                           </div>
                           <input
                             type="range"
-                            min="50"
-                            max="99"
+                            min={PERCENTAGE_MIN}
+                            max={PERCENTAGE_MAX}
                             step="1"
-                            value={nextContentThresholdValue}
-                            onChange={(e) => setNextContentThresholdValue(parseFloat(e.target.value))}
+                            value={nextContent.percentage}
+                            onChange={(e) => setNextContent({ percentage: parseFloat(e.target.value) })}
                             className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-red-600"
-                            style={{
-                              background: `linear-gradient(to right, #dc2626 0%, #dc2626 ${((nextContentThresholdValue - 50) / 49) * 100}%, #374151 ${((nextContentThresholdValue - 50) / 49) * 100}%, #374151 100%)`
-                            }}
+                            style={{ background: sliderFill(nextContent.percentage, PERCENTAGE_MIN, PERCENTAGE_MAX) }}
                           />
                           <div className="flex justify-between text-xs text-gray-400 mt-1">
-                            <span>50%</span>
+                            <span>{PERCENTAGE_MIN}%</span>
                             <span>75%</span>
-                            <span>99%</span>
+                            <span>{PERCENTAGE_MAX}%</span>
                           </div>
                         </div>
                       ) : (
                         <div className="mb-3">
                           <div className="flex justify-between items-center mb-2">
                             <span className="text-sm text-gray-300">
-                              {nextContentThresholdValue >= 60
-                                ? t('watch.minutesBeforeEnd', { min: Math.floor(nextContentThresholdValue / 60), sec: nextContentThresholdValue % 60 > 0 ? `${nextContentThresholdValue % 60}s` : '' })
-                                : t('watch.secondsBeforeEnd', { sec: nextContentThresholdValue })}
+                              {nextContent.timeBeforeEnd >= 60
+                                ? t('watch.minutesBeforeEnd', {
+                                  min: Math.floor(nextContent.timeBeforeEnd / 60),
+                                  sec: nextContent.timeBeforeEnd % 60 > 0 ? `${nextContent.timeBeforeEnd % 60}s` : '',
+                                })
+                                : t('watch.secondsBeforeEnd', { sec: nextContent.timeBeforeEnd })}
                             </span>
                           </div>
                           <input
                             type="range"
-                            min="30"
-                            max="300"
+                            min={TIME_BEFORE_END_MIN}
+                            max={TIME_BEFORE_END_MAX}
                             step="10"
-                            value={nextContentThresholdValue}
-                            onChange={(e) => setNextContentThresholdValue(parseFloat(e.target.value))}
+                            value={nextContent.timeBeforeEnd}
+                            onChange={(e) => setNextContent({ timeBeforeEnd: parseFloat(e.target.value) })}
                             className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-red-600"
-                            style={{
-                              background: `linear-gradient(to right, #dc2626 0%, #dc2626 ${((nextContentThresholdValue - 30) / 270) * 100}%, #374151 ${((nextContentThresholdValue - 30) / 270) * 100}%, #374151 100%)`
-                            }}
+                            style={{ background: sliderFill(nextContent.timeBeforeEnd, TIME_BEFORE_END_MIN, TIME_BEFORE_END_MAX) }}
                           />
                           <div className="flex justify-between text-xs text-gray-400 mt-1">
                             <span>{t('watch.subtitleDelayPreset30Seconds')}</span>
@@ -2515,10 +2419,51 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         </div>
                       )}
 
+                      {/* Enchaînement automatique */}
+                      <div className="mb-3">
+                        <div className="flex justify-between items-center mb-2">
+                          <span className="text-xs text-gray-400">{t('watch.autoplayCountdown')}</span>
+                          <span className="text-sm text-gray-300">
+                            {nextContent.autoplaySeconds === 0
+                              ? t('watch.autoplayOff')
+                              : t('watch.autoplayAfter', { sec: nextContent.autoplaySeconds })}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={AUTOPLAY_SECONDS_MAX}
+                          step="1"
+                          value={nextContent.autoplaySeconds}
+                          onChange={(e) => setNextContent({ autoplaySeconds: parseFloat(e.target.value) })}
+                          className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-red-600"
+                          style={{ background: sliderFill(nextContent.autoplaySeconds, 0, AUTOPLAY_SECONDS_MAX) }}
+                        />
+                        <p className="text-xs text-gray-400 mt-1 px-1">{t('watch.autoplayCountdownDesc')}</p>
+                      </div>
+
                       <p className="text-xs text-gray-400 px-1">
                         {t('watch.configureNextContent')}
                       </p>
                     </div>
+
+                    {skipSettings && (
+                      <div className="pt-4 border-t border-gray-700/60">
+                        <SkipSegmentsPanel
+                          settings={skipSettings}
+                          providerStatus={segmentProviderStatus}
+                          providerDetail={segmentProviderDetail}
+                          onSettingsChange={onSkipSettingsChange}
+                          onSegmentTypeChange={onSegmentTypeChange}
+                          onSegmentColorChange={onSegmentColorChange}
+                          onProviderToggle={onProviderToggle}
+                          onProviderReorder={onProviderReorder}
+                          onReset={onSkipSettingsReset}
+                          onOpenStudio={onOpenSegmentStudio}
+                          communityCount={communitySubmissionCount ?? 0}
+                        />
+                      </div>
+                    )}
 
                     {/* Reset Current Progress */}
                     <div className="mb-3 pt-4 border-t border-gray-700/60">

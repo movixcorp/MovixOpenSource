@@ -23,7 +23,7 @@ let deps = {
   },
   coflixHeaders: {},
   COFLIX_BASE_URL: (
-    process.env.COFLIX_BASE_URL || "https://coflix.esq"
+    process.env.COFLIX_BASE_URL || "https://coflix.boston"
   ).replace(/\/$/, ""),
   getFromCacheNoExpiration: async () => null,
   saveToCache: async () => false,
@@ -686,7 +686,7 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
       return { seasons: [], current_episode: null };
     }
 
-    const base = (deps.COFLIX_BASE_URL || "https://coflix.esq").replace(
+    const base = (deps.COFLIX_BASE_URL || "https://coflix.boston").replace(
       /\/$/,
       "",
     );

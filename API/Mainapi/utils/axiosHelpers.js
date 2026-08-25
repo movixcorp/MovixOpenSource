@@ -55,7 +55,7 @@ let deps = {
   incrementFstreamRequestCounter: () => {}
 };
 
-const WIFLIX_BASE_URL = 'https://flemmix.men';
+const WIFLIX_BASE_URL = 'https://flemmix.golf';
 
 const truncateForLog = (value, maxLength = 300) => {
   if (typeof value !== 'string') return value;

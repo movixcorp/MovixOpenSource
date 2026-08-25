@@ -19,7 +19,6 @@ const router = express.Router();
 const path = require('path');
 const fsp = require('fs').promises;
 const { generateCacheKey } = require('../utils/cacheManager');
-const { getAuthIfValid } = require('../middleware/auth');
 const { getPool: getMovixPool } = require('../mysqlPool');
 const darkiworldSqlite = require('../utils/darkiworldSqlite');
 const hydrackerLiveModule = require('../utils/hydrackerLive');
@@ -101,21 +100,19 @@ async function fireScraperWebhook(req, id) {
 //
 // HYDRACKER_LIVE_ENABLED is the master kill-switch for outbound lien fetches.
 //   true  → cache+sqlite miss falls through to hydracker.com /api/v1/content/liens
-//           (decode) and /api/v1/titles/.../content/liens (list). hydracker
-//           returns the raw host link (raw_url/directDL) directly.
+//           (decode) and /api/v1/titles/.../content/liens (list). Those responses
+//           already carry the hoster URL, so it is used as-is.
 //   false → cache+sqlite are the only sources. Every miss returns sqlite_miss
 //           without any outbound HTTP. No new liens are discovered.
 (() => {
   const enabled = process.env.HYDRACKER_LIVE_ENABLED === 'true';
   const cookiesLen = (process.env.DARKIWORLD_COOKIES || '').length;
   const xsrfLen = (process.env.DARKIWORLD_XSRF_TOKEN || '').length;
-  const concurrency = parseInt(process.env.HYDRACKER_LIVE_CONCURRENCY, 10) || 6;
   const timeoutMs = parseInt(process.env.HYDRACKER_LIVE_TIMEOUT_MS, 10) || 20000;
   console.log(
     `[hydrackerLive][boot] enabled=${enabled} ` +
       `mode=${enabled ? 'cache+sqlite+hydracker_live' : 'cache+sqlite_only'} ` +
-      `concurrency=${concurrency} timeout=${timeoutMs}ms ` +
-      `cookies_len=${cookiesLen} xsrf_len=${xsrfLen} pid=${process.pid}`,
+      `timeout=${timeoutMs}ms cookies_len=${cookiesLen} xsrf_len=${xsrfLen} pid=${process.pid}`,
   );
   if (enabled && cookiesLen === 0) {
     console.warn('[hydrackerLive][boot] DARKIWORLD_COOKIES is empty — every hydracker fetch will return live_hydracker_error');
@@ -145,7 +142,6 @@ function getHydrackerLive() {
     axios,
     cookies: process.env.DARKIWORLD_COOKIES || '',
     xsrf: process.env.DARKIWORLD_XSRF_TOKEN || '',
-    concurrency: parseInt(process.env.HYDRACKER_LIVE_CONCURRENCY, 10) || 6,
     timeoutMs: parseInt(process.env.HYDRACKER_LIVE_TIMEOUT_MS, 10) || 20000,
     cacheDir: DOWNLOAD_CACHE_DIR,
     cacheGet: (dir, key) => getFromCacheNoExpiration(dir, key),

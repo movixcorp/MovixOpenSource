@@ -5,12 +5,12 @@
 
 // === LIMITEUR DE CONCURRENCE (p-limit style) ===
 // Fonction pour limiter le nombre de promesses exécutées en parallèle
-function createConcurrencyLimiter(concurrency, maxQueueSize = 200) {
+function createConcurrencyLimiter(concurrency) {
   const queue = [];
   let activeCount = 0;
 
   const next = () => {
-    activeCount = Math.max(0, activeCount - 1);
+    activeCount--;
     if (queue.length > 0) {
       queue.shift()();
     }
@@ -27,10 +27,6 @@ function createConcurrencyLimiter(concurrency, maxQueueSize = 200) {
 
   const enqueue = (fn) => {
     return new Promise((resolve, reject) => {
-      if (activeCount >= concurrency && queue.length >= maxQueueSize) {
-        reject(new Error(`Concurrency queue full (${maxQueueSize} pending tasks)`));
-        return;
-      }
       const task = () => run(fn).then(resolve, reject);
       if (activeCount < concurrency) {
         task();

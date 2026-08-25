@@ -19,6 +19,7 @@ import { getTmdbLanguage } from '../i18n';
 import { encodeId } from '../utils/idEncoder';
 import { getPersonalizedRecommendations, isRecommendationsEnabled, PersonalizedRecommendations } from '../services/recommendationService';
 import CarouselTitle from '../components/CarouselTitle';
+import ConfirmDialog from '../components/ui/confirm-dialog';
 
 // Nombre de sections à charger immédiatement (les premières sont prioritaires)
 const IMMEDIATE_LOAD_COUNT = 3;
@@ -33,6 +34,14 @@ const TMDB_DETAILS_STORAGE_KEY = 'movix_tmdb_details_cache_v1';
 const TMDB_DETAILS_MAX_ENTRIES = 300;
 let tmdbCacheHydrated = false;
 let tmdbCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+const getHomeCacheKeys = (language: string) => {
+  const suffix = language.toLowerCase();
+  return {
+    data: `movix_home_data_${suffix}`,
+    timestamp: `movix_home_data_${suffix}_timestamp`,
+  };
+};
 
 const hydrateTmdbDetailsCache = () => {
   if (tmdbCacheHydrated) return;
@@ -66,16 +75,21 @@ const scheduleTmdbCachePersist = () => {
   }, 500);
 };
 
-const fetchTMDBDetails = async (mediaType: string, id: number, params?: any): Promise<any> => {
+const fetchTMDBDetails = async (
+  mediaType: string,
+  id: number,
+  params?: any,
+  language = getTmdbLanguage(),
+): Promise<any> => {
   hydrateTmdbDetailsCache();
-  const key = `${mediaType}_${id}`;
+  const key = `${language}_${mediaType}_${id}`;
   const cached = tmdbDetailsCache.get(key);
   if (cached && Date.now() - cached.ts < TMDB_CACHE_TTL) {
     return cached.data;
   }
   const endpoint = `https://api.themoviedb.org/3/${mediaType}/${id}`;
   const response = await axios.get(endpoint, {
-    params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), ...params }
+    params: { api_key: TMDB_API_KEY, language, ...params }
   });
   tmdbDetailsCache.set(key, { data: response.data, ts: Date.now() });
   scheduleTmdbCachePersist();
@@ -84,10 +98,66 @@ const fetchTMDBDetails = async (mediaType: string, id: number, params?: any): Pr
 
 // Styles nécessaires aux EmblaCarousel rendus dans Home
 const homeStyles = `
+/* ── Rythme vertical des rangées ────────────────────────────────────────────
+   Un seul écart, défini une seule fois.
+
+   Avant, chaque section empilait ses propres \`mt-16\` / \`mb-16\` par-dessus
+   les marges de \`.content-row-container\` — comptées deux fois, la rangée
+   interne d'EmblaCarousel portant la même classe que son conteneur — le tout
+   rattrapé par une marge négative de -30px. Selon la section, l'écart réel
+   allait de quelques pixels à plus de deux cents, d'où les séparations tantôt
+   inexistantes tantôt énormes. Désormais \`.content-row-container\` n'a plus
+   aucun espacement vertical : tout passe par \`.home-section\`.            */
+.home-section {
+  /* L'écart réel entre deux rangées vaut cette marge PLUS le \`mb-4\` (16px) de
+     la rangée d'EmblaCarousel, soit 64px : les deux ne fusionnent pas, parce
+     que LazySection pose \`contain: layout\` et coupe donc la fusion des marges
+     entre la rangée et son conteneur. Les écarts allaient de 54 à 152px avant,
+     64 reste dans cette fourchette sans rien resserrer brutalement. */
+  margin-top: 3rem;
+}
+
+/* Un écart lu sur un écran de bureau et sur un téléphone n'a pas le même
+   poids : 48px valent 4 % de la hauteur d'une fenêtre de 1080px, mais 7 % des
+   ~670px utiles d'un mobile une fois les barres du navigateur déduites. Sur
+   une page qui n'est qu'une pile de rangées, l'écart se paie donc en contenu
+   visible. L'échelle descend par paliers plutôt que de garder la valeur du
+   bureau.
+
+   Rien que des \`@media (max-width)\` sur \`margin\` : ni \`clamp()\`, ni requêtes
+   de conteneur, ni \`dvh\` — les anciens WebKit d'iOS et les WebView Android
+   d'origine les interprètent tous. Un moteur qui ignorerait ces blocs
+   retomberait simplement sur les 3rem du bureau, jamais sur une page cassée. */
+@media (max-width: 900px) {
+  .home-section {
+    margin-top: 2.25rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .home-section {
+    margin-top: 1rem;
+  }
+
+  /* La rangée d'EmblaCarousel porte \`mb-4\` (16px) qui s'ajoute à la marge
+     ci-dessus — \`contain: layout\` sur LazySection empêche les deux de
+     fusionner. Les resserrer ensemble donne 24px d'écart réel au lieu de 48,
+     soit la moitié, sans toucher au \`mb-4\` d'origine : la règle est portée
+     par \`.home-section\`, donc Films, Animés et les pages fournisseur, qui
+     réutilisent le même carrousel, gardent leur espacement.
+
+     24px reste au-dessus des 16px qui séparent deux cartes voisines dans une
+     rangée : en descendant plus bas, l'écart entre deux rangées deviendrait
+     plus petit que l'écart à l'intérieur d'une rangée, et la page se lirait
+     comme une grille continue plutôt que comme des sections. */
+  .home-section .content-row-container {
+    margin-bottom: 0.5rem;
+  }
+}
+
+/* Ne reste ici que le rôle structurel : laisser les cartes déborder (ombres,
+   agrandissement au survol) sans que le conteneur les rogne. */
 .content-row-container {
-  padding-top: 5px;
-  padding-bottom: 40px;
-  margin-top: -30px;
   overflow: visible !important;
   position: relative;
   z-index: 1;
@@ -107,7 +177,10 @@ const homeStyles = `
   text-transform: uppercase;
   display: inline-block;
   animation: homeFadeInTitle 0.8s ease-out forwards;
-  transition: all 0.3s ease;
+  /* Ciblé plutôt que \`all\` : le dégradé de fond n'a rien à faire dans une
+     transition — il est découpé sur le texte et son interpolation coûte un
+     repaint à chaque frame. */
+  transition: transform 0.3s ease, text-shadow 0.3s ease;
 }
 
 .section-title:hover {
@@ -127,13 +200,22 @@ const homeStyles = `
   height: 3px;
   background: linear-gradient(90deg, #f11 0%, #f66 100%);
   border-radius: 3px;
-  animation: homeExpandWidth 0.6s ease-out forwards 0.3s;
   transform-origin: left;
-  transition: all 0.3s ease;
+  /* \`backwards\` et non \`forwards\`. Une valeur figée par une animation
+     l'emporte sur toute règle normale, survol compris : le trait restait
+     bloqué à 40px une fois l'animation finie, mais s'étirait si on passait la
+     souris pendant le délai de 0.3s. D'où un comportement qui dépendait du
+     moment. \`backwards\` ne tient que l'état de départ pendant le délai,
+     puis rend la main aux règles CSS.                                      */
+  animation: homeExpandWidth 0.6s ease-out 0.3s backwards;
+  transition: width 0.3s ease, background 0.3s ease;
 }
 
 .section-title:hover::after {
-  width: 100%;
+  /* Borné. \`width: 100%\` se rapportait à la largeur du titre : sur
+     « PARCE QUE VOUS AVEZ REGARDÉ … » en capitales, le trait devenait une
+     barre rouge démesurée. */
+  width: 72px;
   background: linear-gradient(90deg, #ff3333, #ff9999);
 }
 
@@ -162,6 +244,33 @@ interface Media {
   media_type: 'movie' | 'tv';
   genre_ids?: number[];
 }
+
+const SCHEDULED_HOME_MOVIE_ID = 1744462;
+// Visible jusqu'au 28 août 2026 inclus, heure de Paris.
+const SCHEDULED_HOME_MOVIE_END_AT = Date.parse('2026-08-29T00:00:00+02:00');
+
+const getHomeHeroItems = (items: Media[], announcement: string): Media[] => {
+  const regularItems = items.filter(
+    item => !(item.id === SCHEDULED_HOME_MOVIE_ID && item.media_type === 'movie')
+  );
+
+  if (Date.now() >= SCHEDULED_HOME_MOVIE_END_AT) {
+    return regularItems.slice(0, 5);
+  }
+
+  const scheduledMovie: Media = {
+    id: SCHEDULED_HOME_MOVIE_ID,
+    title: 'Grand Theft Auto VI: An Extended Look',
+    poster_path: '/nNYOsrgnIuoZcxXprHJRh5l7y5g.jpg',
+    backdrop_path: '/oDp9Yvvi2mRHXxPh6E2wi9ybhtK.jpg',
+    overview: announcement,
+    vote_average: 0,
+    release_date: '2026-08-27',
+    media_type: 'movie',
+  };
+
+  return [scheduledMovie, ...regularItems].slice(0, 5);
+};
 
 interface Category {
   id: string;
@@ -192,6 +301,10 @@ interface ContinueWatching {
     episode: number;
   };
 }
+
+type ContinueWatchingRemoval =
+  | { type: 'item'; itemId: number; mediaType: 'movie' | 'tv' }
+  | { type: 'all' };
 
 const inferHomeMediaType = (item: any): 'tv' | 'movie' =>
   item.media_type || item.mediaType || (item.first_air_date ? 'tv' : 'movie');
@@ -229,6 +342,7 @@ const normalizePersonalizedReco = (reco: PersonalizedRecommendations | null): Pe
 
 const Home: React.FC = () => {
   const { t } = useTranslation();
+  const tmdbLanguage = getTmdbLanguage();
   const [loading, setLoading] = useState(true);
   const [heroItems, setHeroItems] = useState<Media[]>([]);
   const [trending, setTrending] = useState<Media[]>([]);
@@ -237,8 +351,12 @@ const Home: React.FC = () => {
   const [categories, setCategories] = useState<Category[]>([]);
   const [sagaCollections, setSagaCollections] = useState<any[]>([]);
   const [featuredSeries, setFeaturedSeries] = useState<any>(null);
+  const [streamingPlatformsHidden, setStreamingPlatformsHidden] = useState(() => {
+    return localStorage.getItem('settings_hide_streaming_platforms') === 'true';
+  });
 
   const [continueWatching, setContinueWatching] = useState<ContinueWatching[]>([]);
+  const [continueWatchingRemoval, setContinueWatchingRemoval] = useState<ContinueWatchingRemoval | null>(null);
   const [recommendations, setRecommendations] = useState<Media[]>([]);
   const [personalizedReco, setPersonalizedReco] = useState<PersonalizedRecommendations | null>(null);
   const cancelTokenSourceRef = useRef<CancelTokenSource | null>(null);
@@ -248,6 +366,24 @@ const Home: React.FC = () => {
     mode: 'page',
     pageData: { pageName: 'home' },
   });
+
+  useEffect(() => {
+    const syncStreamingPlatformsVisibility = () => {
+      setStreamingPlatformsHidden(localStorage.getItem('settings_hide_streaming_platforms') === 'true');
+    };
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === 'settings_hide_streaming_platforms') {
+        syncStreamingPlatformsVisibility();
+      }
+    };
+
+    window.addEventListener('streaming_platforms_visibility_changed', syncStreamingPlatformsVisibility);
+    window.addEventListener('storage', handleStorageChange);
+    return () => {
+      window.removeEventListener('streaming_platforms_visibility_changed', syncStreamingPlatformsVisibility);
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, []);
 
 
 
@@ -293,8 +429,9 @@ const Home: React.FC = () => {
       setLoading(true);
 
       // Check for cached data first — localStorage pour survivre aux F5/nouveaux onglets (perf)
-      const cachedData = localStorage.getItem('movix_home_data');
-      const cacheTimestamp = localStorage.getItem('movix_home_data_timestamp');
+      const homeCacheKeys = getHomeCacheKeys(tmdbLanguage);
+      const cachedData = localStorage.getItem(homeCacheKeys.data);
+      const cacheTimestamp = localStorage.getItem(homeCacheKeys.timestamp);
 
       // Use cache if it exists and is less than 15 minutes old
       if (cachedData && cacheTimestamp) {
@@ -302,7 +439,10 @@ const Home: React.FC = () => {
 
         if (isRecent) {
           const parsedData = JSON.parse(cachedData);
-          setHeroItems(parsedData.heroItems || []);
+          setHeroItems(getHomeHeroItems(
+            parsedData.heroItems || [],
+            t('home.hero.specialEventAnnouncement'),
+          ));
           setTrending(parsedData.trending || []);
           setPopularMovies(parsedData.popularMovies || []);
 
@@ -323,30 +463,30 @@ const Home: React.FC = () => {
 
       // Split API requests into batches to prevent overwhelming the browser
       const batch1 = [
-        { url: 'https://api.themoviedb.org/3/trending/all/day', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage() } },
-        { url: 'https://api.themoviedb.org/3/movie/popular', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), page: 1 } },
-        { url: 'https://api.themoviedb.org/3/tv/popular', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), page: 1 } },
+        { url: 'https://api.themoviedb.org/3/trending/all/day', params: { api_key: TMDB_API_KEY, language: tmdbLanguage } },
+        { url: 'https://api.themoviedb.org/3/movie/popular', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, page: 1 } },
+        { url: 'https://api.themoviedb.org/3/tv/popular', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, page: 1 } },
       ];
 
       const batch2 = [
-        { url: 'https://api.themoviedb.org/3/movie/upcoming', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), page: 1 } },
-        { url: 'https://api.themoviedb.org/3/movie/top_rated', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), page: 1 } },
-        { url: 'https://api.themoviedb.org/3/tv/top_rated', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), page: 1 } },
+        { url: 'https://api.themoviedb.org/3/movie/upcoming', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, page: 1 } },
+        { url: 'https://api.themoviedb.org/3/movie/top_rated', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, page: 1 } },
+        { url: 'https://api.themoviedb.org/3/tv/top_rated', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, page: 1 } },
       ];
 
       const batch3 = [
-        { url: 'https://api.themoviedb.org/3/discover/movie', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), with_genres: '28', page: 1 } }, // Action Movies
-        { url: 'https://api.themoviedb.org/3/discover/tv', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), with_genres: '10759', page: 1 } }, // Action & Adventure TV
+        { url: 'https://api.themoviedb.org/3/discover/movie', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, with_genres: '28', page: 1 } }, // Action Movies
+        { url: 'https://api.themoviedb.org/3/discover/tv', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, with_genres: '10759', page: 1 } }, // Action & Adventure TV
       ];
 
       const batch4 = [
-        { url: 'https://api.themoviedb.org/3/discover/movie', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), with_genres: '16', page: 1 } }, // Animation Movies
-        { url: 'https://api.themoviedb.org/3/discover/tv', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), with_genres: '16', page: 1 } }, // Animation TV
+        { url: 'https://api.themoviedb.org/3/discover/movie', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, with_genres: '16', page: 1 } }, // Animation Movies
+        { url: 'https://api.themoviedb.org/3/discover/tv', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, with_genres: '16', page: 1 } }, // Animation TV
       ];
 
       const batch5 = [
-        { url: 'https://api.themoviedb.org/3/discover/movie', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), with_genres: '35', page: 1 } }, // Comedy Movies
-        { url: 'https://api.themoviedb.org/3/discover/tv', params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), with_genres: '35', page: 1 } }, // Comedy TV
+        { url: 'https://api.themoviedb.org/3/discover/movie', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, with_genres: '35', page: 1 } }, // Comedy Movies
+        { url: 'https://api.themoviedb.org/3/discover/tv', params: { api_key: TMDB_API_KEY, language: tmdbLanguage, with_genres: '35', page: 1 } }, // Comedy TV
       ];
 
       // Helper function to process batch
@@ -414,7 +554,10 @@ const Home: React.FC = () => {
       // Update UI with initial data
       setTrending(trendingItems);
       setPopularMovies(popularMovies);
-      setHeroItems(trendingItems.slice(0, 5));
+      setHeroItems(getHomeHeroItems(
+        trendingItems,
+        t('home.hero.specialEventAnnouncement'),
+      ));
 
       // Les batches restants ont été lancés en même temps que batch1
       const [batch2Responses, batch3Responses, batch4Responses, batch5Responses] = await remainingBatchesPromise;
@@ -463,7 +606,11 @@ const Home: React.FC = () => {
       const filteredItems = uniqueItems.filter((item: Media) => item.overview && item.poster_path);
 
       // Update state with all data
-      setHeroItems(filteredItems.slice(0, 5)); // Take top 5 for hero slider
+      const homeHeroItems = getHomeHeroItems(
+        filteredItems,
+        t('home.hero.specialEventAnnouncement'),
+      );
+      setHeroItems(homeHeroItems);
       setTrending(filteredItems.slice(5));
       setPopularMovies(popularMovies);
 
@@ -492,8 +639,8 @@ const Home: React.FC = () => {
       // et n'a pas besoin de bloquer l'affichage du contenu (perf)
       const persistHomeCache = () => {
         try {
-          localStorage.setItem('movix_home_data', JSON.stringify(cacheData));
-          localStorage.setItem('movix_home_data_timestamp', Date.now().toString());
+          localStorage.setItem(homeCacheKeys.data, JSON.stringify(cacheData));
+          localStorage.setItem(homeCacheKeys.timestamp, Date.now().toString());
         } catch {
           // Quota plein : cache best-effort, la page fonctionne sans
         }
@@ -525,8 +672,8 @@ const Home: React.FC = () => {
   // ça retire 20 requêtes TMDB du chargement initial (perf)
   const fetchSagaCollections = useCallback(async () => {
     try {
-      const cacheKey = 'movix_sagas_data';
-      const cacheTsKey = 'movix_sagas_data_ts';
+      const cacheKey = `movix_sagas_data_${tmdbLanguage.toLowerCase()}`;
+      const cacheTsKey = `movix_sagas_data_${tmdbLanguage.toLowerCase()}_ts`;
       const cached = localStorage.getItem(cacheKey);
       const cachedTs = localStorage.getItem(cacheTsKey);
       const oneDayMs = 24 * 60 * 60 * 1000;
@@ -561,7 +708,7 @@ const Home: React.FC = () => {
       const responses = await Promise.all(
         popularCollectionIds.map(id =>
           axios.get(`https://api.themoviedb.org/3/collection/${id}`, {
-            params: { api_key: TMDB_API_KEY, language: getTmdbLanguage() }
+            params: { api_key: TMDB_API_KEY, language: tmdbLanguage }
           }).then(r => r.data).catch(() => null)
         )
       );
@@ -598,7 +745,7 @@ const Home: React.FC = () => {
     } catch (e) {
       // Fail silently; the rest of the home page still works
     }
-  }, []);
+  }, [tmdbLanguage]);
 
   useEffect(() => {
     fetchData();
@@ -610,17 +757,36 @@ const Home: React.FC = () => {
         cancelTokenSourceRef.current = null;
       }
     };
-  }, []); // Fetch data on initial load
+  }, [tmdbLanguage]);
+
+  useEffect(() => {
+    const remainingTime = SCHEDULED_HOME_MOVIE_END_AT - Date.now();
+    if (remainingTime <= 0) return;
+
+    const expirationTimer = window.setTimeout(() => {
+      setHeroItems(currentItems => getHomeHeroItems(
+        currentItems,
+        t('home.hero.specialEventAnnouncement'),
+      ));
+    }, remainingTime);
+
+    return () => window.clearTimeout(expirationTimer);
+  }, [t]);
 
   // Fetch featured series (team selection) — différé via le LazySection de la section (perf)
   const fetchFeaturedSeries = useCallback(async () => {
     try {
-      const data = await fetchTMDBDetails('tv', 215160, { append_to_response: 'content_ratings' });
+      const data = await fetchTMDBDetails(
+        'tv',
+        215160,
+        { append_to_response: 'content_ratings' },
+        tmdbLanguage,
+      );
       setFeaturedSeries(data);
     } catch (error) {
       console.error('Error fetching featured series:', error);
     }
-  }, []);
+  }, [tmdbLanguage]);
 
   useEffect(() => {
     const loadContinueWatching = async () => {
@@ -745,7 +911,7 @@ const Home: React.FC = () => {
     loadContinueWatching();
     // Home n'est monté que sur "/" : un changement de route le démonte de toute façon,
     // donc dépendre de location.pathname ne faisait que risquer des relances inutiles (perf)
-  }, []);
+  }, [tmdbLanguage]);
 
   // NOTE perf : l'ancien setInterval de rotation du hero a été supprimé — il pilotait un state
   // (currentHeroIndex) utilisé nulle part et re-rendait tout Home toutes les 6s.
@@ -834,37 +1000,48 @@ const Home: React.FC = () => {
     setCategories(newCategories.slice(0, 10).map(normalizeHomeCategory)); // Réduit de 12 à 10 catégories max
   };
 
-  const removeFromContinueWatching = useCallback((itemId: number, mediaType: string, skipConfirmation = false) => {
-    if (skipConfirmation || window.confirm(t('home.confirmRemoveItem'))) {
-      const continueWatching = JSON.parse(localStorage.getItem('continueWatching') || '{"movies": [], "tv": []}');
+  const deleteContinueWatchingItem = useCallback((itemId: number, mediaType: 'movie' | 'tv') => {
+    const storedContinueWatching = JSON.parse(localStorage.getItem('continueWatching') || '{"movies": [], "tv": []}');
 
-      // Ensure structure exists
-      if (!continueWatching.movies) continueWatching.movies = [];
-      if (!continueWatching.tv) continueWatching.tv = [];
+    // Ensure structure exists
+    if (!storedContinueWatching.movies) storedContinueWatching.movies = [];
+    if (!storedContinueWatching.tv) storedContinueWatching.tv = [];
 
-      if (mediaType === 'movie') {
-        // Handle both old format (number) and new format (object)
-        continueWatching.movies = continueWatching.movies.filter((item: any) => {
-          const movieId = typeof item === 'number' ? item : item.id;
-          return movieId !== itemId;
-        });
-      } else if (mediaType === 'tv') {
-        continueWatching.tv = continueWatching.tv.filter((tvShow: any) => tvShow.id !== itemId);
-      }
-
-      localStorage.setItem('continueWatching', JSON.stringify(continueWatching));
-
-      // Update the UI state
-      setContinueWatching(prev => prev.filter(item => !(item.id === itemId && item.media_type === mediaType)));
+    if (mediaType === 'movie') {
+      // Handle both old format (number) and new format (object)
+      storedContinueWatching.movies = storedContinueWatching.movies.filter((item: any) => {
+        const movieId = typeof item === 'number' ? item : item.id;
+        return movieId !== itemId;
+      });
+    } else {
+      storedContinueWatching.tv = storedContinueWatching.tv.filter((tvShow: any) => tvShow.id !== itemId);
     }
-  }, [t]);
+
+    localStorage.setItem('continueWatching', JSON.stringify(storedContinueWatching));
+    setContinueWatching(prev => prev.filter(item => !(item.id === itemId && item.media_type === mediaType)));
+  }, []);
+
+  const removeFromContinueWatching = useCallback((itemId: number, mediaType: string) => {
+    if (mediaType !== 'movie' && mediaType !== 'tv') return;
+    setContinueWatchingRemoval({ type: 'item', itemId, mediaType });
+  }, []);
 
   const removeAllContinueWatching = useCallback(() => {
-    if (window.confirm(t('home.confirmRemoveAll'))) {
-      localStorage.setItem('continueWatching', JSON.stringify({ "movies": [], "tv": [] }));
+    setContinueWatchingRemoval({ type: 'all' });
+  }, []);
+
+  const confirmContinueWatchingRemoval = useCallback(() => {
+    if (!continueWatchingRemoval) return;
+
+    if (continueWatchingRemoval.type === 'all') {
+      localStorage.setItem('continueWatching', JSON.stringify({ movies: [], tv: [] }));
       setContinueWatching([]);
+    } else {
+      deleteContinueWatchingItem(continueWatchingRemoval.itemId, continueWatchingRemoval.mediaType);
     }
-  }, [t]);
+
+    setContinueWatchingRemoval(null);
+  }, [continueWatchingRemoval, deleteContinueWatchingItem]);
 
   useEffect(() => {
     // Simple title for homepage
@@ -994,92 +1171,98 @@ const Home: React.FC = () => {
               </div>
             )}
 
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.3 }}
-              className="w-full py-8 relative mb-6 mt-8 z-0 px-4 md:px-8"
-            >
-              <div className="w-full overflow-hidden">
-                <EmblaCarouselPlatforms
-                  title={platformsTitle}
-                  items={platformsItems}
-                />
-              </div>
-            </motion.div>
-
-            {/* Section "Reprendre votre lecture" - Section prioritaire (index 0) */}
-            {continueWatching.length > 0 && (
-              <div className="content-row-container px-4 md:px-8 mb-2 mt-16">
-                <LazySection index={0} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
-                  <EmblaCarousel
-                    title={yourHistoryTitle}
-                    items={continueWatching as any[]}
-                    mediaType="history"
-                    isHistory={true}
-                    onRemoveItem={removeFromContinueWatching}
-                    onRemoveAll={removeAllContinueWatching}
+            {!streamingPlatformsHidden && (
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.3 }}
+                className="home-section w-full relative z-0 px-4 md:px-8"
+              >
+                <div className="w-full overflow-hidden">
+                  <EmblaCarouselPlatforms
+                    title={platformsTitle}
+                    items={platformsItems}
                   />
-                </LazySection>
-              </div>
+                </div>
+              </motion.div>
             )}
 
-            {/* Personalized: "Because you watched X" */}
-            {personalizedReco?.becauseYouWatched?.map((group, idx) => (
-              <div key={`byw-${group.sourceId}`} className="content-row-container px-4 md:px-8 mb-2 mt-16">
-                <LazySection index={idx + 2} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
-                  <EmblaCarousel
-                    title={becauseYouWatchedTitles[idx]}
-                    items={group.items}
-                    mediaType="mixed"
-                  />
-                </LazySection>
-              </div>
-            ))}
+            <div>
+              {/* Section "Reprendre votre lecture" - Section prioritaire (index 0) */}
+              {continueWatching.length > 0 && (
+                <div className="home-section content-row-container px-4 md:px-8">
+                  <LazySection index={0} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
+                    <EmblaCarousel
+                      title={yourHistoryTitle}
+                      items={continueWatching as any[]}
+                      mediaType="history"
+                      isHistory={true}
+                      onRemoveItem={removeFromContinueWatching}
+                      onRemoveAll={removeAllContinueWatching}
+                    />
+                  </LazySection>
+                </div>
+              )}
 
-            {/* Personalized: "Popular in [genre]" */}
-            {personalizedReco?.topGenres?.map((group, idx) => (
-              <div key={`genre-${group.genreId}`} className="content-row-container px-4 md:px-8 mb-2 mt-16">
-                <LazySection index={idx + 5} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
-                  <EmblaCarousel
-                    title={topGenresTitles[idx]}
-                    items={group.items}
-                    mediaType="mixed"
-                  />
-                </LazySection>
-              </div>
-            ))}
+              {/* Personalized: "Because you watched X" */}
+              {personalizedReco?.becauseYouWatched?.map((group, idx) => (
+                <div key={`byw-${group.sourceId}`} className="home-section content-row-container px-4 md:px-8">
+                  <LazySection index={idx + 2} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
+                    <EmblaCarousel
+                      title={becauseYouWatchedTitles[idx]}
+                      items={group.items}
+                      mediaType="mixed"
+                    />
+                  </LazySection>
+                </div>
+              ))}
 
-            {/* Personalized: "Users also watched" (collaborative filtering) */}
-            {personalizedReco?.usersAlsoWatched && personalizedReco.usersAlsoWatched.length > 0 && (
-              <div className="content-row-container px-4 md:px-8 mb-2 mt-16">
-                <LazySection index={8} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
-                  <EmblaCarousel
-                    title={usersAlsoWatchedTitle}
-                    items={personalizedReco.usersAlsoWatched}
-                    mediaType="mixed"
-                  />
-                </LazySection>
-              </div>
-            )}
+              {/* Personalized: "Popular in [genre]" */}
+              {personalizedReco?.topGenres?.map((group, idx) => (
+                <div key={`genre-${group.genreId}`} className="home-section content-row-container px-4 md:px-8">
+                  <LazySection index={idx + 5} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
+                    <EmblaCarousel
+                      title={topGenresTitles[idx]}
+                      items={group.items}
+                      mediaType="mixed"
+                    />
+                  </LazySection>
+                </div>
+              ))}
 
-            {/* Section "Tendances du jour" - Section prioritaire (index 1) */}
-            {topContent.length > 0 && (
-              <div className="content-row-container px-4 md:px-8 mb-2 mt-16">
-                <LazySection index={1} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
-                  <EmblaCarousel
-                    title={trendingTodayTitle}
-                    items={topContent}
-                    mediaType="top10"
-                    showRanking={true}
-                  />
-                </LazySection>
-              </div>
-            )}
+              {/* Personalized: "Users also watched" (collaborative filtering) */}
+              {personalizedReco?.usersAlsoWatched && personalizedReco.usersAlsoWatched.length > 0 && (
+                <div className="home-section content-row-container px-4 md:px-8">
+                  <LazySection index={8} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
+                    <EmblaCarousel
+                      title={usersAlsoWatchedTitle}
+                      items={personalizedReco.usersAlsoWatched}
+                      mediaType="mixed"
+                    />
+                  </LazySection>
+                </div>
+              )}
 
-            {/* Recommandations - Section prioritaire (index 2) */}
+              {/* Section "Tendances du jour" - Section prioritaire (index 1) */}
+              {topContent.length > 0 && (
+                <div className="home-section content-row-container px-4 md:px-8">
+                  <LazySection index={1} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
+                    <EmblaCarousel
+                      title={trendingTodayTitle}
+                      items={topContent}
+                      mediaType="top10"
+                      showRanking={true}
+                    />
+                  </LazySection>
+                </div>
+              )}
+            </div>
+
+            {/* Recommandations - Section prioritaire (index 2).
+                `px-4 md:px-8` comme les autres rangées : c'était la seule
+                sans retrait horizontal, donc décalée de 2rem. */}
             {!personalizedReco && recommendations.length > 0 && (
-              <div className="mb-16">
+              <div className="home-section px-4 md:px-8">
                 <LazySection index={2} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
                   <EmblaCarousel
                     title={t('home.recommendationsForYou')}
@@ -1098,12 +1281,12 @@ const Home: React.FC = () => {
             >
               {!loading && (
                 <div>
-                  <div className="pt-8 pb-20 sm:pt-12 sm:pb-32">
+                  <div className="home-section">
                     <TelegramPromotion />
                   </div>
 
                   {/* Tendances - Lazy loaded (index 3) */}
-                  <div className="mb-16 px-4 md:px-8">
+                  <div className="home-section px-4 md:px-8">
                     <LazySection index={3} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
                       <EmblaCarousel
                         title={trendingCustomTitle}
@@ -1115,8 +1298,9 @@ const Home: React.FC = () => {
 
                   {/* Sagas - Lazy loaded (index 4) — le fetch des 20 collections TMDB est
                       déclenché par onLoad à l'approche du viewport, plus au mount de Home (perf) */}
-                  <div className="mb-16 px-4 md:px-8">
+                  <div className="home-section px-4 md:px-8">
                     <LazySection
+                      key={`sagas-${tmdbLanguage}`}
                       index={4}
                       immediateLoadCount={IMMEDIATE_LOAD_COUNT}
                       onLoad={fetchSagaCollections}
@@ -1135,6 +1319,7 @@ const Home: React.FC = () => {
                   {/* Featured Series - Team Selection — fetch + image différés via LazySection,
                       image en w1280 au lieu de original (perf) */}
                   <LazySection
+                    key={`featured-${tmdbLanguage}`}
                     index={5}
                     immediateLoadCount={IMMEDIATE_LOAD_COUNT}
                     onLoad={fetchFeaturedSeries}
@@ -1146,7 +1331,7 @@ const Home: React.FC = () => {
                       whileInView={{ opacity: 1, y: 0 }}
                       viewport={{ once: true }}
                       transition={{ duration: 0.6 }}
-                      className="w-full relative mb-16 px-4 md:px-6"
+                      className="home-section w-full relative px-4 md:px-6"
                       style={{ zIndex: 11 }}
                     >
                       <div
@@ -1159,7 +1344,16 @@ const Home: React.FC = () => {
                         <div className="absolute inset-0 pointer-events-none z-10 bg-gradient-to-b from-black/60 via-transparent to-black/90"></div>
                         <div
                           className="absolute inset-0 z-[2] pointer-events-none"
-                          style={{ backgroundImage: 'linear-gradient(to right, rgba(9, 2, 1, 0.95) 0%, rgba(9, 2, 1, 0.4) 50%, transparent 80%)' }}
+                          style={{
+                            backgroundImage: `linear-gradient(
+                              to right,
+                              rgba(15, 23, 42, 0.92) 0%,
+                              rgba(15, 23, 42, 0.58) 28%,
+                              rgba(15, 23, 42, 0.10) 56%,
+                              rgba(15, 23, 42, 0.40) 78%,
+                              rgba(15, 23, 42, 0.84) 100%
+                            )`,
+                          }}
                         ></div>
                         <div className="flex items-start justify-center flex-col h-full z-20 relative gap-5 px-6 md:px-12 py-10">
                           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-600/90 border border-red-500/40 text-white text-xs font-semibold uppercase tracking-wider">
@@ -1208,7 +1402,7 @@ const Home: React.FC = () => {
                   </LazySection>
 
                   {/* Films Populaires - Lazy loaded (index 5) */}
-                  <div className="mb-16 px-4 md:px-8">
+                  <div className="home-section px-4 md:px-8">
                     <LazySection index={5} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
                       <EmblaCarousel
                         title={t('home.popularMovies')}
@@ -1220,7 +1414,7 @@ const Home: React.FC = () => {
 
                   {/* Category Genre Rows - Lazy loaded (index 6+) */}
                   {categories.map((category, catIndex) => (
-                    <div key={category.id} className="mb-16 px-4 md:px-8">
+                    <div key={category.id} className="home-section px-4 md:px-8">
                       <LazySection index={6 + catIndex} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
                         <EmblaCarousel
                           title={category.title}
@@ -1236,6 +1430,19 @@ const Home: React.FC = () => {
           </>
         )}
       </motion.div>
+      <ConfirmDialog
+        isOpen={continueWatchingRemoval !== null}
+        title={t('common.delete')}
+        message={t(
+          continueWatchingRemoval?.type === 'all'
+            ? 'home.confirmRemoveAll'
+            : 'home.confirmRemoveItem'
+        )}
+        confirmLabel={t('common.delete')}
+        variant="destructive"
+        onConfirm={confirmContinueWatchingRemoval}
+        onCancel={() => setContinueWatchingRemoval(null)}
+      />
     </SquareBackground>
   );
 };

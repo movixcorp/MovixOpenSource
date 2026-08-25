@@ -7,7 +7,7 @@ import {
   ArrowLeft, Settings, Shield, Monitor, Smartphone, Tablet,
   Copy, X, Snowflake, Activity, Trash2, Crown, Volume2,
   Database, Key, Lock, Palette, Eye, Download, Upload, Globe, AlertTriangle, History, CalendarClock, FlaskConical, Link2, MessageCircle, BellOff, Sparkles,
-  Zap, RefreshCw, ChevronDown, ListOrdered, Gauge, Megaphone, Square
+  Zap, RefreshCw, ChevronDown, ListOrdered, Gauge, Megaphone, Square, Captions
 } from 'lucide-react';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
@@ -48,7 +48,6 @@ import {
 } from '../utils/soundSettings';
 import { useTranslation } from 'react-i18next';
 import { AVAILABLE_LANGUAGES, changeLanguage, type SupportedLanguage } from '../i18n';
-import { SquareBackground } from '../components/ui/square-background';
 import { SourcePriorityPanel } from '../components/Settings/SourcePriorityPanel';
 import {
   getRememberLastPlayer,
@@ -69,14 +68,24 @@ import {
 import { isLowLatencyEnabled, setLowLatencyEnabled, type LowLatencyScope } from '../utils/lowLatencyPref';
 import { BgColorPickerPanel } from '../components/Settings/BgColorPickerPanel';
 import { useLightMode } from '../context/LightModeContext';
+import { SettingsSearchBar } from '../components/Settings/SettingsSearchBar';
+import { SubtitlePreview } from '../components/subtitles/SubtitlePreview';
+import { SubtitleStyleControls } from '../components/subtitles/SubtitleStyleControls';
+import { useSubtitlePreferences } from '../hooks/useSubtitlePreferences';
 import {
   BG_ACCENT_PRESETS,
   BG_STORAGE_KEYS,
   type BgAccentKey,
   type BgAccentValue,
-  hexToRgbString,
   notifyBgPrefsChanged,
 } from '../utils/bgPreferences';
+import {
+  getSessionBrowserLabel,
+  normalizeSessionDeviceInfo,
+  type SessionDeviceInfo,
+  type SessionDeviceType,
+} from '../utils/sessionDevice';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 
@@ -93,8 +102,8 @@ interface UserSession {
   userId: string;
   createdAt: string;
   accessedAt: string;
-  device: string;
   userAgent: string;
+  deviceInfo?: SessionDeviceInfo;
 }
 
 type LinkProvider = 'discord' | 'google' | 'bip39';
@@ -160,6 +169,7 @@ function getNonSyncReasonTranslationKey(reason: NonSyncableStorageReason) {
 
 const SECTIONS = [
   { id: 'appearance', labelKey: 'settings.sections.appearance', icon: Palette },
+  { id: 'subtitles', labelKey: 'settings.sections.subtitles', icon: Captions },
   { id: 'performance', labelKey: 'settings.sections.performance', icon: Gauge },
   { id: 'language', labelKey: 'settings.sections.language', icon: Globe },
   { id: 'vip', labelKey: 'settings.sections.vip', icon: Crown },
@@ -371,12 +381,18 @@ const SettingsPage: React.FC = () => {
   const contentRef = useRef<HTMLDivElement>(null);
   const { t, i18n } = useTranslation();
   const { lightModeSetting, setLightModeSetting, isLightMode, prefs: animPrefs, effectivePrefs: animEffectivePrefs, setPref: setAnimPref } = useLightMode();
+  const {
+    preferences: subtitlePreferences,
+    patchPreferences,
+    previewPreferences,
+    commitPreferences,
+    resetAppearance,
+  } = useSubtitlePreferences();
   // Active section tracking
   const [activeSection, setActiveSection] = useState<string>(() => {
     const hash = location.hash.replace('#', '');
     return hash || 'appearance';
   });
-
   // ─── Appearance settings state ───────────────────────────────────────────
 
   const [disableAutoScroll, setDisableAutoScroll] = useState(() => {
@@ -460,11 +476,6 @@ const SettingsPage: React.FC = () => {
   const [bgHaloEnabled, setBgHaloEnabled] = useState<boolean>(() => {
     return localStorage.getItem(BG_STORAGE_KEYS.haloEnabled) !== '0';
   });
-
-  const bgAccentRgb = bgAccent === 'custom'
-    ? hexToRgbString(bgAccentCustomHex)
-    : BG_ACCENT_PRESETS[bgAccent].rgb;
-  const bgBorderColor = `rgba(${bgAccentRgb}, 0.15)`;
 
   const handleBgAccentChange = (key: BgAccentValue) => {
     setBgAccent(key);
@@ -595,6 +606,9 @@ const SettingsPage: React.FC = () => {
   const [heroHidden, setHeroHidden] = useState(() => {
     return localStorage.getItem('settings_hide_hero') === 'true';
   });
+  const [streamingPlatformsHidden, setStreamingPlatformsHidden] = useState(() => {
+    return localStorage.getItem('settings_hide_streaming_platforms') === 'true';
+  });
   const [showHistoryConfirm, setShowHistoryConfirm] = useState(false);
   const [showDataCollectionConfirm, setShowDataCollectionConfirm] = useState(false);
   const [notificationsDisabled, setNotificationsDisabled] = useState(false);
@@ -644,8 +658,6 @@ const SettingsPage: React.FC = () => {
     if (isAuthenticated) return SECTIONS;
     return SECTIONS.filter(s => !['sessions', 'accounts', 'privacy', 'data'].includes(s.id));
   }, [isAuthenticated]);
-
-
 
   // ─── Désactive Lenis sur la page Settings ───────────────────────────────
   //
@@ -1115,6 +1127,13 @@ const SettingsPage: React.FC = () => {
     window.dispatchEvent(new CustomEvent('hero_visibility_changed'));
   };
 
+  const handleStreamingPlatformsToggle = () => {
+    const newValue = !streamingPlatformsHidden;
+    setStreamingPlatformsHidden(newValue);
+    localStorage.setItem('settings_hide_streaming_platforms', String(newValue));
+    window.dispatchEvent(new CustomEvent('streaming_platforms_visibility_changed'));
+  };
+
   // Streaming basse latence (LL-HLS) — opt-in par lecteur. S'applique à la
   // prochaine lecture (lu au montage du lecteur). Voir utils/lowLatencyPref.ts.
   const [lowLatencyMovies, setLowLatencyMovies] = useState<boolean>(() => isLowLatencyEnabled('movies'));
@@ -1568,7 +1587,7 @@ const SettingsPage: React.FC = () => {
    * (ou fallback native `behavior:auto`). Le scroll wheel garde son smooth
    * Lenis via l'intensité configurée dans Apparence.
    */
-  const scrollToSection = (sectionId: string) => {
+  const scrollToSection = useCallback((sectionId: string) => {
     const el = document.getElementById(sectionId);
     if (!el) return;
 
@@ -1605,6 +1624,28 @@ const SettingsPage: React.FC = () => {
       programmaticScrollLockRef.current = false;
       scrollLockTimerRef.current = null;
     }, unlockDelay);
+  }, []);
+
+  useEffect(() => {
+    const sectionId = location.hash.replace('#', '');
+    if (!sectionId) return;
+    const frame = window.requestAnimationFrame(() => scrollToSection(sectionId));
+    return () => window.cancelAnimationFrame(frame);
+  }, [location.hash, scrollToSection]);
+
+  const navigateToSearchTarget = (sectionId: string, target: HTMLElement) => {
+    const highlightClasses = ['rounded-lg', 'ring-2', 'ring-red-500/70', 'ring-offset-4', 'ring-offset-[#0a0a0f]'];
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    setActiveSection(sectionId);
+    programmaticScrollLockRef.current = true;
+    target.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'center' });
+    target.tabIndex = -1;
+    target.focus({ preventScroll: true });
+    target.classList.add(...highlightClasses);
+    window.setTimeout(() => target.classList.remove(...highlightClasses), 1400);
+    window.setTimeout(() => {
+      programmaticScrollLockRef.current = false;
+    }, reducedMotion ? 50 : 900);
   };
 
   // ─── Render helpers ──────────────────────────────────────────────────────
@@ -1623,13 +1664,9 @@ const SettingsPage: React.FC = () => {
     );
   };
 
-  const getDeviceIcon = (userAgent: string) => {
-    const ua = userAgent.toLowerCase();
-    if (ua.includes('mobile') || ua.includes('android') || ua.includes('iphone')) {
-      return <Smartphone className="w-5 h-5" />;
-    } else if (ua.includes('tablet') || ua.includes('ipad')) {
-      return <Tablet className="w-5 h-5" />;
-    }
+  const getDeviceIcon = (deviceType: SessionDeviceType) => {
+    if (deviceType === 'mobile') return <Smartphone className="w-5 h-5" />;
+    if (deviceType === 'tablet') return <Tablet className="w-5 h-5" />;
     return <Monitor className="w-5 h-5" />;
   };
 
@@ -1664,9 +1701,9 @@ const SettingsPage: React.FC = () => {
   const hasServerStorageContext = Boolean(isAuthenticated && selectedProfileId);
 
   return (
-    <SquareBackground mode={bgMode} borderColor={bgBorderColor} squareSize={bgSquareSize} className="min-h-screen bg-[#0a0a0f] text-white">
+    <div className="min-h-screen overflow-clip bg-black text-white">
       {/* Mobile Header */}
-      <div className="lg:hidden flex items-center gap-4 p-4 border-b border-gray-800/60 bg-[#0a0a0f]">
+      <div className="lg:hidden flex items-center gap-4 border-b border-gray-800/60 bg-black p-4">
         <button
           onClick={() => navigate(-1)}
           className="p-2 rounded-lg hover:bg-gray-800/60 transition-colors text-gray-400 hover:text-white"
@@ -1681,14 +1718,15 @@ const SettingsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Main layout: fixed sidebar + scrollable content */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:pt-24">
-        <div className="flex gap-8">
+      {/* Main layout */}
+      <div className="w-full pb-8">
+        <div className="lg:grid lg:grid-cols-[280px,minmax(0,1fr)] lg:gap-0">
 
           {/* ─── Fixed Sidebar ──────────────────────────────────────── */}
-          <nav className="hidden lg:flex lg:flex-col fixed left-0 top-16 md:top-20 bottom-0 w-64 z-40 bg-[#0a0a0f] border-r border-gray-800/60 px-4 py-6 overflow-y-auto">
+          <aside data-settings-sidebar className="hidden min-w-0 border-r border-white/[0.06] bg-black lg:block">
+          <nav className="sticky top-20 flex h-[calc(100dvh-5rem)] min-h-0 flex-col overflow-hidden bg-black px-5 py-7">
             {/* Settings Header in Sidebar */}
-            <div className="flex items-center gap-3 mb-6 pb-6 border-b border-gray-800/40">
+            <div data-settings-sidebar-header className="mb-4 flex flex-none items-center gap-3 border-b border-gray-800/40 pb-5">
               <button
                 onClick={() => navigate(-1)}
                 className="p-2 rounded-lg hover:bg-gray-800/60 transition-colors text-gray-400 hover:text-white"
@@ -1704,6 +1742,7 @@ const SettingsPage: React.FC = () => {
               </div>
             </div>
 
+            <div data-settings-sidebar-scroll className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2">
             <ul className="space-y-1">
               {visibleSections.map(({ id, labelKey, icon: Icon }) => {
                 const isActive = activeSection === id;
@@ -1734,9 +1773,10 @@ const SettingsPage: React.FC = () => {
                 );
               })}
             </ul>
+            </div>
 
             {/* Back to profile link */}
-            <div className="mt-auto pt-6 border-t border-gray-800/40">
+            <div className="mt-4 flex-none border-t border-gray-800/40 pt-4">
               <Link
                 to="/profile"
                 className="flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm text-gray-500 hover:text-gray-300 hover:bg-gray-800/40 transition-colors"
@@ -1746,6 +1786,10 @@ const SettingsPage: React.FC = () => {
               </Link>
             </div>
           </nav>
+          </aside>
+
+          <main className="min-w-0 px-4 pt-6 sm:px-6 lg:px-8 lg:pt-8 xl:px-10">
+          <SettingsSearchBar contentRootRef={contentRef} onNavigate={navigateToSearchTarget} />
 
           {/* ─── Mobile Section Tabs ────────────────────────────────── */}
           <div className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#0a0a0f]/95 border-t border-gray-800/60 px-2 pb-[env(safe-area-inset-bottom)]">
@@ -1779,7 +1823,7 @@ const SettingsPage: React.FC = () => {
           </div>
 
           {/* ─── Scrollable Content ─────────────────────────────────── */}
-          <div ref={contentRef} className="flex-1 min-w-0 space-y-12 pb-24 lg:pb-8 lg:ml-72">
+          <div ref={contentRef} className="mx-auto mt-8 min-w-0 max-w-[1440px] space-y-12 pb-24 lg:pb-8">
 
             {/* ════════════════════════════════════════════════════════ */}
             {/* SECTION: Apparence                                      */}
@@ -2083,6 +2127,7 @@ const SettingsPage: React.FC = () => {
                         seulement BgColorPickerPanel. Commit ~100ms après l'arrêt. */}
                     <BgColorPickerPanel
                       committedHex={bgAccentCustomHex}
+                      inputLabel={t('settings.bgAccentCustom', 'Custom')}
                       hint={t('settings.bgAccentCustomHint', 'Glissez la pipette pour ajuster, ou tapez l\'hex. La couleur est appliquée à cette page en preview.')}
                       onCommit={handleBgAccentCustomChange}
                     />
@@ -2257,6 +2302,44 @@ const SettingsPage: React.FC = () => {
             </section>
 
             {/* ════════════════════════════════════════════════════════ */}
+            {/* SECTION: Sous-titres                                    */}
+            {/* ════════════════════════════════════════════════════════ */}
+            <section id="subtitles" className="scroll-mt-36">
+              <div data-settings-search-title className="mb-6 flex items-center gap-3">
+                <div className="rounded-xl border border-cyan-500/20 bg-cyan-600/15 p-2">
+                  <Captions className="h-5 w-5 text-cyan-300" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-semibold text-white">{t('settings.subtitles.title')}</h2>
+                  <p className="text-sm text-gray-500">{t('settings.subtitles.description')}</p>
+                </div>
+              </div>
+              <div data-settings-subtitle-layout className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(360px,440px)] xl:items-start">
+                <div className="min-w-0 xl:col-start-2 xl:row-start-1 xl:sticky xl:top-36">
+                  <div
+                    data-settings-search-title
+                    data-settings-search-keywords="aperçu,preview,position"
+                    className="space-y-4 rounded-2xl border border-white/10 bg-gray-900/35 p-5"
+                  >
+                    <h3 className="font-semibold text-white">{t('settings.subtitles.preview')}</h3>
+                    <SubtitlePreview preferences={subtitlePreferences} onChange={patchPreferences} />
+                  </div>
+                </div>
+                <div className="min-w-0 xl:col-start-1 xl:row-start-1">
+                  <SubtitleStyleControls
+                    preferences={subtitlePreferences}
+                    onChange={patchPreferences}
+                    onPreviewChange={previewPreferences}
+                    onCommitPreview={commitPreferences}
+                    onReset={resetAppearance}
+                    density="full"
+                    showPreview={false}
+                  />
+                </div>
+              </div>
+            </section>
+
+            {/* ════════════════════════════════════════════════════════ */}
             {/* SECTION: Performance                                    */}
             {/* ════════════════════════════════════════════════════════ */}
             <section id="performance" className="scroll-mt-24">
@@ -2289,6 +2372,24 @@ const SettingsPage: React.FC = () => {
                   </p>
                 </div>
                 {renderToggle(heroHidden, handleHeroToggle)}
+              </motion.div>
+
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.075 }}
+                className="flex items-center justify-between p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors group mb-3"
+              >
+                <div className="flex-1 mr-4">
+                  <div className="flex items-center gap-2 mb-0.5">
+                    <Monitor className="w-3.5 h-3.5 text-cyan-400" />
+                    <h4 className="font-medium text-white text-sm">{t('settings.hideStreamingPlatforms')}</h4>
+                  </div>
+                  <p className="text-xs text-gray-500 leading-relaxed">
+                    {t('settings.hideStreamingPlatformsDesc')}
+                  </p>
+                </div>
+                {renderToggle(streamingPlatformsHidden, handleStreamingPlatformsToggle)}
               </motion.div>
 
               {/* Streaming basse latence (LL-HLS) — opt-in, un toggle par lecteur. */}
@@ -2664,6 +2765,11 @@ const SettingsPage: React.FC = () => {
                       <AnimatePresence>
                         {sessions.map((session) => {
                           const isCurrentSession = session.id === currentSessionId;
+                          const deviceInfo = normalizeSessionDeviceInfo(session.deviceInfo);
+                          const deviceDetails = [
+                            deviceInfo.operatingSystem,
+                            t(`settings.sessionDeviceTypes.${deviceInfo.deviceType}`),
+                          ].filter(Boolean).join(' · ');
                           return (
                             <motion.div
                               key={session.id}
@@ -2678,15 +2784,12 @@ const SettingsPage: React.FC = () => {
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center space-x-4">
                                   <div className={`p-2.5 rounded-xl ${isCurrentSession ? 'bg-green-500/15 text-green-400' : 'bg-gray-700/40 text-gray-400'}`}>
-                                    {getDeviceIcon(session.userAgent)}
+                                    {getDeviceIcon(deviceInfo.deviceType)}
                                   </div>
                                   <div className="flex-1">
                                     <div className="flex items-center gap-2">
                                       <h4 className="font-medium text-white text-sm">
-                                        {session.userAgent.includes('Chrome') ? 'Chrome' :
-                                          session.userAgent.includes('Firefox') ? 'Firefox' :
-                                            session.userAgent.includes('Safari') ? 'Safari' :
-                                              session.userAgent.includes('Edge') ? 'Edge' : t('common.unknown')}
+                                        {getSessionBrowserLabel(deviceInfo, t('common.unknown'))}
                                       </h4>
                                       {isCurrentSession && (
                                         <span className="px-2 py-0.5 text-[10px] bg-green-500/15 text-green-400 rounded-full font-medium">
@@ -2695,6 +2798,7 @@ const SettingsPage: React.FC = () => {
                                       )}
                                     </div>
                                     <div className="text-xs text-gray-500 mt-1 space-y-0.5">
+                                      <p>{deviceDetails}</p>
                                       <p>{t('settings.createdOn')} {new Date(session.createdAt).toLocaleDateString(i18n.language)} {t('common.at')} {new Date(session.createdAt).toLocaleTimeString(i18n.language, { hour: '2-digit', minute: '2-digit' })}</p>
                                       <p>{t('settings.lastActivity')}: {formatDate(session.accessedAt)}</p>
                                     </div>
@@ -3473,6 +3577,7 @@ const SettingsPage: React.FC = () => {
             </section>
             )}
           </div>
+          </main>
         </div>
       </div>
 
@@ -3563,7 +3668,7 @@ const SettingsPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* Reset Extractions Confirmation Popup */}
@@ -3626,7 +3731,7 @@ const SettingsPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* ID Popup */}
@@ -3687,7 +3792,7 @@ const SettingsPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* localStorage Popup */}
@@ -3754,7 +3859,7 @@ const SettingsPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {showNonSyncablePopup && createPortal(
@@ -3847,7 +3952,7 @@ const SettingsPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* Import Popup */}
@@ -3921,9 +4026,9 @@ const SettingsPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
-    </SquareBackground>
+    </div>
   );
 };
 

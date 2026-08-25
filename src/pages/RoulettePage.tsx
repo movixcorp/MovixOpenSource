@@ -24,6 +24,9 @@ import { encodeId } from '../utils/idEncoder';
 import { getTmdbLanguage } from '../i18n';
 import { getLanguages } from '../data/languages';
 import { areSoundEffectsEnabled } from '../utils/soundSettings';
+import { filterContentByAge } from '../utils/contentAgeFilter';
+import { useProfile } from '../context/ProfileContext';
+import { resolveTmdbKeywordId } from '../utils/tmdbKeywords';
 
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 
@@ -115,7 +118,14 @@ interface RouletteItem {
   first_air_date?: string;
   genre_ids?: number[];
   media_type: 'movie' | 'tv';
+  adult?: boolean;
+  is_anime?: boolean;
 }
+
+type RouletteMediaFilter = 'all' | 'movie' | 'tv' | 'anime';
+
+const getRouletteItemKey = (item: Pick<RouletteItem, 'id' | 'media_type'>) =>
+  `${item.media_type}:${item.id}`;
 
 // ─── Confetti (canvas-confetti) ──────────────────────────────────────────────
 const fireConfetti = async () => {
@@ -373,7 +383,10 @@ const InlineSlotMachine: React.FC<{
   const { t } = useTranslation();
   const [round, setRound] = useState(1);
   const [finishedCount, setFinishedCount] = useState(0);
-  const [allCollected, setAllCollected] = useState<RouletteItem[]>([]);
+  // The first-round winners are needed only when round two completes. Keeping
+  // them in a ref prevents the result render from cancelling the timer that
+  // starts the second round.
+  const round1WinnersRef = useRef<RouletteItem[]>([]);
   const hideTimerRef = useRef<number | null>(null);
   const nextTimerRef = useRef<number | null>(null);
   const completeTimerRef = useRef<number | null>(null);
@@ -408,15 +421,16 @@ const InlineSlotMachine: React.FC<{
 
   // Pré-calculer les gagnants des 2 tours (10 résultats uniques)
   const [roundsData] = useState(() => {
-    const used = new Set<number>();
+    const usedItemKeys = new Set<string>();
     return [0, 1].map(() =>
       Array.from({ length: SLOT_REEL_COUNT }, () => {
-        let idx: number;
-        do {
-          idx = Math.floor(Math.random() * pool.length);
-        } while (used.has(idx) && used.size < pool.length);
-        used.add(idx);
-        return { winnerIndex: idx, item: pool[idx] };
+        const available = pool
+          .map((item, idx) => ({ item, idx }))
+          .filter(({ item }) => !usedItemKeys.has(getRouletteItemKey(item)));
+        const selected = available[Math.floor(Math.random() * available.length)];
+
+        usedItemKeys.add(getRouletteItemKey(selected.item));
+        return { winnerIndex: selected.idx, item: selected.item };
       })
     );
   });
@@ -465,7 +479,7 @@ const InlineSlotMachine: React.FC<{
       hideTimerRef.current = window.setTimeout(() => {
         setReelsHidden(true);
         setRound1Winners(roundWinners);
-        setAllCollected(roundWinners);
+        round1WinnersRef.current = roundWinners;
       }, 800);
       nextTimerRef.current = window.setTimeout(() => {
         setRound(2);
@@ -481,12 +495,12 @@ const InlineSlotMachine: React.FC<{
         completeTimerRef.current = window.setTimeout(() => {
           if (completedRef.current) return;
           completedRef.current = true;
-          onComplete([...allCollected, ...roundWinners]);
+          onComplete([...round1WinnersRef.current, ...roundWinners]);
         }, 400);
       }, 800);
       return clearPendingTimers;
     }
-  }, [allCollected, clearPendingTimers, finishedCount, onComplete, round, roundsData]);
+  }, [clearPendingTimers, finishedCount, onComplete, round, roundsData]);
 
   useEffect(() => {
     if (skipAllSignal === 0 || completedRef.current) return;
@@ -495,8 +509,8 @@ const InlineSlotMachine: React.FC<{
     completedRef.current = true;
     setRound(2);
     setFinishedCount(0);
-    setAllCollected(roundsData[0].map((entry) => entry.item));
-    setRound1Winners(roundsData[0].map((entry) => entry.item));
+    round1WinnersRef.current = roundsData[0].map((entry) => entry.item);
+    setRound1Winners(round1WinnersRef.current);
     setRound2Winners(roundsData[1].map((entry) => entry.item));
     setReelsHidden(true);
     setDone(true);
@@ -621,9 +635,11 @@ const InlineSlotMachine: React.FC<{
 // ─── Main page ──────────────────────────────────────────────────────────────
 const RoulettePage: React.FC = () => {
   const { t, i18n } = useTranslation();
+  const { currentProfile } = useProfile();
+  const profileAgeRestriction = currentProfile?.ageRestriction || 0;
 
   // Filters
-  const [mediaFilter, setMediaFilter] = useState<'all' | 'movie' | 'tv'>('all');
+  const [mediaFilter, setMediaFilter] = useState<RouletteMediaFilter>('all');
   const [selectedGenres, setSelectedGenres] = useState<string[]>([]);
   const [minRating, setMinRating] = useState(0);
   const [localMinRating, setLocalMinRating] = useState(0);
@@ -677,9 +693,18 @@ const RoulettePage: React.FC = () => {
   const fetchPool = useCallback(async () => {
     setLoading(true);
     try {
-      const types: ('movie' | 'tv')[] = mediaFilter === 'all' ? ['movie', 'tv'] : [mediaFilter];
+      const isAnimeFilter = mediaFilter === 'anime';
+      const types: ('movie' | 'tv')[] = mediaFilter === 'all'
+        ? ['movie', 'tv']
+        : isAnimeFilter
+          ? ['tv']
+          : [mediaFilter];
       const today = new Date().toISOString().split('T')[0];
       const allResults: RouletteItem[] = [];
+      const tmdbLanguage = getTmdbLanguage();
+      const animeKeywordId = isAnimeFilter
+        ? await resolveTmdbKeywordId('anime', tmdbLanguage)
+        : null;
 
       for (const type of types) {
         // Fetch 3 random pages for variety
@@ -688,7 +713,7 @@ const RoulettePage: React.FC = () => {
         const requests = randomPages.map(page => {
           const params: Record<string, any> = {
             api_key: TMDB_API_KEY,
-            language: getTmdbLanguage(),
+            language: tmdbLanguage,
             page,
             sort_by: 'popularity.desc',
             include_adult: false,
@@ -696,7 +721,14 @@ const RoulettePage: React.FC = () => {
           };
           if (type === 'movie') params['primary_release_date.lte'] = today;
           else params['first_air_date.lte'] = today;
-          if (selectedGenres.length > 0) params.with_genres = selectedGenres.join(',');
+          if (isAnimeFilter) {
+            // Le genre Animation seul inclut aussi les productions occidentales.
+            // Le mot-clé TMDB « anime » resserre le résultat quand il est connu.
+            params.with_genres = Array.from(new Set(['16', ...selectedGenres])).join(',');
+            if (animeKeywordId) params.with_keywords = String(animeKeywordId);
+          } else if (selectedGenres.length > 0) {
+            params.with_genres = selectedGenres.join(',');
+          }
           if (minRating > 0) params['vote_average.gte'] = minRating;
           if (yearMin) {
             if (type === 'movie') params['primary_release_date.gte'] = `${yearMin}-01-01`;
@@ -719,23 +751,26 @@ const RoulettePage: React.FC = () => {
         responses.forEach(res => {
           const items = res.data.results
             .filter((item: any) => item.poster_path && item.overview)
-            .map((item: any) => ({ ...item, media_type: type }));
+            .map((item: any) => ({ ...item, media_type: type, is_anime: isAnimeFilter }));
           allResults.push(...items);
         });
       }
 
       // Deduplicate and shuffle
-      const unique = Array.from(new Map(allResults.map(i => [i.id, i])).values());
+      const unique = Array.from(
+        new Map(allResults.map(item => [getRouletteItemKey(item), item])).values()
+      );
       const shuffled = unique.sort(() => Math.random() - 0.5);
+      const allowedItems = await filterContentByAge(shuffled, profileAgeRestriction);
 
-      if (shuffled.length === 0) {
+      if (allowedItems.length === 0) {
         toast.error(t('roulette.noResults'));
         setLoading(false);
         return null;
       }
 
-      setPool(shuffled.slice(0, 30)); // Keep 30 for the reel
-      return shuffled;
+      setPool(allowedItems.slice(0, 30)); // Keep 30 for the reel
+      return allowedItems;
     } catch (err) {
       console.error('Roulette fetch error:', err);
       toast.error(t('roulette.fetchError'));
@@ -743,21 +778,20 @@ const RoulettePage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [mediaFilter, selectedGenres, minRating, yearMin, yearMax, selectedLangs, selectedProviders]);
+  }, [mediaFilter, selectedGenres, minRating, yearMin, yearMax, selectedLangs, selectedProviders, profileAgeRestriction, t]);
 
   const spinsLeftRef = useRef(0);
   const poolRef = useRef<RouletteItem[]>([]);
-  const usedIdsRef = useRef<Set<number>>(new Set());
+  const usedItemKeysRef = useRef<Set<string>>(new Set());
 
   // Pick a random index that hasn't been used yet
-  const pickUniqueIndex = (items: RouletteItem[]): number => {
+  const pickUniqueIndex = (items: RouletteItem[]): number | null => {
     const available = items
       .map((item, idx) => ({ item, idx }))
-      .filter(({ item }) => !usedIdsRef.current.has(item.id));
+      .filter(({ item }) => !usedItemKeysRef.current.has(getRouletteItemKey(item)));
 
     if (available.length === 0) {
-      // Fallback: all used, just pick random
-      return Math.floor(Math.random() * items.length);
+      return null;
     }
     return available[Math.floor(Math.random() * available.length)].idx;
   };
@@ -769,13 +803,19 @@ const RoulettePage: React.FC = () => {
     setAllWinners([]);
     setSlotMachineActive(false);
     setSlotSkipSignal(0);
-    setHasSpun(true);
-    usedIdsRef.current = new Set();
+    spinsLeftRef.current = 0;
+    usedItemKeysRef.current = new Set();
 
     const result = await fetchPool();
     if (!result || result.length === 0) return;
 
     const items = result.slice(0, 30);
+    if (items.length < spinCount) {
+      toast.error(t('roulette.notEnoughUniqueResults', { count: spinCount }));
+      return;
+    }
+
+    setHasSpun(true);
     setPool(items);
     poolRef.current = items;
 
@@ -788,17 +828,23 @@ const RoulettePage: React.FC = () => {
     spinsLeftRef.current = spinCount - 1;
 
     const idx = pickUniqueIndex(items);
-    usedIdsRef.current.add(items[idx].id);
+    if (idx === null) return;
+    usedItemKeysRef.current.add(getRouletteItemKey(items[idx]));
     setWinnerIndex(idx);
     setSpinning(true);
   };
 
   const respin = () => {
     if (spinning || poolRef.current.length === 0) return;
-    setWinner(null);
 
     const idx = pickUniqueIndex(poolRef.current);
-    usedIdsRef.current.add(poolRef.current[idx].id);
+    if (idx === null) {
+      toast.info(t('roulette.noUniqueResults'));
+      return;
+    }
+
+    setWinner(null);
+    usedItemKeysRef.current.add(getRouletteItemKey(poolRef.current[idx]));
     setWinnerIndex(idx);
     setSpinning(true);
   };
@@ -818,13 +864,14 @@ const RoulettePage: React.FC = () => {
 
     // Current spin winner (if still spinning, the reel skip will handle it via skipSignal)
     const currentW = items[winnerIndex];
-    remaining.push(currentW);
+    if (currentW) remaining.push(currentW);
 
     // All remaining spins
     while (spinsLeftRef.current > 0) {
       spinsLeftRef.current--;
       const idx = pickUniqueIndex(items);
-      usedIdsRef.current.add(items[idx].id);
+      if (idx === null) break;
+      usedItemKeysRef.current.add(getRouletteItemKey(items[idx]));
       remaining.push(items[idx]);
     }
 
@@ -865,7 +912,11 @@ const RoulettePage: React.FC = () => {
 
       setTimeout(() => {
         const idx = pickUniqueIndex(poolRef.current);
-        usedIdsRef.current.add(poolRef.current[idx].id);
+        if (idx === null) {
+          toast.info(t('roulette.noUniqueResults'));
+          return;
+        }
+        usedItemKeysRef.current.add(getRouletteItemKey(poolRef.current[idx]));
         setWinnerIndex(idx);
         setSpinning(true);
       }, 600);
@@ -966,7 +1017,7 @@ const RoulettePage: React.FC = () => {
               >
                 {/* Media type toggle */}
                 <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-center gap-2 mb-5">
-                  {(['all', 'movie', 'tv'] as const).map(type => (
+                  {(['all', 'movie', 'tv', 'anime'] as const).map(type => (
                     <motion.button
                       key={type}
                       whileHover={{ scale: 1.05 }}
@@ -976,7 +1027,13 @@ const RoulettePage: React.FC = () => {
                         ? 'bg-red-600 text-white'
                         : 'bg-white/5 text-white/60 border border-white/10 hover:bg-white/10'}`}
                     >
-                      {type === 'all' ? t('roulette.all') : type === 'movie' ? t('filter.movies') : t('filter.series')}
+                      {type === 'all'
+                        ? t('roulette.all')
+                        : type === 'movie'
+                          ? t('filter.movies')
+                          : type === 'anime'
+                            ? t('roulette.animes')
+                            : t('filter.series')}
                     </motion.button>
                   ))}
                 </motion.div>
@@ -1211,7 +1268,11 @@ const RoulettePage: React.FC = () => {
                         <span>{new Date(winner.release_date || winner.first_air_date || '').getFullYear() || 'N/A'}</span>
                       </div>
                       <span className="px-2 py-0.5 rounded-lg bg-white/5 border border-white/10 text-[11px] uppercase font-semibold">
-                        {winner.media_type === 'movie' ? t('filter.movies') : t('filter.series')}
+                        {winner.is_anime
+                          ? t('roulette.animes')
+                          : winner.media_type === 'movie'
+                            ? t('filter.movies')
+                            : t('filter.series')}
                       </span>
                     </div>
 
@@ -1278,7 +1339,7 @@ const RoulettePage: React.FC = () => {
                       }}
                       index={i}
                       movieLabel={t('filter.movies')}
-                      serieLabel={t('filter.series')}
+                      serieLabel={mediaFilter === 'anime' ? t('roulette.animes') : t('filter.series')}
                     />
                   ))}
                 </div>

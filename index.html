@@ -21,6 +21,8 @@
         <!-- Prefetch -->
         <link rel="dns-prefetch" href="//image.tmdb.org" />
         <link rel="preconnect" href="https://image.tmdb.org" crossorigin />
+        <link rel="dns-prefetch" href="//api.themoviedb.org" />
+        <link rel="preconnect" href="https://api.themoviedb.org" crossorigin />
         <link rel="dns-prefetch" href="//www.gstatic.com" />
         <link rel="dns-prefetch" href="//www.google.com" />
         <link rel="preconnect" href="https://www.gstatic.com" crossorigin />
@@ -29,11 +31,13 @@
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 
-        <!-- Bootstrap Icons -->
-        <link
-            rel="stylesheet"
-            href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
-        />
+        <!-- Bootstrap Icons : la feuille jsdelivr a été retirée du <head>.
+             Elle bloquait le premier rendu de TOUTES les pages (DNS + TLS vers
+             un CDN tiers, puis la police d'icônes) alors qu'un seul écran s'en
+             sert. `src/pages/LiveTV.tsx` importe déjà
+             `bootstrap-icons/font/bootstrap-icons.min.css` : la feuille part
+             donc dans le chunk de cette route, servie depuis notre origine avec
+             un cache immuable, et seulement quand on y va. -->
 
         <!-- Icons -->
         <link rel="icon" href="/movix.png" />

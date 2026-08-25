@@ -61,11 +61,11 @@ test('runtime reuses the shared public proxy origin when the KissKH-specific URL
   const runtime = createRuntimeDependencies({
     env: {
       KISSKH_ENABLED: 'false',
-      PROXY_SERVER_URL: 'https://proxy.movix.example/proxy',
+      PROXY_SERVER_URL: 'https://proxiesembed.example/proxy',
     },
   });
 
-  assert.equal(runtime.publicProxyUrl, 'https://proxy.movix.example');
+  assert.equal(runtime.publicProxyUrl, 'https://proxiesembed.example');
 });
 
 test('runtime dependency wiring applies a non-default fallback TTL from environment to Redis EX', async () => {

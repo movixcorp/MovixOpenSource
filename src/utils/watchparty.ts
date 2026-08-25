@@ -16,6 +16,45 @@ export const generateRandomCode = (length: number): string => {
 };
 
 /**
+ * Jeton d'accès à une room.
+ *
+ * Le serveur exige désormais un token — délivré par POST /create (hôte) ou
+ * POST /join (membre) — pour lire `/api/watchparty/room/:roomId` et pour ouvrir
+ * la socket. Connaître le `roomId` ne suffit plus à entrer dans une room.
+ *
+ * Stocké en `sessionStorage` : le token survit à un rafraîchissement de page
+ * mais reste cantonné à l'onglet et disparaît à sa fermeture.
+ */
+const ROOM_TOKEN_PREFIX = 'watchPartyToken:';
+
+export const storeRoomToken = (roomId: string, token: string): void => {
+  if (!roomId || !token) return;
+  try {
+    sessionStorage.setItem(`${ROOM_TOKEN_PREFIX}${roomId}`, token);
+  } catch {
+    // sessionStorage indisponible (mode privé strict) : on continue sans persistance.
+  }
+};
+
+export const getRoomToken = (roomId: string): string | null => {
+  if (!roomId) return null;
+  try {
+    return sessionStorage.getItem(`${ROOM_TOKEN_PREFIX}${roomId}`);
+  } catch {
+    return null;
+  }
+};
+
+export const clearRoomToken = (roomId: string): void => {
+  if (!roomId) return;
+  try {
+    sessionStorage.removeItem(`${ROOM_TOKEN_PREFIX}${roomId}`);
+  } catch {
+    // Rien à faire.
+  }
+};
+
+/**
  * Socket connection state for watchparty
  */
 export enum SocketState {
@@ -127,17 +166,6 @@ export interface Mp4SourceInfo {
 }
 
 /**
- * Rivestream source information (VO/VOSTFR HLS streams)
- */
-export interface RivestreamSourceInfo {
-  url: string;         // HLS stream URL
-  label: string;       // Display label (e.g., "VO 1080p", "VOSTFR 720p")
-  quality: number;     // Quality in pixels (1080, 720, etc.)
-  service: string;     // Service provider
-  category: string;    // Category (e.g., "VO", "VOSTFR")
-}
-
-/**
  * Caption/subtitle information
  */
 export interface CaptionInfo {
@@ -211,7 +239,6 @@ export interface WatchPartyRoom {
     nexusSources?: NexusSourceInfo[]; // Array of available Nexus sources
     bravoSources?: BravoSourceInfo[]; // Array of available Bravo/PurStream sources
     mp4Sources?: Mp4SourceInfo[]; // Array of available generic MP4/file sources
-    rivestreamSources?: RivestreamSourceInfo[]; // Array of available Rivestream HLS sources (VO/VOSTFR)
     captions?: CaptionInfo[]; // Array of available subtitles/captions
     currentNexusSource?: NexusSourceInfo; // Currently selected Nexus source
     currentBravoSource?: BravoSourceInfo; // Currently selected Bravo source

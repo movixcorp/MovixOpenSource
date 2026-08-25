@@ -181,7 +181,12 @@ async def execute_player_scripts(
                 stderr=asyncio.subprocess.DEVNULL,
                 env=_minimal_worker_environment(),
             )
-        except OSError:
+        except (OSError, NotImplementedError):
+            # NotImplementedError : la boucle asyncio ne sait pas lancer de
+            # sous-processus (cas de WindowsSelectorEventLoop). Elle remonte
+            # sans message, ce qui donnait un 500 `{"error": ""}` indéchiffrable
+            # à l'appelant. Ici on dégrade comme pour une OSError : l'extraction
+            # retombe sur le repli HTML au lieu de faire échouer la requête.
             return SandboxResult(error="sandbox_unavailable")
         try:
             stdout, _ = await asyncio.wait_for(

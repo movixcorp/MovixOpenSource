@@ -9,7 +9,7 @@ export type VipInvoiceStatus =
   | 'expired'
   | 'cancelled';
 
-export type VipPaymentMethod = 'btc' | 'ltc' | 'paygate_hosted' | 'payblis';
+export type VipPaymentMethod = 'btc' | 'ltc' | 'cryptogate' | 'paygate_hosted' | 'payblis';
 export type VipCoin = Extract<VipPaymentMethod, 'btc' | 'ltc'>;
 export type VipRecipientMode = 'self' | 'gift';
 
@@ -118,7 +118,13 @@ function normalizeVipCoin(value: unknown): VipCoin | null {
 
 function normalizeVipPaymentMethod(value: unknown, fallbackCoin: unknown = null): VipPaymentMethod | null {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  if (normalized === 'btc' || normalized === 'ltc' || normalized === 'paygate_hosted' || normalized === 'payblis') {
+  if (
+    normalized === 'btc'
+    || normalized === 'ltc'
+    || normalized === 'cryptogate'
+    || normalized === 'paygate_hosted'
+    || normalized === 'payblis'
+  ) {
     return normalized;
   }
 

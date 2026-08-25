@@ -12,12 +12,19 @@ export type TopLevelSourceId = typeof TOP_LEVEL_SOURCE_IDS[number];
  * Ids historiques retirés de l'UI de priorité.
  * mergeWithDefaults les strip des prefs persistées (cleanup migration).
  */
-export const DEPRECATED_SOURCE_IDS = ['nexus_file', 'rivestream_hls'] as const;
+export const DEPRECATED_SOURCE_IDS = ['nexus_file', 'rivestream_hls', 'rivestream'] as const;
 export const DEPRECATED_HOSTER_IDS = [] as const;
 
-/** Hosters built-in connus. Les custom hosters utilisent des ids prefixés `custom_`. */
+/**
+ * Hosters built-in connus. Les custom hosters utilisent des ids prefixés `custom_`.
+ *
+ * **L'ordre compte deux fois** : il fixe l'ordre de priorité par défaut ET
+ * l'ordre de test dans `detectHoster`. `veev` doit donc rester AVANT
+ * `doodstream`, dont les patterns couvrent aussi `doods.to`.
+ */
 export const BUILTIN_HOSTER_IDS = [
-  'voe', 'vidmoly', 'vidzy', 'uqload', 'sibnet', 'doodstream',
+  'voe', 'vidmoly', 'vidzy', 'uqload', 'sibnet', 'veev', 'doodstream',
+  'lulustream', 'vidara',
   'seekstreaming', 'smoothpre', 'minochinos', 'darkibox',
   'supervideo', 'dropload', 'oneupload', 'fsvid',
 ] as const;

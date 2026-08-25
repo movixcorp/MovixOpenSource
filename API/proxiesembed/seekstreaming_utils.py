@@ -11,6 +11,21 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
+SEEKSTREAMING_HOSTS = frozenset({
+    "embed4me.com",
+    "servicecatalog.site",
+    "technicalcatalog.site",
+    "embedseek.com",
+    "embedseek.online",
+    "embedseek.xyz",
+    "seekplayer.me",
+    "seekplayer.vip",
+    "seeks.cloud",
+    "seekplays.com",
+    "seekplays.ink",
+    "seekplays.online",
+    "seekplays.pro",
+})
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 LEGACY_IPV4_PART_RE = re.compile(r"(?:[0-9]+|0[xX][0-9A-Fa-f]+)")
@@ -28,6 +43,11 @@ class SeekStreamingEmbed:
 class SeekStreamingCandidate:
     kind: Literal["cfNative", "source"]
     url: str
+
+
+def is_seekstreaming_host(host: str) -> bool:
+    normalized = host.rstrip(".").lower()
+    return any(normalized == root or normalized.endswith(f".{root}") for root in SEEKSTREAMING_HOSTS)
 
 
 def _decode_url(raw_url: str) -> str:
@@ -52,6 +72,7 @@ def normalize_seekstreaming_origin(raw_url: str) -> str:
     if (
         parsed.scheme != "https"
         or not host
+        or not is_seekstreaming_host(host)
         or parsed.username is not None
         or parsed.password is not None
         or port not in (None, 443)
@@ -73,14 +94,20 @@ def parse_seekstreaming_embed_url(raw_url: str) -> SeekStreamingEmbed:
     if (
         parsed.scheme != "https"
         or not host
+        or not is_seekstreaming_host(host)
         or parsed.username is not None
         or parsed.password is not None
         or port not in (None, 443)
-        or parsed.path != "/"
-        or bool(parsed.query)
     ):
         raise ValueError("Invalid SeekStreaming URL")
     video_id = parsed.fragment.split("&", 1)[0].split("?", 1)[0].strip()
+    if not video_id:
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 2 and path_parts[-2].lower() == "embed":
+            video_id = path_parts[-1]
+        elif path_parts:
+            candidate = path_parts[-1]
+            video_id = candidate[1:] if candidate.startswith("#") else candidate
     if not VIDEO_ID_RE.fullmatch(video_id):
         raise ValueError("Invalid SeekStreaming video ID")
     origin = normalize_seekstreaming_origin(decoded)

@@ -33,6 +33,22 @@ const MAX_CONCURRENT_IMAGE_FETCHES = 6;
 let activeImageFetches = 0;
 const imageFetchQueue = [];
 
+// Éviction FIFO : sans ça le cache grossit sans limite jusqu'à ce que le
+// quota du navigateur fasse échouer silencieusement tous les cache.put().
+// On ne vérifie qu'~1 mise en cache sur 20 (hors chemin chaud du hit, donc
+// pas de coût sur les hits) pour éviter d'ouvrir cache.keys() à chaque fetch.
+const IMAGE_CACHE_MAX_ENTRIES = 600;
+const IMAGE_CACHE_TRIM_SAMPLE_RATE = 1 / 20;
+
+async function trimImageCache(cache) {
+  const keys = await cache.keys();
+  if (keys.length <= IMAGE_CACHE_MAX_ENTRIES) return;
+  // cache.keys() respecte l'ordre d'insertion -> les plus vieilles entrées
+  // sont en tête, donc les premières de la liste sont supprimées (FIFO).
+  const staleKeys = keys.slice(0, keys.length - IMAGE_CACHE_MAX_ENTRIES);
+  await Promise.all(staleKeys.map((key) => cache.delete(key)));
+}
+
 function acquireImageFetchSlot() {
   return new Promise((resolve) => {
     if (activeImageFetches < MAX_CONCURRENT_IMAGE_FETCHES) {
@@ -65,12 +81,63 @@ async function handleTmdbImage(req) {
       // .clone() avant .put() : la response ne peut être consommée qu'une fois.
       // .catch silently : QuotaExceededError quand storage full → on sert la
       // réponse non-cachée à l'utilisateur, qui marche quand même.
-      cache.put(req, res.clone()).catch(() => {});
+      cache.put(req, res.clone())
+        .then(() => {
+          if (Math.random() < IMAGE_CACHE_TRIM_SAMPLE_RATE) {
+            trimImageCache(cache).catch(() => {});
+          }
+        })
+        .catch(() => {});
     }
     return res;
   } finally {
     releaseImageFetchSlot();
   }
+}
+
+// ============================================================================
+// Asset cache — JS / CSS / polices du build
+// ============================================================================
+//
+// Vite hashe le contenu dans le nom de fichier : `/assets/index-a1b2c3.js` ne
+// désigne jamais deux contenus différents. Un cache-first est donc sûr — et
+// c'est ce qui fait la différence entre « le site recharge » et « le site est
+// déjà là » : au deuxième chargement, plus une seule requête réseau pour le
+// bundle, même sur une connexion lente ou en train de se réveiller.
+//
+// Un déploiement change les hashs, donc les nouvelles URLs manquent au cache et
+// sont récupérées normalement. Les anciennes n'y sont plus référencées : d'où
+// l'éviction FIFO ci-dessous, sans quoi le cache grossirait à chaque build.
+const ASSET_CACHE_NAME = 'movix-assets-v1';
+const ASSET_PATH_PREFIX = '/assets/';
+const ASSET_CACHE_MAX_ENTRIES = 160;
+const ASSET_CACHE_TRIM_SAMPLE_RATE = 1 / 10;
+
+async function trimAssetCache(cache) {
+  const keys = await cache.keys();
+  if (keys.length <= ASSET_CACHE_MAX_ENTRIES) return;
+  const staleKeys = keys.slice(0, keys.length - ASSET_CACHE_MAX_ENTRIES);
+  await Promise.all(staleKeys.map((key) => cache.delete(key)));
+}
+
+async function handleAsset(req) {
+  const cache = await caches.open(ASSET_CACHE_NAME);
+  const cached = await cache.match(req);
+  if (cached) return cached;
+
+  const res = await fetch(req);
+  // Uniquement les vraies réussites : une 404 (chunk d'un ancien build) ou une
+  // réponse opaque mises en cache seraient resservies indéfiniment.
+  if (res && res.ok && res.type === 'basic') {
+    cache.put(req, res.clone())
+      .then(() => {
+        if (Math.random() < ASSET_CACHE_TRIM_SAMPLE_RATE) {
+          trimAssetCache(cache).catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }
+  return res;
 }
 
 // ============================================================================
@@ -261,13 +328,14 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       const keys = await caches.keys();
-      // Préserve le cache d'images courant ; supprime tout le reste (anciennes
-      // versions de cache, caches légacy d'avant cette logique). Quand on bumpe
-      // IMAGE_CACHE_NAME (ex. v1 → v2), l'ancienne version sera supprimée ici
-      // automatiquement.
+      // Préserve les caches courants (images, assets) ; supprime tout le reste
+      // (anciennes versions, caches légacy d'avant cette logique). Quand on
+      // bumpe un nom de cache (ex. v1 → v2), l'ancienne version est supprimée
+      // ici automatiquement.
+      const kept = new Set([IMAGE_CACHE_NAME, ASSET_CACHE_NAME]);
       await Promise.all(
         keys
-          .filter((k) => k !== IMAGE_CACHE_NAME)
+          .filter((k) => !kept.has(k))
           .map((k) => caches.delete(k))
       );
       await self.clients.claim();
@@ -286,8 +354,8 @@ self.addEventListener('push', (event) => {
   event.waitUntil(
     self.registration.showNotification(data.title || 'Movix', {
       body: data.body || '',
-      icon: data.icon ? new URL(data.icon, baseUrl).href : `${baseUrl}/movix.png`,
-      badge: `${baseUrl}/movix.png`,
+      icon: data.icon ? new URL(data.icon, baseUrl).href : `${baseUrl}/movix-192.png`,
+      badge: `${baseUrl}/movix-192.png`,
       image: data.image || undefined,
       data: data.data || {},
     })
@@ -449,7 +517,14 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // 2. Navigation fallback (logique existante — préservée)
+  // 2. Assets du build — cache-first. Réservé à notre origine : le nom hashé
+  // ne garantit l'immuabilité que pour les fichiers qu'on a produits.
+  if (url.origin === self.location.origin && url.pathname.startsWith(ASSET_PATH_PREFIX)) {
+    event.respondWith(handleAsset(req));
+    return;
+  }
+
+  // 3. Navigation fallback (logique existante — préservée)
   if (req.mode !== 'navigate') return;
   if (isLocalHost(self.location.hostname)) return;
   event.respondWith(handleNavigation(req));

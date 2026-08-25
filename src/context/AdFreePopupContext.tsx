@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useMemo } from 'react';
-import { isUserVip } from '../utils/vipUtils';
+import { checkVipStatus, isUserVip } from '../utils/vipUtils';
 import { getAdPopupMode, subscribeToAdPopupModeChanges } from '../utils/adPopupMode';
 import { SCRIPT_AD_MODE_ENABLED, loadAdScript } from '../utils/adScriptMode';
 
@@ -34,6 +34,12 @@ export const AdFreePopupProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
   // Effect to listen for changes to VIP status (localStorage + custom events)
   useEffect(() => {
+    let mounted = true;
+
+    const syncVipStatus = () => {
+      if (mounted) setIsVip(isUserVip());
+    };
+
     const handleStorageChange = (e: StorageEvent) => {
       if (e.key === 'is_vip') {
         setIsVip(e.newValue === 'true');
@@ -44,9 +50,20 @@ export const AdFreePopupProvider: React.FC<{ children: React.ReactNode }> = ({ c
       setIsVip(isUserVip());
     };
 
+    // La vÃ©rification lancÃ©e au dÃ©marrage peut finir avant le montage de ce
+    // provider. On relit donc l'Ã©tat, puis on rejoint sa requÃªte en cours afin
+    // de ne jamais rester bloquÃ© avec la valeur initiale aprÃ¨s une connexion.
+    syncVipStatus();
+    if (localStorage.getItem('access_code')) {
+      void checkVipStatus().then((vip) => {
+        if (mounted) setIsVip(vip);
+      });
+    }
+
     window.addEventListener('storage', handleStorageChange);
     window.addEventListener('vipStatusChanged', handleVipStatusChanged);
     return () => {
+      mounted = false;
       window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('vipStatusChanged', handleVipStatusChanged);
     };

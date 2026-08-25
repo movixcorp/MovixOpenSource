@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Eye, Shield, Image, FileText, Play, RotateCcw } from 'lucide-react';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 export interface AntiSpoilerSettings {
   seasonImages: boolean;
@@ -306,7 +307,7 @@ const AntiSpoilerSettingsModal: React.FC<AntiSpoilerSettingsProps> = ({
     </AnimatePresence>
   );
 
-  return createPortal(modalContent, document.body);
+  return createPortal(modalContent, getOverlayPortalRoot());
 };
 
 export default AntiSpoilerSettingsModal;

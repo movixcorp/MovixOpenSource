@@ -8,6 +8,7 @@ import { useTranslation } from 'react-i18next';
 import { encodeId } from '../utils/idEncoder';
 import { useTmdbImages, prefetchTmdbImages } from '../hooks/useTmdbImages';
 import { useEmblaScrollSuppress } from '../hooks/useEmblaScrollSuppress';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 import './EmblaCarousel.css';
 
 const POSTER_FALLBACK = `data:image/svg+xml,${encodeURIComponent('<svg width="500" height="750" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#111"/><text x="50%" y="50%" fill="#444" font-size="36" font-family="sans-serif" text-anchor="middle" dy=".3em">MOVIX</text></svg>')}`;
@@ -412,6 +413,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
   const [canScrollPrev, setCanScrollPrev] = useState(false);
   const [canScrollNext, setCanScrollNext] = useState(false);
   const rowRef = useRef<HTMLDivElement>(null);
+  const { items: allowedItems } = useAgeRestrictedContent(items);
 
   // Cache watchlists once using useMemo to avoid repeated localStorage access
   const watchlistMovies = useMemo(() => {
@@ -427,7 +429,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
   }, []);
 
   // Limite le nombre d'items pour éviter de surcharger le DOM (max 30 items par carousel)
-  const limitedItems = useMemo(() => items.slice(0, 30), [items]);
+  const limitedItems = useMemo(() => allowedItems.slice(0, 30), [allowedItems]);
 
   // Pré-warmer idle (P1 + P3) : dès le mount du carousel, on pré-décode toutes
   // les bitmaps poster (élimine le coût de décode synchrone pendant le scroll
@@ -728,8 +730,10 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
     return map;
   }, [limitedItems, isHistory, getEpisodeProgress, getMovieProgress]);
 
+  if (limitedItems.length === 0) return null;
+
   return (
-    <div ref={rowRef} className="mb-4 content-row-container select-none -mx-3 md:-mx-4 group/carousel" style={{ position: 'relative' }}>
+    <div ref={rowRef} className="mb-4 content-row-container -mx-3 md:-mx-4 group/carousel" style={{ position: 'relative' }}>
         <div className="flex justify-between items-center mb-2 px-4 md:px-6 relative">
           <div className="flex items-center gap-3">
             <h2 className="section-title">{title}</h2>
@@ -743,7 +747,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
               </button>
             )}
           </div>
-          {isHistory && onRemoveAll && items.length > 0 && (
+          {isHistory && onRemoveAll && limitedItems.length > 0 && (
             <button
               onClick={onRemoveAll}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-red-700/80 hover:bg-red-700 text-white text-xs font-medium rounded-full transition-colors"
@@ -757,8 +761,12 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
 
         <div className="relative w-full overflow-visible">
           <div className="overflow-visible" ref={emblaRef}>
+            {/* `select-none` est ici et non sur toute la rangée : il n'existe
+                que pour empêcher la sélection de texte pendant qu'on fait
+                glisser le carrousel. Posé plus haut, il rendait aussi le titre
+                de section et les boutons impossibles à sélectionner. */}
             <div
-              className="flex gap-4 pr-4 md:pr-6 pl-4 md:pl-6"
+              className="flex gap-4 pr-4 md:pr-6 pl-4 md:pl-6 select-none"
               style={{ overflow: 'visible' }}
             >
               {limitedItems.map((item, index) => {

@@ -1,9 +1,8 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
-import { getFrembedBase } from '../utils/frembedConfig';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
-import { Loader, Video, Star, Calendar, List, Check, FolderPlus, ChevronRight, AlertTriangle, Play, X, MapPin, Languages, Building, ArrowLeft, Image, Download, Shield, EyeOff, MessageSquare, Archive, CheckCircle } from 'lucide-react';
+import { Loader, Video, Star, Calendar, List, Check, FolderPlus, ChevronRight, AlertTriangle, Play, X, MapPin, Languages, Building, ArrowLeft, Image, Download, Shield, EyeOff, MessageSquare, Archive, CheckCircle, Info } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
@@ -12,9 +11,7 @@ import DetailsSkeleton from '../components/skeletons/DetailsSkeleton';
 
 import CustomDropdown from '../components/CustomDropdown';
 import ShareButtons from '../components/ShareButtons';
-import HLSPlayer, { HLSPlayerRef } from '../components/HLSPlayer';
 import { useAdFreePopup } from '../context/AdFreePopupContext';
-import AdFreePlayerAds from '../components/AdFreePlayerAds';
 import AlertButton from '../components/AlertButton';
 import {
   searchWithFallback,
@@ -24,6 +21,11 @@ import {
   shouldDefaultAnimeModeToOff,
 } from '../utils/searchUtils';
 import { isLikelyAnime, type TmdbKeywordsResponse } from '../utils/animeSignals';
+import CharactersSection from '../components/CharactersSection';
+import DetailExtraMetadata from '../components/DetailExtraMetadata';
+import { loadDetailCharacters, type DetailCharacters } from '../services/detailCharacters';
+import { normalizeAlternateTitles, normalizeKeywords } from '../utils/tmdbMetadata';
+import { rememberMedia } from '../utils/mediaSearchIndex';
 import {
   pickBestAnimeMatch,
   collectTmdbNames,
@@ -35,7 +37,8 @@ import AntiSpoilerSettingsModal from '../components/AntiSpoilerSettings';
 import { useAntiSpoilerSettings } from '../hooks/useAntiSpoilerSettings';
 import { buildSiteUrl } from '../config/runtime';
 import CommentsSection from '../components/CommentsSection';
-import LikeDislikeButton from '../components/LikeDislikeButton';
+import LikeDislikeButton, { calculateLikeDislikeRating, type LikeDislikeStats } from '../components/LikeDislikeButton';
+import MovixRatingInfoModal from '../components/MovixRatingInfoModal';
 import { useWrappedTracker } from '../hooks/useWrappedTracker';
 import LazySection from '../components/LazySection';
 import SEO from '../components/SEO';
@@ -116,38 +119,6 @@ interface GroupedCrewMember {
   profile_path: string | null;
 }
 
-interface CoflixResponse {
-  tmdb_details: {
-    id: number;
-    title: string;
-    original_title: string;
-    release_date: string;
-    poster_path: string;
-    backdrop_path: string;
-    overview: string;
-    vote_average: number;
-  };
-  iframe_src: string;
-  current_episode: {
-    season_number: number;
-    episode_number: number;
-    title: string;
-    iframe_src: string;
-    player_links: Array<{
-      decoded_url: string;
-      quality: string;
-      language: string;
-    }>;
-  };
-  seasons: Array<{
-    season_number: number;
-    name: string;
-    data_id: string;
-    post_id: string;
-    episodes: Array<any>;
-  }>;
-}
-
 interface WatchStatus {
   watchlist: boolean;
   favorite: boolean;
@@ -167,49 +138,6 @@ interface Episode {
   sa: string | number;
   epi: string | number;
   link?: string;
-}
-
-interface OmegaResponse {
-  type: string;
-  series: Array<{
-    title: string;
-    audio_type: string;
-    release_date: string;
-    summary: string;
-    tmdb_data: {
-      id: number;
-      name: string;
-      overview: string;
-      first_air_date: string;
-      poster_path: string;
-      backdrop_path: string;
-      vote_average: number;
-      match_score: number;
-    };
-    seasons: Array<{
-      number: number;
-      title: string;
-      episodes: Array<{
-        number: string;
-        versions: {
-          vf?: {
-            title: string;
-            players: Array<{
-              name: string;
-              link: string;
-            }>;
-          };
-          vostfr?: {
-            title: string;
-            players: Array<{
-              name: string;
-              link: string;
-            }>;
-          };
-        };
-      }>;
-    }>;
-  }>;
 }
 
 const DEFAULT_IMAGE = 'https://www.shutterstock.com/image-vector/default-image-icon-vector-missing-600nw-2079504220.jpg';
@@ -953,1481 +881,6 @@ const fetchSeasonDetails = async (
   return null;
 };
 
-const checkEpisodeAvailability = async (showId: string, seasonNumber: number, episodeNumber: number) => {
-  let customLinks: string[] = [];
-  let isFrembedAvailable = false;
-  let mp4Links: { url: string; label?: string; language?: string; isVip?: boolean }[] = [];
-
-  try {
-    // 1. Vérifier les liens personnalisés via l'API
-    // Cache les résultats pour éviter les appels répétés
-    const cacheKey = `episode_${showId}_s${seasonNumber}_e${episodeNumber}`;
-    const cachedData = sessionStorage.getItem(cacheKey);
-
-    if (cachedData) {
-      const parsed = JSON.parse(cachedData);
-      customLinks = parsed.customLinks || [];
-      mp4Links = parsed.mp4Links || [];
-    } else {
-      try {
-        const response = await axios.get(`${MAIN_API}/api/links/tv/${showId}`, {
-          params: { season: seasonNumber, episode: episodeNumber }
-        });
-
-        if (response.data?.success && Array.isArray(response.data?.data) && response.data.data.length > 0) {
-          const episodeData = response.data.data[0];
-          const rawLinks = episodeData.links || [];
-          console.log('Raw API TV links:', rawLinks);
-
-          const uniqueUrls = new Set<string>();
-
-          rawLinks.forEach((item: any) => {
-            let urlToAdd: string | null = null;
-            let label = '1080p+';
-            let language = 'Français';
-            let isVip = false;
-
-            if (typeof item === 'string') {
-              urlToAdd = item;
-            } else if (typeof item === 'object' && item !== null && typeof item.url === 'string') {
-              urlToAdd = item.url;
-              label = item.label || label;
-              language = item.language || language;
-              isVip = !!item.isVip;
-            }
-
-            if (urlToAdd) {
-              if (urlToAdd.toLowerCase().endsWith('.mp4')) {
-                if (!uniqueUrls.has(urlToAdd)) {
-                  uniqueUrls.add(urlToAdd);
-                  mp4Links.push({ url: urlToAdd, label, language, isVip });
-                }
-              } else if (!customLinks.includes(urlToAdd)) {
-                customLinks.push(urlToAdd);
-              }
-            }
-          });
-
-          sessionStorage.setItem(cacheKey, JSON.stringify({
-            customLinks,
-            mp4Links,
-            timestamp: Date.now()
-          }));
-        }
-      } catch (error) {
-        console.error('Error fetching TV links from API:', error);
-      }
-    }
-
-    // 2. Vérifier la disponibilité sur Frembed via l'API personnalisée, indépendamment des liens custom
-    try {
-      // Utiliser le format d'URL fourni par l'utilisateur
-      const frembedCheckUrl = `${MAIN_API}/tv/check/${showId}?sa=${seasonNumber}&epi=${episodeNumber}`;
-      const frembedResponse = await axios.get(frembedCheckUrl);
-      // La réponse indique la disponibilité si status 200 et totalItems est supérieur à 0 (au lieu de "1")
-      isFrembedAvailable = frembedResponse.data.status === 200 &&
-        (parseInt(frembedResponse.data.result.totalItems) > 0);
-    } catch (frembedError) {
-      console.error('Error checking Frembed API:', frembedError);
-      // Supposer non disponible si la vérification échoue
-      isFrembedAvailable = false;
-    }
-
-    // La disponibilité générale est considérée comme vraie car des lecteurs VO/VOSTFR sont disponibles en fallback.
-    // La fonction retourne l'état réel de frembedAvailable et les liens personnalisés.
-    return {
-      isAvailable: true, // Maintenu à true pour la logique de fallback du composant
-      customLinks: customLinks,
-      frembedAvailable: isFrembedAvailable,
-      mp4Links: mp4Links  // Ajouter les liens MP4
-    };
-
-  } catch (error) {
-    console.error('Error checking episode availability:', error);
-    return {
-      isAvailable: false,
-      customLinks: [],
-      frembedAvailable: false,
-      mp4Links: []
-    };
-  }
-};
-const fetchCustomTVLinks = async (showId: string, seasonNumber: number, episodeNumber: number) => {
-  try {
-    const availability = await checkEpisodeAvailability(showId, seasonNumber, episodeNumber);
-    return {
-      customLinks: availability.customLinks,
-      frembedAvailable: availability.frembedAvailable,
-      isAvailable: availability.isAvailable,
-      mp4Links: availability.mp4Links
-    };
-  } catch (error) {
-    console.error('Error fetching TV custom links:', error);
-    return { customLinks: [], frembedAvailable: false, isAvailable: false, mp4Links: [] };
-  }
-};
-
-const _checkCustomTVLink = async (showId: string, seasonNumber: number, episodeNumber: number) => {
-  return await fetchCustomTVLinks(showId, seasonNumber, episodeNumber);
-};
-void _checkCustomTVLink;
-
-const checkDarkinoAvailability = async (
-  showTitle: string,
-  releaseYear: number,
-  seasonNumber: number,
-  episodeNumber: number,
-  updateRetryMessage?: (message: string) => void // Add callback parameter
-) => {
-  const retryMessages = [
-    "Finalisation de la recherche...",
-    "Préparation de la source alternative...",
-    "Vérification des accès...",
-    "Optimisation de la connexion..."
-  ];
-
-  const attemptDownload = async (matchingShowId: string) => {
-    try {
-      const response = await axios.get(
-        `${MAIN_API}/api/series/download/${matchingShowId}/season/${seasonNumber}/episode/${episodeNumber}`
-      );
-      return response;
-    } catch (downloadError: any) {
-      // Si l'erreur est spécifiquement "Erreur lors de la récupération des liens de téléchargement", on renvoie null pour réessayer
-      if (downloadError.response?.data?.error === "Erreur lors de la récupération des liens de téléchargement") {
-        console.log("Erreur lors de la récupération des liens de téléchargement, on va réessayer...");
-        return null;
-      }
-      // Sinon on relance l'erreur
-      throw downloadError;
-    }
-  };
-
-  try {
-    // Update retry message if callback is provided
-    if (updateRetryMessage) {
-      updateRetryMessage("Recherche d'une source Nightflix...");
-    }
-
-    const searchResponse = await axios.get(
-      `${MAIN_API}/api/search?title=${encodeURIComponent(showTitle)}`
-    )
-
-    if (!searchResponse.data.results) {
-      return { available: false, sources: [] }
-    }
-
-    const matchingShow = searchResponse.data.results.find((result: any) => {
-      if (result.have_streaming !== 1 || !result.is_series) return false
-      const resultYear = new Date(result.release_date).getFullYear()
-      const titleMatches =
-        result.original_title?.toLowerCase() === showTitle.toLowerCase() ||
-        result.name?.toLowerCase() === showTitle.toLowerCase()
-      return titleMatches && resultYear === releaseYear
-    })
-
-    if (!matchingShow) {
-      return { available: false, sources: [] }
-    }
-
-    // Update message before first attempt
-    if (updateRetryMessage) {
-      updateRetryMessage("Source trouvée, récupération du contenu...");
-    }
-
-    // Premier essai
-    let downloadResponse = await attemptDownload(matchingShow.id);
-
-    // Tentatives supplémentaires en cas d'erreur spécifique
-    const maxRetries = 4; // Nombre maximum de tentatives
-    let retryCount = 0;
-
-    while (downloadResponse === null && retryCount < maxRetries) {
-      retryCount++;
-      console.log(`Tentative de réessai ${retryCount}/${maxRetries}`);
-
-      // Update retry message with a random message based on retry count
-      if (updateRetryMessage) {
-        const messageIndex = Math.min(retryCount - 1, retryMessages.length - 1);
-        updateRetryMessage(retryMessages[messageIndex]);
-      }
-
-      // Attendre 3 secondes avant de réessayer
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      downloadResponse = await attemptDownload(matchingShow.id);
-    }
-
-    // Si toujours null après tous les essais, on abandonne
-    if (downloadResponse === null) {
-      console.log(`Échec après ${maxRetries} réessais pour récupérer les liens de téléchargement`);
-      return { available: false, sources: [] };
-    }
-
-    if (downloadResponse.data?.sources) {
-      const sources = downloadResponse.data.sources
-        .filter((source: any) => source.m3u8)
-        .map((source: any) => ({
-          src: source.src || '',
-          m3u8: source.m3u8 || '',
-          language: source.language || '',
-          quality: source.quality || ''
-        }))
-
-      return {
-        available: sources.length > 0,
-        sources,
-        darkinoId: matchingShow.id
-      }
-    }
-
-    return { available: false, sources: [] }
-
-  } catch (error) {
-    console.error('Erreur lors de la vérification Vip:', error)
-    return { available: false, sources: [] }
-  }
-}
-
-// Define a better type for the episode object in seasons to avoid 'any' in the future
-interface TMDBEpisode {
-  name: string;
-  episode_number: number;
-  season_number: number;
-  overview: string;
-  vote_average: number;
-  still_path?: string;
-}
-
-interface VideoPlayerRefHandle {
-  getIframe: () => HTMLIFrameElement | null;
-  getSection: () => HTMLElement | null;
-}
-
-interface VideoPlayerProps {
-  showId: string;
-  seasonNumber: number;
-  episodeNumber: number;
-  tvShowName: string;
-  releaseYear: number;
-  backdropPath: string;
-  seasons?: Record<number, { episodes: TMDBEpisode[] }>;
-  cinemaMode: boolean;
-}
-
-const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId, seasonNumber, episodeNumber, tvShowName, releaseYear, backdropPath, seasons, cinemaMode }, ref) => {
-  const { t } = useTranslation();
-  const [videoSource, setVideoSource] = useState<string | null>(null);
-  const [customSources, setCustomSources] = useState<string[]>([]);
-  const [selectedSource, setSelectedSource] = useState<'primary' | 'peachify' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number | null>(null); // Ajout de 'mp4'
-  const [frembedAvailable, setFrembedAvailable] = useState<boolean>(true);
-  const [, setIsLoading] = useState(true);
-  const [coflixData, setCoflixData] = useState<CoflixResponse | null>(null);
-  const [loadingCoflix, setLoadingCoflix] = useState(true);
-  const [selectedPlayerLink, setSelectedPlayerLink] = useState<number>(0);
-  const [showVostfrOptions, setShowVostfrOptions] = useState(false);
-  const [omegaData, setOmegaData] = useState<OmegaResponse | null>(null);
-  const [loadingOmega, setLoadingOmega] = useState(true);
-  const [selectedOmegaPlayer, setSelectedOmegaPlayer] = useState<number>(0);
-  const [selectedOmegaVersion, setSelectedOmegaVersion] = useState<'vf' | 'vostfr'>('vf');
-
-  // Darkino states (similar to MovieDetails)
-  const [darkinoAvailable, setDarkinoAvailable] = useState(false);
-  const [loadingDarkino, setLoadingDarkino] = useState(true);
-  const [darkinoSources, setDarkinoSources] = useState<any[]>([]);
-  const [selectedDarkinoSource, setSelectedDarkinoSource] = useState<number>(0);
-  const [, setLoadingError] = useState<boolean>(false);
-  const [watchProgress, setWatchProgress] = useState<number>(0);
-
-  // MP4 sources from Firebase
-  const [mp4Sources, setMp4Sources] = useState<{ url: string; label?: string; language?: string; isVip?: boolean }[]>([]);
-  const [selectedMp4Source, setSelectedMp4Source] = useState<number>(0);
-
-  // State for iframe poster logic
-  const [, setShowIframe] = useState(false);
-
-  // Ref for current player type
-  const currentSourceRef = useRef<string>('darkino');
-
-  // Refs replacing document.getElementById/querySelector lookups for player elements
-  const videoPlayerIframeRef = useRef<HTMLIFrameElement | null>(null);
-  const hlsContainerRef = useRef<HTMLDivElement | null>(null);
-  const videoPlayerSectionRef = useRef<HTMLDivElement | null>(null);
-  const hlsPlayerRef = useRef<HLSPlayerRef | null>(null);
-
-  useImperativeHandle(ref, () => ({
-    getIframe: () => videoPlayerIframeRef.current,
-    getSection: () => videoPlayerSectionRef.current,
-  }), []);
-
-  // Add state for M3U8 loading timeout, mirroring MovieDetails.tsx
-  const [m3u8Timeout, setM3u8Timeout] = useState<number>(3000); // Default 3000ms
-
-  // State for the next episode (if applicable)
-  // const [_nextEpisode, _setNextEpisode] = useState<any>(null);
-
-  // Helper function to transform coflix.upn display name to movix
-  const getDisplayName = (quality: string) => {
-    if (!quality) return '';
-
-    let displayName = quality;
-
-    // Replace coflix.upn with movix
-    if (displayName.includes('coflix.upn')) {
-      displayName = displayName.replace('coflix.upn', 'movix');
-    }
-
-    // Format "PAS DE PUBLICITE" to title case
-    if (displayName.includes('PAS DE PUBLICITE')) {
-      // Split the string, keeping the parts before and after "PAS DE PUBLICITE"
-      const [mainPart, pubPart] = displayName.split('PAS DE PUBLICITE').map(part => part.trim());
-
-      // Format the "PAS DE PUBLICITE" text to title case
-      const formattedPubText = 'Pas De Publicite';
-
-      // Recombine with proper spacing
-      displayName = mainPart;
-      if (pubPart) {
-        displayName += ` ${formattedPubText} ${pubPart}`;
-      } else {
-        displayName += ` ${formattedPubText}`;
-      }
-
-      // Trim any extra spaces
-      displayName = displayName.trim();
-    }
-
-    return displayName;
-  };
-
-  const saveCurrentPosition = () => {
-    if (currentSourceRef.current === 'darkino') {
-      const videoElement = hlsPlayerRef.current?.getVideoElement();
-      if (videoElement && videoElement.currentTime > 0 && videoElement.duration > 0 && !isNaN(videoElement.duration)) {
-        setWatchProgress(videoElement.currentTime);
-      }
-    }
-  };
-
-  // Function to try the next Darkino source
-  const tryNextDarkinoSource = async () => {
-    if (selectedDarkinoSource < darkinoSources.length - 1) {
-      setLoadingError(false);
-      setSelectedDarkinoSource(prev => prev + 1);
-      return true;
-    }
-    setLoadingError(true);
-    return false;
-  };
-
-  // Function to handle errors with the HLS player
-  const handleHlsError = async () => {
-    console.log('HLS error occurred, trying next source');
-    saveCurrentPosition(); // Save position BEFORE trying next source
-    await tryNextDarkinoSource();
-  };
-
-  // Progress saving functionality removed
-
-  // Restore watch progress for HLS player
-  useEffect(() => {
-    if (selectedSource === 'darkino' && darkinoSources.length > 0) {
-      const timeoutId = setTimeout(() => {
-        const videoElement = hlsPlayerRef.current?.getVideoElement();
-        if (videoElement && watchProgress > 0 && videoElement.readyState >= videoElement.HAVE_METADATA) {
-          if (Math.abs(videoElement.currentTime - watchProgress) > 1) {
-            console.log(`Restoring progress to ${watchProgress} from current ${videoElement.currentTime}`);
-            videoElement.currentTime = watchProgress;
-          } else {
-            console.log(`Progress ${videoElement.currentTime} already close to saved ${watchProgress}, not setting.`);
-          }
-        } else if (videoElement && watchProgress > 0) {
-          const handleLoadedMetadata = () => {
-            if (Math.abs(videoElement.currentTime - watchProgress) > 1) {
-              console.log(`Restoring progress to ${watchProgress} on loadedmetadata`);
-              videoElement.currentTime = watchProgress;
-            }
-            videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
-          };
-          videoElement.addEventListener('loadedmetadata', handleLoadedMetadata);
-        }
-      }, 500);
-
-      return () => clearTimeout(timeoutId);
-    }
-  }, [selectedDarkinoSource, watchProgress, selectedSource, darkinoSources]);
-
-  // Add a timeout to check if m3u8 is loading properly
-  useEffect(() => {
-    if (selectedSource === 'darkino' && darkinoSources.length > 0) {
-      const loadingTimeoutId = setTimeout(() => {
-        // Check if video is playing or if it has loaded metadata
-        const videoElement = hlsPlayerRef.current?.getVideoElement();
-        if (videoElement) {
-          // If video hasn't started loading within 10 seconds, try next source
-          if (videoElement.readyState < videoElement.HAVE_METADATA) {
-            console.log('M3u8 loading timeout after 10 seconds, trying next source');
-            handleHlsError();
-          }
-        }
-      }, 3000); // <-- changé de 5000 à 10000
-
-      return () => clearTimeout(loadingTimeoutId);
-    }
-  }, [selectedDarkinoSource, selectedSource, darkinoSources]);
-
-  // Fetch video sources effect
-  useEffect(() => {
-    let isCurrent = true; // flag pour annuler la mise à jour d'état si l'épisode change
-    const maxRetries = 3;
-
-    const fetchVideoSources = async (retry = 0) => {
-      setIsLoading(true);
-      if (retry > 0) {
-        console.log(`Retrying source fetch (attempt ${retry}/${maxRetries})...`);
-      }
-
-      setVideoSource(null);
-      setCustomSources([]);
-      setCoflixData(null);
-      setOmegaData(null);
-      setFrembedAvailable(false);
-      setDarkinoAvailable(false);
-      setDarkinoSources([]);
-      setLoadingDarkino(true);
-      setLoadingCoflix(true);
-      setLoadingOmega(true);
-      setLoadingError(false);
-      setSelectedDarkinoSource(0); // Reset selected darkino source
-      setVipRetryMessage(null); // Reset VIP retry message
-
-      // Progress loading functionality removed
-      setWatchProgress(0); // Reset progress
-
-      try {
-        // Launch all requests in parallel
-        const [darkinoResult, availabilityCheck, coflixResponse, omegaResponse] = await Promise.allSettled([
-          checkDarkinoAvailability(tvShowName, releaseYear, seasonNumber, episodeNumber, updateVipRetryMessage),
-          checkEpisodeAvailability(showId, seasonNumber, episodeNumber),
-          axios.get(`${MAIN_API}/api/tmdb/tv/${showId}?season=${seasonNumber}&episode=${episodeNumber}`),
-          axios.get(`${MAIN_API}/api/imdb/tv/${showId}`)
-        ]);
-
-        if (!isCurrent) return; // Ne pas mettre à jour l'état si ce n'est plus l'épisode courant
-
-        let fetchedCustomLinks: string[] = [];
-        let fetchedFrembedAvailable = false;
-        let fetchedCoflixData: CoflixResponse | null = null;
-        let fetchedOmegaData: OmegaResponse | null = null;
-        let fetchedDarkinoAvailable = false;
-        let fetchedDarkinoSources: any[] = [];
-        let fetchedMp4Sources: { url: string; label?: string; language?: string }[] = [];
-
-        // Process Darkino result
-        if (darkinoResult.status === 'fulfilled' && darkinoResult.value.available) {
-          fetchedDarkinoAvailable = true;
-          fetchedDarkinoSources = darkinoResult.value.sources;
-          setDarkinoAvailable(true);
-          setDarkinoSources(fetchedDarkinoSources);
-          console.log("Vip sources found:", fetchedDarkinoSources);
-        } else if (darkinoResult.status === 'rejected') {
-          console.error('Error checking Darkino availability:', darkinoResult.reason);
-        } else {
-          console.log("Vip sources not available or fetch failed.");
-        }
-        setLoadingDarkino(false);
-
-        // Process other results (as before)
-        if (availabilityCheck.status === 'fulfilled') {
-          fetchedCustomLinks = availabilityCheck.value.customLinks;
-          fetchedFrembedAvailable = availabilityCheck.value.frembedAvailable;
-          fetchedMp4Sources = availabilityCheck.value.mp4Links || [];
-          setCustomSources(fetchedCustomLinks);
-          setFrembedAvailable(fetchedFrembedAvailable);
-          setMp4Sources(fetchedMp4Sources);
-        } else {
-          console.error('Error checking availability:', availabilityCheck.reason);
-        }
-
-        if (coflixResponse.status === 'fulfilled' && coflixResponse.value.data && coflixResponse.value.data.current_episode?.player_links) {
-          fetchedCoflixData = coflixResponse.value.data;
-          setCoflixData(fetchedCoflixData);
-        } else if (coflixResponse.status === 'rejected') {
-          console.error('Error fetching Coflix sources:', coflixResponse.reason);
-        }
-        setLoadingCoflix(false);
-
-        if (omegaResponse.status === 'fulfilled' && omegaResponse.value.data) {
-          fetchedOmegaData = omegaResponse.value.data;
-          setOmegaData(fetchedOmegaData);
-        } else if (omegaResponse.status === 'rejected') {
-          console.error('Error fetching Omega sources:', omegaResponse.reason);
-        }
-        setLoadingOmega(false);
-
-        // Check if any players were found
-        const hasPlayers =
-          fetchedDarkinoAvailable ||
-          fetchedFrembedAvailable ||
-          fetchedMp4Sources.length > 0 ||
-          ((fetchedCoflixData?.current_episode?.player_links?.length ?? 0) > 0) ||
-          (fetchedOmegaData?.series?.some(s => {
-            const series = s.tmdb_data?.id === Number(showId);
-            const season = s.seasons?.some(s => s.number === seasonNumber);
-            const episode = s.seasons?.some(s =>
-              s.number === seasonNumber &&
-              s.episodes?.some(e =>
-                e.number === episodeNumber.toString() &&
-                ((e.versions?.vf?.players?.length ?? 0) > 0 || (e.versions?.vostfr?.players?.length ?? 0) > 0)
-              )
-            );
-            return series && season && episode;
-          })) ||
-          fetchedCustomLinks.length > 0;
-
-        // If no players found and retries remaining, try again
-        if (!hasPlayers && retry < maxRetries) {
-          if (isCurrent) {
-            console.log(`No players found, retrying in ${(retry + 1) * 1000}ms...`);
-            setTimeout(() => {
-              if (isCurrent) {
-                fetchVideoSources(retry + 1);
-              }
-            }, (retry + 1) * 1000);
-            return;
-          }
-        }
-
-        // Supprimez tout le code ici qui définit automatiquement selectedSource
-
-      } catch (error) {
-        if (!isCurrent) return;
-        console.error('Error fetching video sources globally:', error);
-
-        // Try again if we have retries left
-        if (retry < maxRetries) {
-          console.log(`Error fetching sources, retrying in ${(retry + 1) * 1000}ms...`);
-          setTimeout(() => {
-            if (isCurrent) {
-              fetchVideoSources(retry + 1);
-            }
-          }, (retry + 1) * 1000);
-          return;
-        }
-
-        // Si toutes les tentatives échouent, définir juste les états sans définir selectedSource
-        setFrembedAvailable(false);
-        setLoadingDarkino(false);
-        setLoadingCoflix(false);
-        setLoadingOmega(false);
-      } finally {
-        if (!isCurrent) return;
-        setIsLoading(false);
-      }
-    };
-    // Reset showIframe when episode changes
-    setShowIframe(false);
-    fetchVideoSources(0);
-    return () => {
-      isCurrent = false;
-    };
-  }, [showId, seasonNumber, episodeNumber, tvShowName, releaseYear]); // Dependencies for fetching sources
-
-  // Update iframe video source based on selection (excluding darkino and mp4)
-  useEffect(() => {
-    let newSrc: string | null = null;
-    if (selectedSource === 'darkino' || selectedSource === 'mp4') {
-      // Handled by HLSPlayer component
-      return;
-    }
-    switch (selectedSource as 'primary' | 'peachify' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number) {
-      case 'primary':
-        newSrc = `${getFrembedBase()}/api/serie.php?id=${showId}&sa=${seasonNumber}&epi=${episodeNumber}`;
-        break;
-      case 'peachify':
-        newSrc = `https://peachify.top/embed/tv/${showId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
-        break;
-      case 'vostfr':
-        newSrc = `https://vidsrc.wtf/api/3/tv/?id=${showId}&s=${seasonNumber}&e=${episodeNumber}`;
-        break;
-      case 'videasy':
-        newSrc = `https://vidlink.pro/tv/${showId}?s=${seasonNumber}&e=${episodeNumber}&primaryColor=0278fd&secondaryColor=a2a2a2&iconColor=eefdec&icons=default&player=default&title=true&poster=true&autoplay=true&nextbutton=false`;
-        break;
-      case 'vidsrccc':
-        newSrc = `https://vidsrc.io/embed/tv?tmdb=${showId}&season=${seasonNumber}&episode=${episodeNumber}`;
-        break;
-      case 'vidsrcsu':
-        newSrc = `https://vidsrc.su/embed/tv/${showId}/${seasonNumber}/${episodeNumber}`;
-        break;
-      case 'vidsrcwtf1':
-        newSrc = `https://vidsrc.wtf/api/1/tv/?id=${showId}&s=${seasonNumber}&e=${episodeNumber}`;
-        break;
-      case 'vidsrcwtf5':
-        newSrc = `https://vidsrc.wtf/api/5/tv/?id=${showId}&s=${seasonNumber}&e=${episodeNumber}`;
-        break;
-      case 'multi':
-        if (coflixData?.current_episode?.player_links &&
-          coflixData.current_episode.player_links.length > selectedPlayerLink) {
-          newSrc = coflixData.current_episode.player_links[selectedPlayerLink].decoded_url;
-        } else {
-          newSrc = coflixData?.current_episode?.iframe_src || "";
-        }
-        break;
-      case 'omega':
-        const currentSeries = omegaData?.series?.find(s => s.tmdb_data && s.tmdb_data.id === Number(showId));
-        const season = currentSeries?.seasons?.find(s => s.number === seasonNumber);
-        const episode = season?.episodes?.find(e => e.number === episodeNumber.toString());
-
-        // Get prioritized player links
-        if (episode?.versions?.[selectedOmegaVersion]?.players) {
-          const prioritizedPlayers = episode.versions[selectedOmegaVersion].players;
-          // If we have player links after filtering, use the selected one or default to first
-          if (prioritizedPlayers.length > 0) {
-            const playerIndex = selectedOmegaPlayer < prioritizedPlayers.length ? selectedOmegaPlayer : 0;
-            newSrc = prioritizedPlayers[playerIndex].link || "";
-          } else {
-            newSrc = "";
-          }
-        } else {
-          newSrc = "";
-        }
-        break;
-      case 'darkino':
-        break;
-      case 'mp4':
-        newSrc = mp4Sources[selectedMp4Source]?.url || "";
-        break;
-      default:
-        if (typeof selectedSource === 'number' && customSources[selectedSource]) {
-          newSrc = customSources[selectedSource];
-        }
-    }
-
-    if (newSrc !== null) {
-      setVideoSource(newSrc);
-      scrollToPlayerRef(); // Changed from scrollToPlayer to scrollToPlayerRef
-    }
-  }, [selectedSource, selectedPlayerLink, selectedOmegaPlayer, selectedOmegaVersion, showId, seasonNumber, episodeNumber, coflixData, omegaData, customSources, tvShowName, releaseYear, mp4Sources, selectedMp4Source]);
-
-  // Helper to scroll to the player from anywhere in the component
-  const scrollToPlayerRef = () => {
-    // Use a small delay to ensure DOM has updated
-    setTimeout(() => {
-      const playerElement = videoPlayerIframeRef.current || hlsContainerRef.current;
-      if (playerElement) {
-        playerElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 100);
-  };
-
-  // M3U8 timeout localStorage functionality removed
-
-  // Update the timeout useEffect to use the state variable
-  useEffect(() => {
-    if (selectedSource === 'darkino' && darkinoSources.length > 0) {
-      const loadingTimeoutId = setTimeout(() => {
-        const videoElement = hlsPlayerRef.current?.getVideoElement();
-        if (videoElement) {
-          if (videoElement.readyState < videoElement.HAVE_METADATA) {
-            console.log(`M3u8 loading timeout after ${m3u8Timeout}ms, trying next source`);
-            handleHlsError();
-          }
-        }
-      }, m3u8Timeout); // Use state variable here
-
-      return () => clearTimeout(loadingTimeoutId);
-    }
-  }, [selectedDarkinoSource, selectedSource, darkinoSources, m3u8Timeout]); // Add m3u8Timeout dependency
-
-  // Add VIP retry message state
-  const [vipRetryMessage, setVipRetryMessage] = useState<string | null>(null);
-
-  // Add useAdFreePopup hook
-  const {
-    showAdFreePopup,
-    adType,
-    playerToShow: _playerToShow,
-    shouldLoadIframe,
-    isSpecialPlayer: _isSpecialPlayer,
-    is_vip,
-    showPopupForPlayer,
-    handlePopupClose,
-    handlePopupAccept,
-    resetVipStatus
-  } = useAdFreePopup();
-
-  // Add a ref to track the requested source for VIP players
-  const requestedSourceRef = useRef<typeof selectedSource | null>(null);
-
-  // Function to update the VIP retry message
-  const updateVipRetryMessage = (message: string) => {
-    setVipRetryMessage(message);
-  };
-
-  // Reset retry message when loading state changes
-  useEffect(() => {
-    if (!loadingDarkino) {
-      setVipRetryMessage(null);
-    }
-  }, [loadingDarkino]);
-
-  // Reset VIP status when the show or episode changes
-  useEffect(() => {
-    resetVipStatus();
-  }, [showId, seasonNumber, episodeNumber, resetVipStatus]);
-
-  // Helper to determine if a source is VIP
-  const isVipSource = (src: typeof selectedSource) => {
-    return src === 'darkino' || src === 'mp4';
-  };
-
-  // Modify the source selection to use VIP popup when needed
-  useEffect(() => {
-    if (!showAdFreePopup && shouldLoadIframe && requestedSourceRef.current !== null) {
-      setSelectedSource(requestedSourceRef.current);
-      setShowVostfrOptions(false);
-      scrollToPlayerRef();
-      requestedSourceRef.current = null;
-    }
-  }, [showAdFreePopup, shouldLoadIframe]);
-
-  // Define handleSelectSource function after all the existing useEffects
-  const handleSelectSource = (src: typeof selectedSource) => {
-    // Si un lecteur est déjà sélectionné, changer directement sans popup
-    if (selectedSource !== null) {
-      setSelectedSource(src);
-      setShowVostfrOptions(false);
-      scrollToPlayerRef();
-      return;
-    }
-
-    // Show popup only for first player selection
-    requestedSourceRef.current = src;
-
-    // Prepare additional info for the showPopupForPlayer function
-    const additionalInfo = {
-      coflixData: {
-        player_links: coflixData?.current_episode?.player_links || []
-      },
-      omegaData: {
-        player_links: (() => {
-          const currentSeries = omegaData?.series?.find(s => s.tmdb_data?.id === Number(showId));
-          const season = currentSeries?.seasons?.find(s => s.number === seasonNumber);
-          const episode = season?.episodes?.find(e => e.number === episodeNumber.toString());
-          if (!episode?.versions?.[selectedOmegaVersion]?.players) return [];
-          return episode.versions[selectedOmegaVersion].players.map(p => ({
-            player: p.name,
-            link: p.link
-          }));
-        })()
-      }
-    };
-
-    showPopupForPlayer(
-      typeof src === 'string' ? src : 'custom',
-      additionalInfo
-    );
-    return;
-  };
-  return (
-    <div ref={videoPlayerSectionRef} className="space-y-4" id="video-player-section">
-      <div className="bg-blue-900/30 border border-blue-600 p-4 rounded-lg mb-4">
-        <p className="text-blue-200 text-sm font-medium">
-          <span className="font-bold">{t('details.choosePlayer')}</span> {t('details.playerOptionsBelow')}
-          {darkinoAvailable && darkinoSources.length > 0 ?
-            <span className="text-green-400 font-bold"> {t('details.nightflixRecommended')}</span> :
-            <span>{t('details.tryDifferentPlayers')}</span>
-          }
-        </p>
-      </div>
-
-      {!frembedAvailable &&
-        !(darkinoAvailable && darkinoSources.length > 0) &&
-        !(coflixData && coflixData.current_episode && coflixData.current_episode.player_links && coflixData.current_episode.player_links.length > 0) &&
-        !(omegaData && omegaData.series && omegaData.series.length > 0 &&
-          omegaData.series.some(s => {
-            if (!s.tmdb_data || s.tmdb_data.id !== Number(showId)) return false;
-            const season = s.seasons?.find(season => season.number === seasonNumber);
-            const episode = season?.episodes?.find(ep => ep.number === episodeNumber.toString());
-            return !!episode?.versions;
-          })
-        ) &&
-        !loadingDarkino && !loadingCoflix && !loadingOmega && (
-          <div className="bg-yellow-800/30 border border-yellow-600 p-4 rounded-lg mb-6">
-            <p className="text-yellow-200 text-sm">
-              {t('details.episodeNotOnMainSource')}
-              {!cinemaMode && ` ${t('details.cinemaModeTip')}`}
-              {t('details.contactDiscord')}
-            </p>
-          </div>
-        )}
-
-      <div className="flex justify-center gap-4 mb-4 flex-wrap">
-        {frembedAvailable && (
-          <button
-            onClick={() => handleSelectSource('primary')}
-            className={`px-4 py-2 rounded ${selectedSource === 'primary'
-              ? 'bg-red-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600'
-              }`}
-          >
-            {t('details.playerVF')}
-          </button>
-        )}
-
-        <div className="relative">
-          <button
-            onClick={() => setShowVostfrOptions(!showVostfrOptions)}
-            className={`px-4 py-2 rounded flex items-center gap-2 ${(selectedSource === 'peachify' || selectedSource === 'vostfr' || selectedSource === 'videasy' || selectedSource === 'vidsrccc' || selectedSource === 'vidsrcsu' || selectedSource === 'vidsrcwtf1' || selectedSource === 'vidsrcwtf5')
-              ? 'bg-red-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600'
-              }`}
-          >
-            {t('details.playersVOSTFR')}
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              className={`w-4 h-4 transition-transform ${showVostfrOptions ? 'rotate-180' : ''}`}
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-
-          {showVostfrOptions && (
-            <div className="absolute z-50 top-full left-0 mt-1 bg-gray-800 rounded-lg shadow-lg overflow-hidden min-w-[200px]">
-              <button
-                onClick={() => handleSelectSource('peachify')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'peachify'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Peachify
-              </button>
-
-              <button
-                onClick={() => handleSelectSource('vostfr')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'vostfr'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Vidsrc.wtf 3
-              </button>
-
-              <button
-                onClick={() => handleSelectSource('videasy')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'videasy'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Vidlink
-              </button>
-
-              <button
-                onClick={() => handleSelectSource('vidsrccc')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrccc'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Vidsrc.io
-              </button>
-
-              <button
-                onClick={() => handleSelectSource('vidsrcsu')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcsu'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Vidsrc.su
-              </button>
-
-              <button
-                onClick={() => handleSelectSource('vidsrcwtf1')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf1'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Vidsrc.wtf 1
-              </button>
-
-              <button
-                onClick={() => handleSelectSource('vidsrcwtf5')}
-                className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf5'
-                  ? 'bg-red-600/70 text-white'
-                  : 'hover:bg-gray-700'
-                  }`}
-              >
-                Vidsrc.wtf 5
-              </button>
-            </div>
-          )}
-        </div>
-
-        <button
-          onClick={() => handleSelectSource('multi')}
-          disabled={loadingCoflix || !(coflixData && coflixData.current_episode && coflixData.current_episode.player_links && coflixData.current_episode.player_links.length > 0)}
-          className={`px-4 py-2 rounded flex items-center gap-2 ${selectedSource === 'multi'
-            ? 'bg-blue-600 text-white'
-            : loadingCoflix
-              ? 'bg-blue-700/50 text-white cursor-not-allowed'
-              : (coflixData && coflixData.current_episode && coflixData.current_episode.player_links && coflixData.current_episode.player_links.length > 0)
-                ? 'bg-blue-700/70 hover:bg-blue-600/90 text-white'
-                : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
-            }`}
-        >
-          {loadingCoflix ? (
-            <>
-              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              {t('details.playerMulti')}
-            </>
-          ) : (
-            <>{t('details.playerMulti')}</>
-          )}
-        </button>
-
-        <button
-          onClick={() => handleSelectSource('omega')}
-          disabled={loadingOmega || !(omegaData && omegaData.series && omegaData.series.length > 0 &&
-            omegaData.series.some(s => {
-              if (!s.tmdb_data || s.tmdb_data.id !== Number(showId)) return false;
-              const season = s.seasons?.find(season => season.number === seasonNumber);
-              const episode = season?.episodes?.find(ep => ep.number === episodeNumber.toString());
-              return !!episode?.versions;
-            })
-          )}
-          className={`px-4 py-2 rounded flex items-center gap-2 ${selectedSource === 'omega'
-            ? 'bg-purple-600 text-white'
-            : loadingOmega
-              ? 'bg-purple-700/50 text-white cursor-not-allowed'
-              : (omegaData && omegaData.series && omegaData.series.length > 0 &&
-                omegaData.series.some(s => {
-                  if (!s.tmdb_data || s.tmdb_data.id !== Number(showId)) return false;
-                  const season = s.seasons?.find(season => season.number === seasonNumber);
-                  const episode = season?.episodes?.find(ep => ep.number === episodeNumber.toString());
-                  return !!episode?.versions;
-                })
-              )
-                ? 'bg-purple-700/70 hover:bg-purple-600/90 text-white'
-                : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
-            }`}
-        >
-          {loadingOmega ? (
-            <>
-              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              {t('details.playerOmega')}
-            </>
-          ) : (
-            <div className="flex items-center gap-2">
-              {t('details.playerOmega')}
-              <span className="text-xs bg-green-600 text-white px-1 py-0.5 rounded flex items-center gap-1">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3">
-                  <path fillRule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clipRule="evenodd" />
-                </svg>
-                {t('details.noAds')}
-              </span>
-            </div>
-          )}
-        </button>
-
-        {/* Darkino/VIP Button - Update to use handleSelectSource */}
-        <button
-          onClick={() => handleSelectSource('darkino')}
-          disabled={loadingDarkino || !(darkinoAvailable && darkinoSources.length > 0)}
-          className={`px-4 py-2 rounded flex items-center gap-2 ${selectedSource === 'darkino'
-            ? 'bg-orange-600 text-white'
-            : loadingDarkino
-              ? 'bg-orange-700/50 text-white cursor-not-allowed'
-              : (darkinoAvailable && darkinoSources.length > 0)
-                ? 'bg-orange-700/70 hover:bg-orange-600/90 text-white'
-                : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
-            }`}
-        >
-          {loadingDarkino ? (
-            <>
-              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              {vipRetryMessage || t('details.playerNightflix')}
-            </>
-          ) : (
-            <>{t('details.playerNightflix')}</>
-          )}
-        </button>
-
-        {customSources.map((src, index) => {
-          const srcLower = src.toLowerCase();
-          const isSeek = srcLower.includes('embedseek.') || srcLower.includes('seekplayer.') || srcLower.includes('seeks.cloud') || srcLower.includes('seekplays.');
-          return (
-          <button
-            key={index}
-            onClick={() => handleSelectSource(index)}
-            className={`px-4 py-2 rounded ${selectedSource === index
-              ? 'bg-red-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600'
-              }`}
-          >
-            {isSeek ? `SeekStreaming ${index + 1}` : t('details.playerNumber', { number: frembedAvailable ? index + 3 : index + 2 })}
-          </button>
-          );
-        })}
-      </div>
-
-      {/* ... existing multi, omega, darkino source selection UI ... */}
-
-      {selectedSource === 'multi' && coflixData && coflixData.current_episode && coflixData.current_episode.player_links && coflixData.current_episode.player_links.length > 0 && (
-        <div className="mb-4 bg-gray-900 p-4 rounded-lg max-w-7xl mx-auto">
-          <h3 className="text-lg font-medium mb-3">{t('details.sourcesAvailable')}</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-            {coflixData.current_episode.player_links.map((link, index) => (
-              <button
-                key={index}
-                onClick={() => {
-                  setSelectedPlayerLink(index);
-                  // Scroll géré par useEffect
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedPlayerLink === index
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium">{getDisplayName(link.quality)}</div>
-                <div className="text-xs opacity-75">{link.language}</div>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {selectedSource === 'omega' && omegaData && omegaData.series && omegaData.series.length > 0 && (
-        <div className="mb-4 bg-gray-900 p-4 rounded-lg max-w-7xl mx-auto">
-          <h3 className="text-lg font-medium mb-3">{t('details.sourcesOmega')}</h3>
-          {(() => {
-            // Find the series that matches the current show
-            const currentSeries = omegaData.series.find(s => s.tmdb_data && s.tmdb_data.id === Number(showId));
-            // Find the season with the matching number
-            const season = currentSeries?.seasons?.find(s => s.number === seasonNumber);
-            // Find the episode with the matching number
-            const episode = season?.episodes?.find(e => e.number === episodeNumber.toString());
-
-            if (!episode?.versions) {
-              return (
-                <div className="text-yellow-400 p-3 bg-yellow-900/30 rounded-lg">
-                  {t('details.episodeNotInOmega')}
-                </div>
-              );
-            }
-
-            return (
-              <>
-                <div className="flex gap-4 mb-4">
-                  {episode.versions.vf && (
-                    <button
-                      onClick={() => {
-                        setSelectedOmegaVersion('vf');
-                        setSelectedOmegaPlayer(0); // Reset player selection when changing version
-                      }}
-                      className={`px-4 py-2 rounded ${selectedOmegaVersion === 'vf'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-800 hover:bg-gray-700'
-                        }`}
-                    >
-                      {t('details.versionFrancaise')}
-                    </button>
-                  )}
-                  {episode.versions.vostfr && (
-                    <button
-                      onClick={() => {
-                        setSelectedOmegaVersion('vostfr');
-                        setSelectedOmegaPlayer(0); // Reset player selection when changing version
-                      }}
-                      className={`px-4 py-2 rounded ${selectedOmegaVersion === 'vostfr'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-800 hover:bg-gray-700'
-                        }`}
-                    >
-                      {t('details.versionOriginale')}
-                    </button>
-                  )}
-                </div>
-
-                {episode.versions[selectedOmegaVersion] && (() => {
-                  // Get prioritized and filtered player links
-                  const prioritizedPlayers = episode.versions[selectedOmegaVersion].players;
-
-                  if (prioritizedPlayers.length === 0) {
-                    return (
-                      <div className="text-yellow-400 p-3 bg-yellow-900/30 rounded-lg">
-                        {t('details.noPlayerForVersion')}
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-                      {prioritizedPlayers.map((player, index) => (
-                        <button
-                          key={index}
-                          onClick={() => {
-                            setSelectedOmegaPlayer(index);
-                          }}
-                          className={`px-4 py-2 rounded text-left ${selectedOmegaPlayer === index
-                            ? 'bg-purple-600 text-white'
-                            : 'bg-gray-800 hover:bg-gray-700'
-                            }`}
-                        >
-                          <div className="font-medium">
-                            {player.name}
-                            {(player.name.toLowerCase() === "supervideo" || player.name.toLowerCase() === "dropload") &&
-                              <span className="ml-2 text-xs bg-green-600 text-white px-1 py-0.5 rounded">{t('details.noAds')}</span>
-                            }
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  );
-                })()}
-              </>
-            );
-          })()}
-        </div>
-      )}
-
-      {/* VIP Source List */}
-      {(selectedSource === 'darkino' || selectedSource === 'mp4') && (darkinoAvailable || mp4Sources.length > 0) && (
-        <div className="mb-4 bg-gray-900 p-4 rounded-lg max-w-7xl mx-auto">
-          <h3 className="text-lg font-medium mb-3">{t('details.sourcesNightflix')}</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-            {/* MP4 Sources */}
-            {mp4Sources.map((source, index) => (
-              <button
-                key={`mp4-source-${index}`}
-                onClick={() => {
-                  saveCurrentPosition(); // Save before changing source
-                  setSelectedSource('mp4');
-                  setSelectedMp4Source(index);
-                  setLoadingError(false); // Reset error when manually selecting
-                  scrollToPlayerRef();
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedSource === 'mp4' && selectedMp4Source === index
-                  ? 'bg-orange-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium flex items-center justify-between">
-                    <span>{t('details.sourceMp4', { number: index + 1 })}</span>
-                </div>
-                <div className="text-xs opacity-75 flex items-center">
-                  <span className="text-green-400 font-semibold">{source.label}</span>
-                  <span className="mx-1">•</span>
-                  <span>{source.language || t('details.langFrench')}</span>
-                </div>
-              </button>
-            ))}
-
-            {/* Darkino Sources */}
-            {darkinoSources.map((source, index) => (
-              <button
-                key={`vip-source-${index}`}
-                onClick={() => {
-                  saveCurrentPosition(); // Save before changing source within VIP
-                  setSelectedSource('darkino');
-                  setSelectedDarkinoSource(index);
-                  setLoadingError(false); // Reset error when manually selecting
-                  scrollToPlayerRef(); // Changed from scrollToPlayer to scrollToPlayerRef
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedSource === 'darkino' && selectedDarkinoSource === index
-                  ? 'bg-orange-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium">{source.label || source.quality || t('details.sourceLabel', { number: index + 1 })}</div>
-                <div className="text-xs opacity-75">{source.language || t('details.langFrench')} - {t('details.m3u8Label')}</div>
-              </button>
-            ))}
-          </div>
-
-          {/* On ne gère plus loadingError ici car il n'y a plus d'essai automatique */}
-
-          {/* Add M3U8 Timeout Control Section Here */}
-          <div className="mt-4 pt-4 border-t border-gray-700">
-            <label htmlFor="m3u8TimeoutInputTV" className="block text-sm font-medium text-gray-300 mb-2">
-              {t('details.timeoutNightflix')}
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="range"
-                id="m3u8TimeoutInputTV"
-                min="500"
-                max="10000"
-                step="500"
-                value={m3u8Timeout}
-                onChange={(e) => setM3u8Timeout(parseInt(e.target.value, 10))}
-                className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
-              />
-              <span className="text-sm text-gray-400 font-mono bg-gray-800 px-2 py-1 rounded">
-                {m3u8Timeout}ms
-              </span>
-              <button
-                onClick={() => setM3u8Timeout(3000)} // Reset to default
-                className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded"
-              >
-                {t('common.reset')}
-              </button>
-            </div>
-            <p className="text-xs text-gray-500 mt-1">
-              {t('details.timeoutDescription')}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Add the AdFreePopup component */}
-      {showAdFreePopup && (
-        <AdFreePlayerAds
-          onClose={handlePopupClose}
-          onAccept={handlePopupAccept}
-          adType={adType}
-        />
-      )}
-
-      {/* Display warning message when VIP needed but popup not shown */}
-      {isVipSource(selectedSource) && !shouldLoadIframe && !is_vip && !showAdFreePopup && (
-        <div className="relative w-full h-[calc(100vh-180px)] mb-32 pb-20 max-w-7xl mx-auto rounded-lg overflow-hidden bg-black flex items-center justify-center">
-          <div className="bg-gray-900 p-6 rounded-lg text-center max-w-md">
-            <div className="text-yellow-400 text-5xl mb-4">⚠️</div>
-            <h3 className="text-xl font-bold mb-2 text-white">{t('details.playbackUnavailable')}</h3>
-            <p className="text-gray-300 mb-4">
-              {t('details.adRequired')}
-            </p>
-            <button
-              onClick={() => {
-                if (selectedSource) {
-                  handleSelectSource(selectedSource);
-                }
-              }}
-              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
-            >
-              {t('details.viewAdForContent')}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Player Rendering Area - Only show if not a VIP source that needs ad view */}
-      {(shouldLoadIframe || !isVipSource(selectedSource) || is_vip) && (
-        selectedSource === 'darkino' ? (
-          // HLS Player (VIP M3U8)
-          <div ref={hlsContainerRef} className="relative w-full h-[calc(100vh-180px)] mb-32 pb-20 max-w-7xl mx-auto rounded-lg overflow-hidden bg-black">
-            <HLSPlayer
-              ref={hlsPlayerRef}
-              key={`darkino-${selectedDarkinoSource}-${showId}-${seasonNumber}-${episodeNumber}`}
-              src={darkinoSources[selectedDarkinoSource]?.m3u8 || ""}
-              className="w-full h-full rounded-lg"
-              autoPlay={true}
-              onEnded={() => {
-                // On ne tente plus la source suivante automatiquement, on passe juste à l'épisode suivant si besoin
-                const nextEpisodeNum = episodeNumber + 1;
-                const event = new CustomEvent('movix:playNextEpisode', {
-                  detail: {
-                    currentSeason: seasonNumber,
-                    currentEpisode: episodeNumber,
-                    nextSeason: seasonNumber,
-                    nextEpisode: nextEpisodeNum
-                  }
-                });
-                document.dispatchEvent(event);
-              }}
-              onError={handleHlsError}
-              poster={backdropPath ? `https://image.tmdb.org/t/p/w1280${backdropPath}` : undefined}
-              tvShowId={showId}
-              seasonNumber={seasonNumber}
-              episodeNumber={episodeNumber}
-              tvShow={{
-                name: tvShowName,
-                backdrop_path: backdropPath || undefined
-              }}
-              nextEpisode={(() => {
-                if (!seasons) return null;
-                const currentSeason = seasons[seasonNumber];
-                const nextSeason = seasons[seasonNumber + 1];
-                let targetSeasonNumber = seasonNumber;
-                let targetEpisodeNumber = episodeNumber + 1;
-                let nextEpisodeData = null;
-
-                // Check if the next episode exists in the current season
-                if (currentSeason?.episodes?.find(e => e.episode_number === targetEpisodeNumber)) {
-                  nextEpisodeData = currentSeason.episodes.find(e => e.episode_number === targetEpisodeNumber);
-                }
-                // If not, check if the next season exists and has episodes
-                else if (nextSeason?.episodes && nextSeason.episodes.length > 0) {
-                  targetSeasonNumber = seasonNumber + 1;
-                  targetEpisodeNumber = 1;
-                  nextEpisodeData = nextSeason.episodes[0]; // Get the first episode of the next season
-                }
-                // Otherwise, there's no next episode
-                else {
-                  return null;
-                }
-
-                return {
-                  seasonNumber: targetSeasonNumber,
-                  episodeNumber: targetEpisodeNumber,
-                  name: nextEpisodeData?.name || `Épisode ${targetEpisodeNumber}`,
-                  overview: nextEpisodeData?.overview || "Poursuivez votre visionnage",
-                  vote_average: nextEpisodeData?.vote_average
-                };
-              })()}
-              onNextEpisode={(season, episode) => {
-                // Trigger next episode via custom event which will be handled by the parent component
-                const event = new CustomEvent('movix:playNextEpisode', {
-                  detail: {
-                    currentSeason: seasonNumber,
-                    currentEpisode: episodeNumber,
-                    nextSeason: season,
-                    nextEpisode: episode
-                  }
-                });
-                document.dispatchEvent(event);
-              }}
-              onIgnore={() => {
-                console.log("User ignored next episode prompt");
-              }}
-              controls={true}
-            />
-          </div>
-        ) : selectedSource === 'mp4' ? (
-          // MP4 Player from Firebase
-          <div ref={hlsContainerRef} className="relative w-full h-[calc(100vh-180px)] mb-32 pb-20 max-w-7xl mx-auto rounded-lg overflow-hidden bg-black">
-            <HLSPlayer
-              ref={hlsPlayerRef}
-              key={`mp4-${selectedMp4Source}-${showId}-${seasonNumber}-${episodeNumber}`}
-              src={mp4Sources[selectedMp4Source]?.url || ""}
-              className="w-full h-full rounded-lg"
-              autoPlay={true}
-              onEnded={() => {
-                const nextEpisodeNum = episodeNumber + 1;
-                const event = new CustomEvent('movix:playNextEpisode', {
-                  detail: {
-                    currentSeason: seasonNumber,
-                    currentEpisode: episodeNumber,
-                    nextSeason: seasonNumber,
-                    nextEpisode: nextEpisodeNum
-                  }
-                });
-                document.dispatchEvent(event);
-              }}
-              onError={handleHlsError}
-              poster={backdropPath ? `https://image.tmdb.org/t/p/w1280${backdropPath}` : undefined}
-              tvShowId={showId}
-              seasonNumber={seasonNumber}
-              episodeNumber={episodeNumber}
-              tvShow={{
-                name: tvShowName,
-                backdrop_path: backdropPath || undefined
-              }}
-              nextEpisode={(() => {
-                if (!seasons) return null;
-                const currentSeason = seasons[seasonNumber];
-                const nextSeason = seasons[seasonNumber + 1];
-                let targetSeasonNumber = seasonNumber;
-                let targetEpisodeNumber = episodeNumber + 1;
-                let nextEpisodeData = null;
-
-                // Check if the next episode exists in the current season
-                if (currentSeason?.episodes?.find(e => e.episode_number === targetEpisodeNumber)) {
-                  nextEpisodeData = currentSeason.episodes.find(e => e.episode_number === targetEpisodeNumber);
-                }
-                // If not, check if the next season exists and has episodes
-                else if (nextSeason?.episodes && nextSeason.episodes.length > 0) {
-                  targetSeasonNumber = seasonNumber + 1;
-                  targetEpisodeNumber = 1;
-                  nextEpisodeData = nextSeason.episodes[0]; // Get the first episode of the next season
-                }
-                // Otherwise, there's no next episode
-                else {
-                  return null;
-                }
-
-                return {
-                  seasonNumber: targetSeasonNumber,
-                  episodeNumber: targetEpisodeNumber,
-                  name: nextEpisodeData?.name || `Épisode ${targetEpisodeNumber}`,
-                  overview: nextEpisodeData?.overview || "Poursuivez votre visionnage",
-                  vote_average: nextEpisodeData?.vote_average
-                };
-              })()}
-              onNextEpisode={(season, episode) => {
-                // Trigger next episode via custom event which will be handled by the parent component
-                const event = new CustomEvent('movix:playNextEpisode', {
-                  detail: {
-                    currentSeason: seasonNumber,
-                    currentEpisode: episodeNumber,
-                    nextSeason: season,
-                    nextEpisode: episode
-                  }
-                });
-                document.dispatchEvent(event);
-              }}
-              onIgnore={() => {
-                console.log("User ignored next episode prompt");
-              }}
-              controls={true}
-            />
-          </div>
-        ) : (
-          // Iframe Players
-          <div className="relative w-full h-[calc(100vh-180px)] mb-32 pb-20 max-w-7xl mx-auto rounded-lg overflow-hidden bg-black">
-            <iframe
-              ref={videoPlayerIframeRef}
-              id="video-player-iframe"
-              sandbox={
-                // Only apply sandbox to "PAS DE PUBLICITE" players
-                ((selectedSource === 'multi' &&
-                  coflixData?.current_episode?.player_links[selectedPlayerLink]?.quality?.includes("PAS DE PUBLICITE") &&
-                  // Exclude specific players even if they have "PAS DE PUBLICITE"
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("lulustream") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("filemoon") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("supervideo") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("dropload") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("voe.sx") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("vidmoly") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("vidguard") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("do7go") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("uqload") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("veed") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("wish") &&
-                  !coflixData?.current_episode?.player_links[selectedPlayerLink]?.decoded_url?.includes("lecteur6.com")
-                ))
-                  ? "allow-scripts allow-same-origin allow-presentation"
-                  : undefined // No sandbox for other players
-              }
-              src={
-                // Utiliser directement videoSource, qui est mis à jour par le useEffect
-                videoSource || ""
-              }
-              className="w-full h-[calc(100vh-180px)] mb-32 pb-20 max-w-7xl mx-auto"
-              allowFullScreen
-            />
-          </div>
-        )
-      )}
-    </div>
-  );
-});
-VideoPlayer.displayName = 'VideoPlayer';
 const TVDetails: React.FC = () => {
   const { t } = useTranslation();
   const [show, setShow] = useState<any>(null);
@@ -2444,24 +897,29 @@ const TVDetails: React.FC = () => {
   });
   const [searchParams] = useSearchParams();
   const [tvShow, setTVShow] = useState<TVShow | null>(null);
+  const [movixVoteStats, setMovixVoteStats] = useState<LikeDislikeStats>({ likes: 0, dislikes: 0 });
+  const [showMovixRatingInfo, setShowMovixRatingInfo] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [backdropImage, setBackdropImage] = useState<string | null>(null);
   const [showTrailerPopup, setShowTrailerPopup] = useState(false);
   const [trailerVideo, setTrailerVideo] = useState<any>(null);
   const [isClosingTrailer, setIsClosingTrailer] = useState(false);
+
+  useEffect(() => {
+    setMovixVoteStats({ likes: 0, dislikes: 0 });
+  }, [id]);
+
+  const movixRating = calculateLikeDislikeRating(movixVoteStats);
   const [availableEpisodes, setAvailableEpisodes] = useState<Episode[]>([]);
   const [selectedSeason, setSelectedSeason] = useState<number | null>(null);
   const [selectedEpisode, setSelectedEpisode] = useState<number | null>(null);
-  const [, setShowVideo] = useState(false);
   // const [_trailerVideoId, _setTrailerVideoId] = useState<string | null>(null);
 
   // Refs replacing document.getElementById/querySelector lookups for season/episode UI
   const seasonsSectionRef = useRef<HTMLDivElement | null>(null);
   const episodesSectionRef = useRef<HTMLDivElement | null>(null);
   const dropdownToggleButtonRef = useRef<HTMLButtonElement | null>(null);
-  const videoPlayerRef = useRef<VideoPlayerRefHandle | null>(null);
-  const animeVideoPlayerSectionRef = useRef<HTMLDivElement | null>(null);
 
   const handleCloseTrailer = () => {
     setIsClosingTrailer(true);
@@ -2482,9 +940,6 @@ const TVDetails: React.FC = () => {
   const [crew, setCrew] = useState<GroupedCrewMember[]>([]);
   const [, setShowCast] = useState(false);
   const [, setShowCrew] = useState(false);
-  const [, setWatchProgress] = useState(0);
-  const [, setLastWatched] = useState<{ season: number; episode: number } | null>(null);
-  const [, setFrembedAvailable] = useState<boolean>(true);
   const [watchStatus, setWatchStatus] = useState<WatchStatus>({
     watchlist: false,
     favorite: false,
@@ -2536,6 +991,9 @@ const TVDetails: React.FC = () => {
   const [animeData, setAnimeData] = useState<any>(null);
   const [loadingAnimeData, setLoadingAnimeData] = useState<boolean>(false);
   const [tmdbKeywords, setTmdbKeywords] = useState<TmdbKeywordsResponse | null>(null);
+  const [characters, setCharacters] = useState<DetailCharacters | null>(null);
+  const [charactersLoading, setCharactersLoading] = useState(false);
+  const [fullCast, setFullCast] = useState<Array<{ id: number; name: string; character?: string; profile_path?: string | null }>>([]);
   const [tmdbEnglishName, setTmdbEnglishName] = useState<string | null>(null);
   const [tmdbAlternativeTitles, setTmdbAlternativeTitles] = useState<
     Array<{ iso_3166_1?: string; title?: string }>
@@ -2552,7 +1010,7 @@ const TVDetails: React.FC = () => {
   const [pendingEpisode, setPendingEpisode] = useState<number | null>(null);
   const [forceShowUpcoming, setForceShowUpcoming] = useState(false);
   // Ajoute les états pour les tabs et le scroll des tabs comme dans MovieDetails
-  const [activeTab, setActiveTab] = useState<'overview' | 'details' | 'videos' | 'images' | 'cast' | 'crew'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'details' | 'videos' | 'images' | 'cast' | 'characters' | 'crew'>('overview');
   const [isTabsScrollable, setIsTabsScrollable] = useState(false);
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   // Dans les états, ajoute un état pour le chargement des vidéos
@@ -2699,6 +1157,8 @@ const TVDetails: React.FC = () => {
       });
 
       setTVShow(tmdbResponse.data);
+      // Générique complet, pour la galerie de personnages.
+      setFullCast(tmdbResponse.data?.credits?.cast ?? []);
 
       // Signaux pour la détection anime (keywords + alternative_titles viennent de append_to_response)
       setTmdbKeywords(tmdbResponse.data?.keywords ?? null);
@@ -2850,13 +1310,11 @@ const TVDetails: React.FC = () => {
       setAvailableEpisodes(allEpisodes);
       setSeasonsDetails(newSeasonsDetails);
       setSeasonVideos(newSeasonVideos); // Update season videos state
-      setFrembedAvailable(true);
       setIsAvailable(true);
 
     } catch (error) {
       console.error('Error fetching TV show details:', error);
       setError(t('details.loadError'));
-      setFrembedAvailable(true); // Assume available on error? Or false?
       setIsAvailable(true); // Assume available on error? Or false?
     } finally {
       setLoading(false);
@@ -2888,7 +1346,6 @@ const TVDetails: React.FC = () => {
       setSelectedAnimeEpisode(null);
       setSelectedLanguage(null);
       setSelectedPlayer(null);
-      setShowVideo(false);
       setRecommendationsLoaded(false);
       setRecommendations([]);
       setShowCast(false);
@@ -3018,31 +1475,8 @@ const TVDetails: React.FC = () => {
       setShowUpcomingModal(true);
       return;
     }
-    setSelectedEpisode(epNumber);
-    setLastWatched({
-      season: selectedSeason!,
-      episode: epNumber
-    });
-
-    if (cinemaMode && id && selectedSeason !== null) {
-      // Rediriger vers la page de visionnage en mode cinéma
-      navigate(`/watch/tv/${encodeId(id)}/s/${selectedSeason}/e/${epNumber}`);
-      return;
-    }
-
-    setShowVideo(true); // S'assurer que le lecteur standard peut se rendre
-
-    // Scroll vers la section des lecteurs immédiatement
-    setTimeout(() => {
-      const playerSection = videoPlayerRef.current?.getSection() || animeVideoPlayerSectionRef.current;
-      if (playerSection) {
-        playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 0); // Délai mis à 0ms
-
-    // Continue watching functionality removed
+    navigate(`/watch/tv/${encodeId(id || '')}/s/${selectedSeason}/e/${epNumber}`);
   };
-
   const _scrollLeft = (elementId: string) => {
     const element = document.getElementById(elementId);
     if (element) {
@@ -3058,24 +1492,6 @@ const TVDetails: React.FC = () => {
     }
   };
   void _scrollRight;
-
-  const updateWatchProgress = useCallback((progress: number) => {
-    if (!tvShow) return;
-
-    setWatchProgress(progress);
-    setLastWatched({
-      season: selectedSeason || 0,
-      episode: selectedEpisode || 0
-    });
-
-    // Continue watching functionality removed
-  }, [id, tvShow, selectedSeason, selectedEpisode]);
-
-  useEffect(() => {
-    if (tvShow && selectedSeason !== null && selectedEpisode) {
-      updateWatchProgress(0);
-    }
-  }, [tvShow, selectedSeason, selectedEpisode, updateWatchProgress]);
 
   const updateWatchStatus = (type: keyof WatchStatus, value: boolean, episodeKey?: string) => {
     setWatchStatus(prev => {
@@ -3424,42 +1840,7 @@ const TVDetails: React.FC = () => {
       return;
     }
 
-    // Normal mode: proceed with existing logic
-    // Gérer le mode anime spécifiquement
-    if (animeMode && animeData?.seasons) {
-      const animeSeason = animeData.seasons[seasonToWatch - 1];
-      const animeEpisode = animeSeason?.episodes?.find((ep: any) => ep.index === episodeToWatch);
-      if (animeEpisode) {
-        setSelectedAnimeEpisode(animeEpisode);
-        // Sélectionner langue/lecteur par défaut si nécessaire
-        const hasVf = animeEpisode.streaming_links.some((link: any) => link.language === 'vf');
-        const hasVostfr = animeEpisode.streaming_links.some((link: any) => link.language === 'vostfr');
-        if (hasVf) setSelectedLanguage('vf');
-        else if (hasVostfr) setSelectedLanguage('vostfr');
-        setSelectedPlayer('0');
-      }
-    } else {
-      // Pour le mode standard, s'assurer que le lecteur est activé
-      setShowVideo(true);
-    }
-
-    // Tenter de scroller immédiatement
-    setTimeout(() => {
-      const playerSection = videoPlayerRef.current?.getSection() || animeVideoPlayerSectionRef.current;
-      if (playerSection) {
-        playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      } else {
-        // Retenter immédiatement si l'élément n'est pas encore rendu
-        setTimeout(() => {
-          const playerSection = videoPlayerRef.current?.getSection() || animeVideoPlayerSectionRef.current;
-          if (playerSection) {
-            playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 0); // Délai de secours mis à 0ms
-      }
-    }, 0); // Délai principal mis à 0ms
   };
-
   const WatchButtons = () => {
     return (
       <div className="flex flex-col gap-4 mt-4">
@@ -3686,7 +2067,6 @@ const TVDetails: React.FC = () => {
   const handleEpisodeSelect = async (seasonNumber: number, episodeNumber: number) => {
     setSelectedSeason(seasonNumber);
     setSelectedEpisode(episodeNumber);
-    setShowVideo(true);
 
     // Watch history functionality removed
   };
@@ -3708,6 +2088,85 @@ const TVDetails: React.FC = () => {
     // keywords "anime"/"manga" (avec garde JP/ja), genre Animation. Seuil 40.
     return isLikelyAnime(tvShow as unknown as Parameters<typeof isLikelyAnime>[0], tmdbKeywords);
   }, [tvShow, id, tmdbKeywords]);
+
+  /**
+   * Les personnages de la fiche. AniList quand la série a le profil d'un anime
+   * — elle rend les personnages eux-mêmes, là où TMDB ne rend que des
+   * comédiens — et le générique TMDB sinon, ou si AniList ne connaît pas
+   * l'œuvre. Les titres sont proposés du plus prometteur au moins : l'original
+   * japonais, puis l'anglais, tous deux mieux indexés chez eux que le titre
+   * traduit affiché.
+   */
+  useEffect(() => {
+    if (!tvShow) return;
+    let stale = false;
+    setCharactersLoading(true);
+
+    void loadDetailCharacters({
+      looksLikeAnime: isAnime(),
+      anilistTitles: [tvShow.original_name, tmdbEnglishName, tvShow.name]
+        .filter((title): title is string => Boolean(title)),
+      cast: fullCast,
+    })
+      .then((result) => { if (!stale) setCharacters(result); })
+      .catch(() => { if (!stale) setCharacters(null); })
+      .finally(() => { if (!stale) setCharactersLoading(false); });
+
+    return () => { stale = true; };
+  }, [tvShow, tmdbEnglishName, fullCast, isAnime]);
+
+  /** Mots-clés et titres alternatifs, mis à plat pour l'affichage. */
+  const extraKeywords = useMemo(
+    () => normalizeKeywords(tmdbKeywords, getTmdbLanguage()),
+    [tmdbKeywords],
+  );
+  const extraAlternateTitles = useMemo(
+    () => normalizeAlternateTitles(
+      { results: tmdbAlternativeTitles },
+      [tvShow?.name, tvShow?.original_name, tmdbEnglishName],
+    ),
+    [tmdbAlternativeTitles, tvShow?.name, tvShow?.original_name, tmdbEnglishName],
+  );
+
+  /**
+   * Ce que la fiche vient de récupérer alimente le catalogue local de
+   * recherche. Titres alternatifs, mots-clés, thèmes et noms de personnages
+   * sont exactement ce que `search/multi` ne sait pas trouver : les garder
+   * rend la fiche retrouvable par ces mots-là (voir `utils/mediaSearchIndex`).
+   */
+  useEffect(() => {
+    if (!tvShow || !id) return;
+    rememberMedia({
+      mediaType: 'tv',
+      id: Number(id),
+      title: tvShow.name,
+      posterPath: tvShow.poster_path,
+      backdropPath: tvShow.backdrop_path,
+      date: tvShow.first_air_date,
+      voteAverage: tvShow.vote_average,
+      genreIds: tvShow.genres?.map((genre) => genre.id),
+      overview: tvShow.overview,
+      terms: [
+        tvShow.original_name,
+        tmdbEnglishName,
+        ...extraAlternateTitles.map((entry) => entry.title),
+        ...extraKeywords,
+        ...(characters?.themes ?? []),
+        ...(characters?.groups.flatMap((group) => group.characters.map((item) => item.name)) ?? []),
+      ].filter((term): term is string => Boolean(term)),
+    });
+  }, [tvShow, id, tmdbEnglishName, extraAlternateTitles, extraKeywords, characters]);
+
+  /** L'onglet n'a de raison d'être que s'il a quelque chose dedans. */
+  /**
+   * L'onglet n'existe que pour ce qu'AniList apporte. Sur une œuvre qu'elle ne
+   * connaît pas — un film, une série qui n'est pas un anime — les personnages
+   * ne viennent que du générique TMDB, et l'onglet Distribution dit déjà la
+   * même chose dans l'autre sens. Les cartes restent construites : elles
+   * nourrissent le catalogue de recherche, qui lui gagne à connaître les noms
+   * de rôles (voir `utils/mediaSearchIndex.ts`).
+   */
+  const hasCharactersTab = characters?.source === 'anilist' && characters.total > 0;
 
   const loadAnimeData = useCallback(async () => {
     if (!tvShow?.name) return;
@@ -3898,17 +2357,6 @@ const TVDetails: React.FC = () => {
   };
   void _scrollToSeasons;
 
-  // Ajouter une fonction pour scroller jusqu'au player (déplacée ici)
-  const scrollToPlayer = () => {
-    // Ajouter un petit délai pour s'assurer que la mise à jour du DOM est terminée
-    setTimeout(() => {
-      const playerElement = videoPlayerRef.current?.getIframe() || videoPlayerRef.current?.getSection() || animeVideoPlayerSectionRef.current; // Inclure HLS container via section wrapper
-      if (playerElement) {
-        playerElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 100);
-  };
-
   const fetchBackdropAndTrailer = async () => {
     try {
       console.log('Fetching backdrop and trailer for TV show:', id);
@@ -4010,42 +2458,6 @@ const TVDetails: React.FC = () => {
       fetchBackdropAndTrailer();
     }
   }, [id]);
-
-  // Add event listener for auto-playing next episode
-  useEffect(() => {
-    const handleNextEpisode = (event: CustomEvent) => {
-      const { nextSeason, nextEpisode } = event.detail;
-
-      // Check if the next episode exists in the current season episodes
-      const seasonsData = show?.seasons || [];
-      const currentSeasonData = seasonsData.find((season: { season_number: number; episode_count: number }) =>
-        season.season_number === nextSeason
-      );
-
-      if (currentSeasonData && nextEpisode <= currentSeasonData.episode_count) {
-        // Next episode exists in the same season
-        handleEpisodeSelect(nextSeason, nextEpisode);
-        scrollToPlayer();
-      } else if (nextSeason < (seasonsData.length || 0)) {
-        // Try next season, episode 1
-        const nextSeasonData = seasonsData.find((season: { season_number: number }) =>
-          season.season_number === nextSeason + 1
-        );
-        if (nextSeasonData) {
-          handleEpisodeSelect(nextSeasonData.season_number, 1);
-          scrollToPlayer();
-        }
-      }
-    };
-
-    // Add event listener
-    document.addEventListener('movix:playNextEpisode', handleNextEpisode as EventListener);
-
-    // Cleanup
-    return () => {
-      document.removeEventListener('movix:playNextEpisode', handleNextEpisode as EventListener);
-    };
-  }, [show, handleEpisodeSelect, id]);
 
   if (loading) {
     return <DetailsSkeleton />;
@@ -4158,12 +2570,6 @@ const TVDetails: React.FC = () => {
             return;
           }
 
-          setTimeout(() => {
-            const playerSection = animeVideoPlayerSectionRef.current;
-            if (playerSection) {
-              playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-          }, 0);
         }
       } else {
         handleEpisodeChange(Number(valueStr));
@@ -4190,13 +2596,6 @@ const TVDetails: React.FC = () => {
         return;
       }
 
-      // Scroll vers la section des lecteurs immédiatement
-      setTimeout(() => {
-        const playerSection = animeVideoPlayerSectionRef.current;
-        if (playerSection) {
-          playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      }, 0); // Délai mis à 0ms
     };
 
     return (
@@ -4913,6 +3312,27 @@ const TVDetails: React.FC = () => {
                   )}
                 </motion.button>
 
+                {/* Réservé à ce qu'AniList apporte : sur du live-action,
+                    l'onglet Équipe et celui de Distribution disent déjà tout,
+                    et un onglet de plus ne ferait que répéter. */}
+                {hasCharactersTab && (
+                  <motion.button
+                    onClick={() => setActiveTab('characters')}
+                    className={`px-6 py-3 font-medium text-sm flex-shrink-0 relative ${activeTab === 'characters' ? 'text-white' : 'text-gray-400 hover:text-white'}`}
+                    whileHover={{ backgroundColor: "rgba(255,255,255,0.05)" }}
+                    whileTap={{ backgroundColor: "rgba(255,255,255,0.1)" }}
+                  >
+                    {t('details.charactersTab')}
+                    {activeTab === 'characters' && (
+                      <motion.div
+                        className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600"
+                        layoutId="activeTab"
+                        transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                      />
+                    )}
+                  </motion.button>
+                )}
+
                 {/* Bouton Commentaires (scroll vers la section) */}
                 <motion.button
                   onClick={() => {
@@ -4961,6 +3381,7 @@ const TVDetails: React.FC = () => {
                       <LikeDislikeButton
                         contentType="tv"
                         contentId={id || ''}
+                        onStatsChange={setMovixVoteStats}
                       />
                     </div>
 
@@ -5008,13 +3429,36 @@ const TVDetails: React.FC = () => {
                       <h3 className="text-lg font-semibold mb-2">{t('details.episodesLabel')}</h3>
                       <p className="text-gray-300">{tvShow.number_of_episodes || 0}</p>
                     </div>
-                    {/* Note */}
-                    <div>
-                      <h3 className="text-lg font-semibold mb-2">{t('details.ratingLabel')}</h3>
-                      <div className="flex items-center gap-2">
-                        <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-                        <p className="text-gray-300 text-lg font-bold">{tvShow.vote_average?.toFixed(1)}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                    {/* Notes */}
+                    <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <h3 className="text-lg font-semibold mb-2">{t('details.ratingLabel')}</h3>
+                        <div className="flex items-center gap-2">
+                          <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
+                          <p className="text-gray-300 text-lg font-bold">{tvShow.vote_average?.toFixed(1) || 'N/A'}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                        </div>
                       </div>
+
+                      {movixRating != null && (
+                        <div>
+                          <h3 className="mb-2 flex items-center gap-2 text-lg font-semibold">
+                            {t('details.movixRatingLabel')}
+                            <button
+                              type="button"
+                              onClick={() => setShowMovixRatingInfo(true)}
+                              aria-label={t('details.movixRatingInfoButtonLabel')}
+                              title={t('details.movixRatingInfoButtonLabel')}
+                              className="rounded-full text-gray-400 transition-colors hover:text-white focus:outline-none focus:ring-2 focus:ring-red-500/70"
+                            >
+                              <Info className="h-4 w-4" />
+                            </button>
+                          </h3>
+                          <div className="flex items-center gap-2">
+                            <Star className="w-5 h-5 text-red-500 fill-red-500" />
+                            <p className="text-gray-300 text-lg font-bold">{movixRating.toFixed(1)}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                          </div>
+                        </div>
+                      )}
                     </div>
                     {/* Genres */}
                     <div>
@@ -5037,6 +3481,8 @@ const TVDetails: React.FC = () => {
                           </motion.div>
                         ))}
                       </div>
+
+
                     </div>
                     {/* Classification par âge */}
                     <div>
@@ -5056,6 +3502,8 @@ const TVDetails: React.FC = () => {
                       </div>
                     </div>
                   </motion.div>
+
+
                   {/* Saisons et épisodes */}
                   <motion.div
                     ref={seasonsSectionRef}
@@ -5327,6 +3775,16 @@ const TVDetails: React.FC = () => {
                       </motion.div>
                     ))}
                   </div>
+                </motion.div>
+              ) : activeTab === 'characters' ? (
+                <motion.div
+                  key="characters"
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  <CharactersSection data={characters} loading={charactersLoading} />
                 </motion.div>
               ) : activeTab === 'crew' ? (
                 <motion.div
@@ -6163,6 +4621,14 @@ const TVDetails: React.FC = () => {
                       </div>
                     </motion.div>
                   )}
+                  {/* En fin d'onglet Détails : thèmes, titres alternatifs et
+                      mots-clés relèvent de la fiche technique, pas de la
+                      galerie de personnages. */}
+                  <DetailExtraMetadata
+                    themes={characters?.themes ?? []}
+                    alternateTitles={extraAlternateTitles}
+                    keywords={extraKeywords}
+                  />
                 </motion.div>
               ) : activeTab === 'videos' ? (
                 <motion.div
@@ -6823,108 +5289,6 @@ const TVDetails: React.FC = () => {
         </AnimatePresence>
       )}
 
-      {selectedSeason !== null && selectedEpisode && !animeMode && (
-        <VideoPlayer
-          ref={videoPlayerRef}
-          showId={id!}
-          seasonNumber={selectedSeason}
-          episodeNumber={selectedEpisode}
-          tvShowName={tvShow?.name || ''}
-          releaseYear={tvShow?.first_air_date ? new Date(tvShow.first_air_date).getFullYear() : 0}
-          backdropPath={tvShow?.backdrop_path || ''}
-          seasons={seasonsDetails}
-          cinemaMode={cinemaMode}
-        />
-      )}
-
-      {/* Lecteur d'anime */}
-      {animeMode && selectedSeason !== null && selectedEpisode && selectedAnimeEpisode && (
-        <motion.div
-          ref={animeVideoPlayerSectionRef}
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.3 }}
-          className="my-10 bg-gray-900 rounded-lg overflow-hidden shadow-xl border border-gray-800 max-w-7xl mx-auto"
-          id="video-player-section"
-        >
-          <div className="p-4 bg-gray-800 border-b border-gray-700 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-            <div>
-              <h2 className="text-xl font-bold text-white">
-                {tvShow?.name} - S{selectedSeason} E{selectedEpisode}: {selectedAnimeEpisode.name}
-              </h2>
-              <p className="text-gray-300 text-sm mt-1">
-                {animeData?.name} - {animeData?.seasons.find((s: any) => (s.number || (animeData.seasons.indexOf(s) + 1)) === selectedSeason)?.name}
-              </p>
-            </div>
-          </div>
-
-          {/* Interface de sélection de langue améliorée */}
-          <div className="px-4 py-3 bg-gray-900 border-b border-gray-700">
-            <div className="flex flex-col gap-3">
-              <h3 className="text-gray-300 font-medium">{t('details.versionLabel')}</h3>
-              <div className="flex flex-wrap gap-3">
-                {selectedAnimeEpisode.streaming_links?.map((link: any, i: number) => (
-                  <button
-                    key={`lang-${link.language}-${i}`}
-                    className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${selectedLanguage === link.language
-                      ? 'bg-red-600 text-white ring-2 ring-red-400 shadow-lg shadow-red-900/30'
-                      : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                      }`}
-                    onClick={() => setSelectedLanguage(link.language)}
-                  >
-                    {getAnimeLanguageLabel(link.language, t)}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Interface de sélection de lecteur améliorée */}
-          {selectedLanguage && selectedAnimeEpisode.streaming_links?.find((link: any) => link.language === selectedLanguage)?.players?.length > 0 && (
-            <div className="px-4 py-3 bg-gray-800/50 border-b border-gray-700">
-              <div className="flex flex-col gap-3">
-                <h3 className="text-gray-300 font-medium">{t('details.availablePlayers')}</h3>
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
-                  {selectedAnimeEpisode.streaming_links
-                    .find((link: any) => link.language === selectedLanguage)
-                    .players.map((_player: string, index: number) => (
-                      <button
-                        key={`player-${index}`}
-                        className={`px-3 py-2 rounded-md flex items-center justify-center transition-all ${selectedPlayer === index.toString()
-                          ? 'bg-red-600 text-white font-medium ring-2 ring-red-400 scale-105 shadow-lg shadow-red-900/30'
-                          : 'bg-gray-700 text-gray-300 hover:bg-gray-600 hover:scale-105'
-                          }`}
-                        onClick={() => setSelectedPlayer(index.toString())}
-                      >
-                        <Play className={`w-4 h-4 mr-1.5 ${selectedPlayer === index.toString() ? 'text-white' : 'text-gray-400'}`} />
-                        {t('details.playerLabel', { number: index + 1 })}
-                      </button>
-                    ))
-                  }
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Lecteur vidéo */}
-          {selectedLanguage && selectedPlayer !== null && (
-            <div className="relative w-full" style={{ paddingBottom: '56.25%' }}>
-              <iframe
-                src={selectedAnimeEpisode.streaming_links
-                  .find((link: any) => link.language === selectedLanguage)
-                  .players[parseInt(selectedPlayer)]}
-                className="absolute top-0 left-0 w-full h-full"
-                allowFullScreen
-                allow="autoplay; encrypted-media"
-                title={`${tvShow?.name} - S${selectedSeason} E${selectedEpisode}`}
-              ></iframe>
-            </div>
-          )}
-        </motion.div>
-      )}
-      {/* Séries similaires — la section est rendue HORS du wrapper page
-          (qui ferme à la ligne ~6686), donc on doit appliquer le padding
-          gauche/droit ici directement pour s'aligner sur le reste du contenu. */}
       <LazySection
         index={0}
         immediateLoadCount={0}
@@ -7100,24 +5464,12 @@ const TVDetails: React.FC = () => {
                   if (pendingEpisode) {
                     if (cinemaMode && id && selectedSeason) {
                       // En mode cinéma, naviguer vers la page de visionnage dédiée
-                      setLastWatched({ season: selectedSeason!, episode: pendingEpisode });
                       if (animeMode) {
                         navigate(`/watch/anime/${encodeId(id)}/season/${selectedSeason}/episode/${pendingEpisode}`);
                       } else {
                         navigate(`/watch/tv/${encodeId(id)}/s/${selectedSeason}/e/${pendingEpisode}`);
                       }
                       return;
-                    }
-                    if (!id || !selectedSeason) {
-                      // Mode normal: sélectionner l'épisode et faire défiler vers le lecteur intégré
-                      setSelectedEpisode(pendingEpisode);
-                      setLastWatched({ season: selectedSeason!, episode: pendingEpisode });
-                      setTimeout(() => {
-                        const playerElement = videoPlayerRef.current?.getIframe();
-                        if (playerElement) {
-                          playerElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        }
-                      }, 100);
                     }
                   }
                   setPendingEpisode(null);
@@ -7175,6 +5527,11 @@ const TVDetails: React.FC = () => {
           )}
         </AnimatePresence>
       )}
+
+      <MovixRatingInfoModal
+        isOpen={showMovixRatingInfo}
+        onClose={() => setShowMovixRatingInfo(false)}
+      />
 
 
       </div>

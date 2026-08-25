@@ -13,7 +13,6 @@ npm install
 Backend services have separate dependencies:
 - `cd API/Mainapi && npm install`
 - `cd API/proxiesembed && pip install -r requirements.txt`
-- `cd API/miscs && pip install -r requirements.txt`
 
 ## Commands
 
@@ -35,7 +34,6 @@ Backend (run individually):
 node API/Mainapi/server.js          # Port 25565
 node API/watchpartyAPI/watchparty.js # Port 25566
 python API/proxiesembed/server.py    # Port 25569
-python API/miscs/bypass403.py        # Port 25568
 ```
 
 ## Repository Structure
@@ -67,7 +65,6 @@ API/
   watchpartyAPI/            # Socket.IO WatchParty
   proxiesembed/             # Python aiohttp proxy + DRM
     drmproxy/services/      # 30+ hoster extractors
-  miscs/                    # Flask bypass403
 extension/
   Chrome/                   # Manifest V3
   Firefox/                  # Manifest V2
@@ -75,7 +72,6 @@ userscript/                 # Tampermonkey
 wasm/watchparty-sync/       # Rust -> WASM sync engine
 PreMid/                     # Discord Rich Presence
 cloudflareproxy/            # Cloudflare Worker
-RivestreamCloudflareProxy/  # Cloudflare Worker variant
 functions/                  # Serverless edge handlers
 public/                     # Static assets, SW, WASM output
 ```
@@ -108,9 +104,8 @@ public/                     # Static assets, SW, WASM output
 - Middleware stack: CORS -> Helmet -> Rate Limit -> Auth -> Routes
 - JWT auth via `middleware/auth.js`
 
-### Backend - Python (API/proxiesembed/, API/miscs/)
+### Backend - Python (API/proxiesembed/)
 - Async/await with aiohttp (proxiesembed)
-- Flask for bypass403
 - Each hoster extractor is a standalone module in `drmproxy/services/`
 - SOCKS5 proxy pool support, memory cache with TTL
 
@@ -127,7 +122,6 @@ public/                     # Static assets, SW, WASM output
 Frontend (3000) ──> Main API (25565)       [REST + Socket.IO]
                 ──> WatchParty API (25566)  [Socket.IO /watchparty]
                 ──> Proxies Embed (25569)   [HTTP proxy/DRM]
-                ──> Bypass403 (25568)       [HTTP header proxy]
                 ──> Cloudflare Workers      [CORS relay]
 Main API        ──> MySQL, Redis, TMDB, 30+ scraping sources
 ```
@@ -149,7 +143,7 @@ Frontend on Cloudflare Pages (`CF_PAGES_COMMIT_SHA` for build ID). PWA with Work
 Frontend: `.env` with `VITE_*` prefix (see `.env.example`)
 Backend: separate `.env` per service (see `API/*/. env.example`)
 
-Key frontend vars: `VITE_MAIN_API`, `VITE_TMDB_API_KEY`, `VITE_SITE_URL`, `VITE_WATCHPARTY_API`, `VITE_PROXY_BASE_URL`, `VITE_PROXIES_EMBED_API`, `VITE_TURNSTILE_SITE_KEY`
+Key frontend vars: `VITE_MAIN_API`, `VITE_TMDB_API_KEY`, `VITE_SITE_URL`, `VITE_WATCHPARTY_API`, `VITE_PROXIES_EMBED_API`, `VITE_TURNSTILE_SITE_KEY`
 
 ## Security Rules
 

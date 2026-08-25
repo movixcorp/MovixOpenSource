@@ -28,6 +28,7 @@ import {
   subscribeCastStatus,
 } from './cast';
 import { applyMediaProxyHeaderRules } from './mediaProxyHeaders';
+import { recordJournalEntry } from './networkJournal';
 import {
   type PictureInPictureEvent,
   acknowledgePictureInPictureRestoreApplied,
@@ -1131,6 +1132,7 @@ export interface BridgeRequest {
     | 'GM_GET_VALUE'
     | 'GM_SET_VALUE'
     | 'GM_DELETE_VALUE'
+    | 'GM_JOURNAL_CONSOLE'
     | 'PLAYBACK_AWAKE_SET';
   url?: string;
   method?: string;
@@ -1237,6 +1239,11 @@ async function handleGMOpenMediaProxy(
     };
   }
 
+  // Les en-têtes tels que la WebView les a demandés, avant nos règles : c'est
+  // la moitié manquante quand un hébergeur refuse le jeton qu'il vient d'émettre
+  // — l'entrée `media/*` du natif donne l'autre, ce qui part réellement.
+  recordJournalEntry('pont/média(appelant)', method, req.url, headers);
+
   try {
     const localUrl = await mediaProxy.open(
       req.url,
@@ -1327,6 +1334,14 @@ async function handleGMFetch(req: BridgeRequest): Promise<BridgeResponse> {
       body = await response.text();
     }
 
+    recordJournalEntry(
+      'pont/fetch',
+      req.method || 'GET',
+      response.url || req.url || '',
+      fetchHeaders,
+      response.status,
+    );
+
     return {
       id: req.id,
       success: true,
@@ -1337,6 +1352,14 @@ async function handleGMFetch(req: BridgeRequest): Promise<BridgeResponse> {
       finalUrl: response.url,
     };
   } catch (err: any) {
+    recordJournalEntry(
+      'pont/fetch',
+      req.method || 'GET',
+      req.url || '',
+      { ...(req.headers || {}) },
+      0,
+      err?.message || 'Requête échouée',
+    );
     return {
       id: req.id,
       success: false,
@@ -1864,6 +1887,18 @@ export async function handleBridgeMessage(
       break;
     case 'GM_DELETE_VALUE':
       response = handleGMDeleteValue(req);
+      break;
+    // La console de la WebView ne remonte nulle part : react-native-webview ne
+    // la publie pas, et un build release n'expose pas le débogage distant. Sans
+    // ça, tout ce que le lecteur raconte de ses échecs est perdu.
+    case 'GM_JOURNAL_CONSOLE':
+      recordJournalEntry(
+        `console/${String(req.key || 'log').slice(0, 16)}`,
+        '-',
+        typeof req.value === 'string' ? req.value.slice(0, 4000) : '',
+        {},
+      );
+      response = { id: req.id, success: true };
       break;
     default:
       return;

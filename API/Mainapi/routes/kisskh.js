@@ -119,7 +119,12 @@ function proxyDescendant(value, origin) {
   const sourceUrl = url.searchParams.get('url');
   let source;
   try { source = new URL(sourceUrl); } catch { throw upstreamError(); }
-  if (url.origin !== origin || url.pathname !== '/kisskh-proxy' || url.searchParams.size !== 1
+  // Le proxy exige une signature HMAC : la forme attendue est `url,exp,sig`.
+  // La forme nue reste tolérée pour le cas dégradé « secret non configuré »,
+  // où proxiesembed refusera de toute façon la lecture.
+  const params = [...url.searchParams.keys()].sort().join(',');
+  if (params !== 'url' && params !== 'exp,sig,url') throw upstreamError();
+  if (url.origin !== origin || url.pathname !== '/kisskh-proxy'
       || url.username || url.password || url.hash || !['http:', 'https:'].includes(source.protocol)
       || source.username || source.password || source.hash) {
     throw upstreamError();

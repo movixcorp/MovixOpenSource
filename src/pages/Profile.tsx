@@ -46,16 +46,26 @@ import AvatarSelector from '../components/AvatarSelector';
 import FilterSystem, { type FilterItemType, type FilterOptions } from '../components/FilterSystem';
 import CustomDropdown from '../components/CustomDropdown';
 import { useOptimizedFilter } from '../hooks/useOptimizedFilter';
+import AgeRestrictedMedia from '../components/AgeRestrictedMedia';
 
 import { AlertService } from '../services/alertService';
 import { EpisodeAlert, NotifyBeforeDays } from '../types/alerts';
 import { encodeId } from '../utils/idEncoder';
 import { getTmdbLanguage } from '../i18n';
 import {
+  getSessionBrowserLabel,
+  normalizeSessionDeviceInfo,
+  type SessionDeviceInfo,
+  type SessionDeviceType,
+} from '../utils/sessionDevice';
+import {
   SHARED_LIST_FAVORITES_STORAGE_KEY,
   readSharedListFavorites,
   type SharedListFavorite,
 } from '../utils/sharedListFavorites';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
+import { useTurnstileBypass } from '@/hooks/useTurnstileBypass';
+import { ADMIN_BYPASS_TOKEN } from '@/utils/turnstileBypass';
 
 // Get API URL from environment variable
 const API_URL = import.meta.env.VITE_MAIN_API;
@@ -133,8 +143,8 @@ interface UserSession {
   userId: string;
   createdAt: string;
   accessedAt: string;
-  device: string;
   userAgent: string;
+  deviceInfo?: SessionDeviceInfo;
 }
 
 interface DragHandleProps {
@@ -372,6 +382,8 @@ const Profile: React.FC = () => {
   const [shareTurnstileToken, setShareTurnstileToken] = useState('');
   const shareTurnstileRef = useRef<HTMLDivElement>(null);
   const shareTurnstileWidgetId = useRef<string | null>(null);
+  // Dispense admin : pas de challenge du tout. Voir `utils/turnstileBypass.ts`.
+  const shareTurnstileBypass = useTurnstileBypass();
 
   // Paramètres utilisateur
   const [disableAutoScroll, setDisableAutoScroll] = useState(() => {
@@ -1915,15 +1927,10 @@ const Profile: React.FC = () => {
       );
     }
 
-    const getDeviceIcon = (userAgent: string) => {
-      const ua = userAgent.toLowerCase();
-      if (ua.includes('mobile') || ua.includes('android') || ua.includes('iphone')) {
-        return <Smartphone className="w-5 h-5" />;
-      } else if (ua.includes('tablet') || ua.includes('ipad')) {
-        return <Tablet className="w-5 h-5" />;
-      } else {
-        return <Monitor className="w-5 h-5" />;
-      }
+    const getDeviceIcon = (deviceType: SessionDeviceType) => {
+      if (deviceType === 'mobile') return <Smartphone className="w-5 h-5" />;
+      if (deviceType === 'tablet') return <Tablet className="w-5 h-5" />;
+      return <Monitor className="w-5 h-5" />;
     };
 
     const formatDate = (dateString: string) => {
@@ -1946,6 +1953,11 @@ const Profile: React.FC = () => {
         <AnimatePresence>
           {sessions.map((session) => {
             const isCurrentSession = session.id === currentSessionId;
+            const deviceInfo = normalizeSessionDeviceInfo(session.deviceInfo);
+            const deviceDetails = [
+              deviceInfo.operatingSystem,
+              t(`settings.sessionDeviceTypes.${deviceInfo.deviceType}`),
+            ].filter(Boolean).join(' · ');
 
             return (
               <motion.div
@@ -1962,16 +1974,13 @@ const Profile: React.FC = () => {
                   <div className="flex items-center space-x-4">
                     <div className={`p-2 rounded-lg ${isCurrentSession ? 'bg-green-500/20 text-green-400' : 'bg-gray-700/50 text-gray-400'
                       }`}>
-                      {getDeviceIcon(session.userAgent)}
+                      {getDeviceIcon(deviceInfo.deviceType)}
                     </div>
 
                     <div className="flex-1">
                       <div className="flex items-center space-x-2">
                         <h4 className="font-medium text-white">
-                          {session.userAgent.includes('Chrome') ? 'Chrome' :
-                            session.userAgent.includes('Firefox') ? 'Firefox' :
-                              session.userAgent.includes('Safari') ? 'Safari' :
-                                session.userAgent.includes('Edge') ? 'Edge' : t('profilePage.sessions.browser')}
+                          {getSessionBrowserLabel(deviceInfo, t('profilePage.sessions.browser'))}
                         </h4>
                         {isCurrentSession && (
                           <span className="px-2 py-1 text-xs bg-green-500/20 text-green-400 rounded-full">
@@ -1981,6 +1990,7 @@ const Profile: React.FC = () => {
                       </div>
 
                       <div className="text-sm text-gray-400 space-y-1">
+                        <p>{deviceDetails}</p>
                         <p>{t('profilePage.sessions.createdOn', { date: new Date(session.createdAt).toLocaleDateString(i18n.language), time: new Date(session.createdAt).toLocaleTimeString(i18n.language, { hour: '2-digit', minute: '2-digit' }) })}</p>
                         <p>{t('profilePage.sessions.lastActivity', { time: formatDate(session.accessedAt) })}</p>
                       </div>
@@ -3408,6 +3418,7 @@ const Profile: React.FC = () => {
     return (
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 px-2 md:px-4 relative z-0">
         {itemsToDisplay.map(item => (
+          <AgeRestrictedMedia key={`in-progress-${item.id}`} item={{ ...item, media_type: 'tv' }}>
           <div
             key={`in-progress-${item.id}`}
             className="relative group bg-gray-900/70 rounded-xl overflow-hidden shadow-lg hover:shadow-2xl transition-colors border border-gray-800/50"
@@ -3457,6 +3468,7 @@ const Profile: React.FC = () => {
               </div>
             )}
           </div>
+          </AgeRestrictedMedia>
         ))}
       </div>
     );
@@ -3580,6 +3592,13 @@ const Profile: React.FC = () => {
 
   // === Turnstile managed pour le partage ===
   useEffect(() => {
+    if (shareTurnstileBypass === 'bypass') {
+      setShareTurnstileToken(ADMIN_BYPASS_TOKEN);
+      return;
+    }
+    // Statut encore inconnu : on n'affiche rien plutôt qu'un challenge à
+    // retirer juste après.
+    if (shareTurnstileBypass === 'unknown') return;
     if (!TURNSTILE_SITE_KEY || !selectedList) return;
 
     // Nettoyer l'ancien widget
@@ -3625,14 +3644,18 @@ const Profile: React.FC = () => {
         setShareTurnstileToken('');
       }
     };
-  }, [selectedList]);
+  }, [selectedList, shareTurnstileBypass]);
 
   const resetShareTurnstile = useCallback(() => {
+    // Un dispensé n'a rien à réinitialiser : effacer le marqueur rebloquerait
+    // le partage suivant.
+    if (shareTurnstileBypass !== 'challenge') return;
+
     setShareTurnstileToken('');
     if (shareTurnstileWidgetId.current && window.turnstile) {
       window.turnstile.reset(shareTurnstileWidgetId.current);
     }
-  }, []);
+  }, [shareTurnstileBypass]);
 
   // === Share list functions ===
   const getProfileId = (): string | null => {
@@ -3847,6 +3870,10 @@ const Profile: React.FC = () => {
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 px-2 md:px-4 relative z-0">
               {selectedListCollections.map((movie, index) => (
+                <AgeRestrictedMedia
+                  key={`${movie.collectionId}-${movie.id}`}
+                  item={{ ...movie, media_type: movie.media_type === 'tv' || movie.type === 'tv' ? 'tv' : 'movie' }}
+                >
                 <motion.div
                   key={`${movie.collectionId}-${movie.id}`}
                   whileHover={{
@@ -3926,6 +3953,7 @@ const Profile: React.FC = () => {
                     </motion.button>
                   )}
                 </motion.div>
+                </AgeRestrictedMedia>
               ))}
             </div>
           )}
@@ -3977,6 +4005,7 @@ const Profile: React.FC = () => {
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 px-2 md:px-4 relative z-0">
               {collectionMovies.map((movie, index) => (
+                <AgeRestrictedMedia key={movie.id} item={{ ...movie, media_type: 'movie' }}>
                 <motion.div
                   key={movie.id}
                   whileHover={{
@@ -4019,6 +4048,7 @@ const Profile: React.FC = () => {
                     </span>
                   </div>
                 </motion.div>
+                </AgeRestrictedMedia>
               ))}
             </div>
           )}
@@ -4086,8 +4116,8 @@ const Profile: React.FC = () => {
               )}
             </div>
             <div className="w-full md:w-auto flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2">
-              {/* Widget Turnstile pour le partage */}
-              {TURNSTILE_SITE_KEY && (
+              {/* Widget Turnstile pour le partage — masqué pour les dispensés */}
+              {TURNSTILE_SITE_KEY && shareTurnstileBypass === 'challenge' && (
                 <div className="w-full flex justify-center sm:justify-start overflow-hidden [&>iframe]:max-w-full [&>div]:max-w-full" style={{ maxWidth: '100%' }}>
                   <div ref={shareTurnstileRef} className="origin-left scale-[0.85] sm:scale-100" />
                 </div>
@@ -4198,7 +4228,8 @@ const Profile: React.FC = () => {
               >
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 px-2 md:px-4 relative z-0">
                   {selectedList.items.map(item => (
-                    <SortableMediaItem key={`${item.type}-${item.id}`} id={`${item.type}-${item.id}`}>
+                    <AgeRestrictedMedia key={`${item.type}-${item.id}`} item={item}>
+                    <SortableMediaItem id={`${item.type}-${item.id}`}>
                       <motion.div
                         whileHover={activeItemDragId ? undefined : {
                           scale: 1.05,
@@ -4269,6 +4300,7 @@ const Profile: React.FC = () => {
                         </motion.button>
                       </motion.div>
                     </SortableMediaItem>
+                    </AgeRestrictedMedia>
                   ))}
                 </div>
               </SortableContext>
@@ -4772,7 +4804,7 @@ const Profile: React.FC = () => {
                   </motion.div>
                 )}
               </AnimatePresence>
-            ), document.body)
+            ), getOverlayPortalRoot())
           }
 
           {/* Popup affichant le localStorage - affichage via portail */}
@@ -4848,7 +4880,7 @@ const Profile: React.FC = () => {
                   </motion.div>
                 )}
               </AnimatePresence>
-            ), document.body)
+            ), getOverlayPortalRoot())
           }
 
           {/* Popup d'importation de données - affichage via portail */}
@@ -4954,7 +4986,7 @@ const Profile: React.FC = () => {
                   </motion.div>
                 )}
               </AnimatePresence>
-            ), document.body)
+            ), getOverlayPortalRoot())
           }
 
           {showAvatarModal && (

@@ -101,6 +101,14 @@ internal class NetworkBoundMediaProxyUpstream(
         headers.putAll(MediaProxyPolicy.sanitizeRequestHeaders(target.headers))
         headers.putAll(MediaProxyPolicy.sanitizeLocalRequestHeaders(localRequestHeaders))
         headers.putIfAbsent("Sec-Ch-Ua", MediaProxyPolicy.PLAYBACK_SEC_CH_UA)
+        headers.putIfAbsent(
+            "Sec-Ch-Ua-Mobile",
+            MediaProxyPolicy.PLAYBACK_SEC_CH_UA_MOBILE,
+        )
+        headers.putIfAbsent(
+            "Sec-Ch-Ua-Platform",
+            MediaProxyPolicy.PLAYBACK_SEC_CH_UA_PLATFORM,
+        )
         headers.putIfAbsent("Sec-Fetch-Site", "cross-site")
         headers.putIfAbsent("Sec-Fetch-Mode", "cors")
         headers.putIfAbsent("Sec-Fetch-Dest", "empty")
@@ -142,6 +150,15 @@ internal class NetworkBoundMediaProxyUpstream(
                 }
                 return@repeat
             }
+            MediaProxyJournal.record(
+                phase = "media/network-bound",
+                method = target.method,
+                url = response.finalUrl,
+                requestHeaders = headers,
+                statusCode = response.statusCode,
+                responseHeaders = response.headers,
+                localRequestHeaders = localRequestHeaders,
+            )
             return MediaProxyUpstreamResponse(
                 statusCode = response.statusCode,
                 statusMessage = response.statusMessage,

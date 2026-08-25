@@ -6,6 +6,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Check, ChevronDown } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { getOverlayPortalRoot } from "@/utils/overlayPortal";
 
 // Context for Select
 interface SelectContextType {
@@ -295,7 +296,7 @@ const SelectContent: React.FC<SelectContentProps> = ({ className, children }) =>
         </AnimatePresence>
     );
 
-    return createPortal(content, document.body);
+    return createPortal(content, getOverlayPortalRoot());
 };
 
 // SelectItem

@@ -80,6 +80,7 @@ async function _performCheck(accessKey: string): Promise<boolean> {
 
     const data = await response.json();
 
+    const previousCheckResult = lastCheckResult;
     lastCheckTime = Date.now();
     lastCheckResult = data.vip === true;
 
@@ -100,7 +101,10 @@ async function _performCheck(accessKey: string): Promise<boolean> {
         localStorage.setItem('is_vip', 'true');
       }
 
-      if (changed) {
+      // Une connexion avec un code VIP pose dÃ©jÃ  `is_vip` avant cette
+      // vÃ©rification. Il faut aussi notifier lorsque la vÃ©rification devient
+      // positive pour la premiÃ¨re fois, mÃªme si la valeur locale n'a pas changÃ©.
+      if (changed || previousCheckResult !== true) {
         window.dispatchEvent(new Event('storage'));
         window.dispatchEvent(new CustomEvent('vipStatusChanged', { detail: { vip: true } }));
       }

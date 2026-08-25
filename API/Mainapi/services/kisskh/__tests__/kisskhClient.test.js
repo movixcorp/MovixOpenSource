@@ -17,7 +17,6 @@ function fakePolicy(overrides = {}) {
   const calls = { assert: 0, reserve: 0, reserveGlobal: 0, success: [], failure: [], rateLimited: [] };
   return {
     calls,
-    allowsDirectTransport() { return false; },
     async assertCircuitClosed() { calls.assert += 1; },
     async reserve() {
       calls.reserve += 1;
@@ -28,53 +27,10 @@ function fakePolicy(overrides = {}) {
     async reserveGlobal() { calls.reserveGlobal += 1; },
     async recordSuccess(proxy) { calls.success.push(proxy); },
     async recordFailure(proxy, kind) { calls.failure.push([proxy, kind]); },
-    async record429(proxy, headers) { calls.rateLimited.push([proxy, headers]); },
+    async record429(headers) { calls.rateLimited.push(headers); },
     ...overrides,
   };
 }
-
-test('metadata requests use direct HTTPS only when the proxy policy explicitly allows it', async () => {
-  const calls = [];
-  const policy = fakePolicy({
-    allowsDirectTransport() { return true; },
-    async reserve() {
-      policy.calls.reserve += 1;
-      return null;
-    },
-  });
-  const client = require('../kisskhClient').createKisskhClient(createDeps(async (options) => {
-    calls.push(options);
-    return ok([{ id: 1 }]);
-  }, { proxyPolicy: policy }));
-
-  assert.deepEqual(await client.search('Business Proposal'), [{ id: 1 }]);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].proxy, undefined);
-  assert.equal(policy.calls.success.length, 0);
-  assert.equal(policy.calls.failure.length, 0);
-  assert.equal(policy.calls.rateLimited.length, 0);
-});
-
-test('metadata requests stay fail-closed when proxies are configured but none can be reserved', async () => {
-  let requestCalls = 0;
-  const policy = fakePolicy({
-    allowsDirectTransport() { return false; },
-    async reserve() {
-      policy.calls.reserve += 1;
-      return null;
-    },
-  });
-  const client = require('../kisskhClient').createKisskhClient(createDeps(async () => {
-    requestCalls += 1;
-    return ok([]);
-  }, { proxyPolicy: policy }));
-
-  await assert.rejects(
-    client.search('Business Proposal'),
-    (error) => error.code === 'provider_unavailable',
-  );
-  assert.equal(requestCalls, 0);
-});
 
 function createDeps(request, overrides = {}) {
   return {
@@ -246,33 +202,18 @@ test('Episode accepts the provider JSON body served as image/png while other met
   await assert.rejects(client.search('Business Proposal'), (error) => error.code === 'provider_security');
 });
 
-test('429 quarantines the current proxy and retries with the next proxy', async () => {
+test('429 opens the global breaker and is not retried on another proxy', async () => {
   const calls = [];
   const policy = fakePolicy();
   const client = require('../kisskhClient').createKisskhClient(createDeps(async (options) => {
     calls.push(options);
-    if (calls.length === 1) return { status: 429, headers: { 'retry-after': '90' }, data: {} };
-    return ok([{ id: 1 }]);
+    return { status: 429, headers: { 'retry-after': '90' }, data: {} };
   }, { proxyPolicy: policy }));
-  assert.deepEqual(await client.search('Business Proposal'), [{ id: 1 }]);
-  assert.equal(calls.length, 2);
-  assert.equal(policy.calls.reserve, 2);
-  assert.deepEqual(policy.calls.rateLimited, [[PROXIES[0], { 'retry-after': '90' }]]);
-  assert.deepEqual(policy.calls.success, [PROXIES[1]]);
-  assert.equal(policy.calls.failure.length, 0);
-});
-
-test('three consecutive 429 responses stop after three distinct proxies', async () => {
-  const calls = [];
-  const policy = fakePolicy();
-  const client = require('../kisskhClient').createKisskhClient(createDeps(async (options) => {
-    calls.push(options);
-    return { status: 429, headers: {}, data: {} };
-  }, { proxyPolicy: policy, maxAttempts: 3 }));
-
   await assert.rejects(client.search('Business Proposal'), (error) => error.code === 'provider_rate_limited');
-  assert.deepEqual(calls.map((call) => call.proxy.host), PROXIES.map((proxy) => proxy.host));
-  assert.equal(policy.calls.rateLimited.length, 3);
+  assert.equal(calls.length, 1);
+  assert.equal(policy.calls.reserve, 1);
+  assert.equal(policy.calls.assert, 1, 'transport rechecks the breaker after its global slot');
+  assert.equal(policy.calls.rateLimited.length, 1);
   assert.equal(policy.calls.failure.length, 0);
 });
 

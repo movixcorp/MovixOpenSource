@@ -15,6 +15,12 @@ const axios = require('axios');
 
 const { CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
 const { memoryCache } = require('../config/redis');
+const { respondWithResolvedSources } = require('../utils/embedExtraction');
+
+// Cpasmal expose la map de langues sous `links` (`{ vf: [...], vostfr: [...] }`),
+// et une seule route sert film comme épisode : la même bascule couvre les deux.
+const respondWithSources = (req, res, payload) =>
+  respondWithResolvedSources(req, res, payload, { movieMapKey: 'links', label: 'CPASMAL' });
 const { fetchTmdbDetails } = require('../utils/tmdbCache');
 const { acquireRedisLock } = require('../utils/redisLock');
 
@@ -750,7 +756,7 @@ router.get('/movie/:tmdbid', async (req, res) => {
             prochaineMiseAJour = new Date(nextUpdateTime).toISOString();
           }
         } catch (e) { /* ignore */ }
-        res.json({ ...cachedData, prochaineMiseAJour });
+        await respondWithSources(req, res, { ...cachedData, prochaineMiseAJour });
       }
 
       // Background update if old OR if links are empty
@@ -775,7 +781,7 @@ router.get('/movie/:tmdbid', async (req, res) => {
 
     await saveCpasmalCachePreservingPlayable(cacheKey, data);
     const prochaineMiseAJour = new Date(Date.now() + 40 * 60 * 1000).toISOString();
-    res.json({ ...data, prochaineMiseAJour });
+    await respondWithSources(req, res, { ...data, prochaineMiseAJour });
     if (process.env.DEBUG_CPASMAL) console.timeEnd(`[Cpasmal API] Total /movie/${tmdbid}`);
 
   } catch (error) {
@@ -828,7 +834,7 @@ router.get('/tv/:tmdbid/:season/:episode', async (req, res) => {
             prochaineMiseAJour = new Date(nextUpdateTime).toISOString();
           }
         } catch (e) { /* ignore */ }
-        res.json({ ...cachedData, prochaineMiseAJour });
+        await respondWithSources(req, res, { ...cachedData, prochaineMiseAJour });
       }
 
       // Background update if old OR if links are empty
@@ -853,7 +859,7 @@ router.get('/tv/:tmdbid/:season/:episode', async (req, res) => {
 
     await saveCpasmalCachePreservingPlayable(cacheKey, data);
     const prochaineMiseAJour = new Date(Date.now() + 40 * 60 * 1000).toISOString();
-    res.json({ ...data, prochaineMiseAJour });
+    await respondWithSources(req, res, { ...data, prochaineMiseAJour });
 
   } catch (error) {
     if (error.message && error.message.includes('not found')) {

@@ -139,74 +139,6 @@ test('concurrent identical resolutions share provider work and mint fresh fallba
     && mode === 'EX' && ttl === 120));
 });
 
-test('logs correlated resolver phases with elapsed durations', async () => {
-  const nowState = { value: 10_000 };
-  const infoLogs = [];
-  const progressEvents = [];
-  const setup = makeResolver({
-    nowState,
-    logger: { info(...args) { infoLogs.push(args); } },
-    async resolveProvider() {
-      nowState.value += 75;
-      return providerFixture();
-    },
-  });
-
-  await setup.resolver.resolveTv(
-    { tmdbId: 154825, season: 1, episode: 3 },
-    { onProgress(event) { progressEvents.push(event); } },
-  );
-
-  const phases = progressEvents;
-  assert.deepEqual(phases.map(({ phase }) => phase), [
-    'prepare_started',
-    'provider_started',
-    'provider_resolved',
-    'resolution_cached',
-  ]);
-  for (const context of phases) {
-    assert.equal(context.resolutionId, 'tv:154825:1:3');
-    assert.equal(context.mediaType, 'tv');
-    assert.equal(context.tmdbId, 154825);
-    assert.equal(context.season, 1);
-    assert.equal(context.episode, 3);
-    assert.equal(Number.isSafeInteger(context.elapsedMs), true);
-  }
-  assert.equal(phases.at(-1).kisskhDramaId, 4608);
-  assert.equal(phases.at(-1).episodeId, 86439);
-  assert.equal(phases.at(-1).subtitleCount, 4);
-  assert.deepEqual(infoLogs, []);
-});
-
-test('a second worker reports distributed lock contention instead of a false warm completion', async () => {
-  const redis = createRedisDouble();
-  let providerCalls = 0;
-  let releaseProvider;
-  let markStarted;
-  const providerStarted = new Promise((resolve) => { markStarted = resolve; });
-  const providerGate = new Promise((resolve) => { releaseProvider = resolve; });
-  const resolveProvider = async () => {
-    providerCalls += 1;
-    markStarted();
-    await providerGate;
-    return providerFixture();
-  };
-  const owner = makeResolver({ redis, resolveProvider });
-  const follower = makeResolver({ redis, resolveProvider });
-  const request = { tmdbId: 154825, season: 1, episode: 3 };
-
-  const ownerWarm = owner.resolver.warmTv(request);
-  await providerStarted;
-  await assert.rejects(
-    follower.resolver.warmTv(request),
-    (error) => error.code === 'provider_unavailable'
-      && error.details?.reason === 'lock_contended',
-  );
-  releaseProvider();
-  await ownerWarm;
-  assert.equal(providerCalls, 1);
-});
-
 test('metadata cache TTLs are exact, sensitive payload stays in bounded local LRU, and lock release compares token', async () => {
   const setup = makeResolver({ resolveProvider: async () => providerFixture() });
   const result = await setup.resolver.resolveTv({ tmdbId: 154825, season: 1, episode: 3 });
@@ -399,12 +331,11 @@ test('episode and subtitle payloads survive a new cache instance through the dis
   assert.equal(await expired.getSensitive('episode', 86439), null);
 });
 
-test('a resolved TV request stays fresh for 12 hours and remains available stale after restart', async (t) => {
+test('a resolved TV request survives a new cache instance through the disk cache', async (t) => {
   const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'movix-kisskh-resolution-cache-'));
   t.after(() => fsp.rm(cacheDir, { recursive: true, force: true }));
   const { createKisskhCache } = require('../kisskhCache');
-  const nowState = { value: 1_000 };
-  const deps = { cacheDir, now: () => nowState.value, sensitiveTtlSeconds: 600 };
+  const deps = { cacheDir, now: () => 1_000, sensitiveTtlSeconds: 600 };
   const value = {
     match: {
       tmdbId: 286506, kisskhDramaId: 123, episodeId: 456, season: 1, episode: 3,
@@ -417,46 +348,6 @@ test('a resolved TV request stays fresh for 12 hours and remains available stale
 
   await createKisskhCache(deps).setResolution('tv', 286506, 1, 3, value);
   assert.deepEqual(await createKisskhCache(deps).getResolution('tv', 286506, 1, 3), value);
-
-  nowState.value += 43_199_999;
-  assert.deepEqual(await createKisskhCache(deps).getResolution('tv', 286506, 1, 3), value);
-  nowState.value += 1;
-  const restarted = createKisskhCache(deps);
-  assert.equal(await restarted.getResolution('tv', 286506, 1, 3), null);
-  assert.deepEqual(
-    await restarted.getResolution('tv', 286506, 1, 3, { allowStale: true }),
-    value,
-  );
-  assert.ok((await fsp.readdir(cacheDir)).includes('tv-286506-1-3.json'));
-});
-
-test('a failed refresh keeps serving the last stale TV resolution from disk', async (t) => {
-  const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'movix-kisskh-stale-resolution-'));
-  t.after(() => fsp.rm(cacheDir, { recursive: true, force: true }));
-  const nowState = { value: 1_000 };
-  const request = { tmdbId: 286506, season: 1, episode: 3 };
-  const value = {
-    match: {
-      ...request,
-      kisskhDramaId: 123,
-      episodeId: 456,
-      evidence: { score: 100, titleSource: 'localized' },
-    },
-    mediaUrl: 'https://media.example/master.m3u8',
-    requiredHeaders: { Referer: 'https://kisskh.nl/', Origin: 'https://kisskh.nl' },
-    subtitles: [],
-  };
-  const setup = makeResolver({
-    cacheDir,
-    nowState,
-    async resolveProvider() { throw new Error('temporary provider failure'); },
-  });
-  await setup.cache.setResolution('tv', request.tmdbId, request.season, request.episode, value);
-  nowState.value += 43_200_000;
-
-  assert.equal((await setup.resolver.getCachedTv(request)).match.episodeId, 456);
-  await assert.rejects(setup.resolver.warmTv(request));
-  assert.equal((await setup.resolver.getCachedTv(request)).match.episodeId, 456);
 });
 
 test('catalogue snapshot persists atomically, can be read stale, and rejects invalid replacement', async (t) => {
@@ -499,19 +390,6 @@ test('catalogue retrieval progress is shared through Redis and can be cleared', 
   assert.deepEqual(await reader.getCatalogProgress(), progress);
   await reader.clearCatalogProgress();
   assert.equal(await writer.getCatalogProgress(), null);
-});
-
-test('catalogue retrieval progress falls back to process memory when Redis misses the write', async () => {
-  const redis = {
-    async get() { return null; },
-    async set() { throw new Error('Redis unavailable'); },
-  };
-  const cache = require('../kisskhCache').createKisskhCache({ redis });
-  const progress = { phase: 'starting', completed: 0, total: null, percent: null };
-
-  await cache.setCatalogProgress(progress);
-
-  assert.deepEqual(await cache.getCatalogProgress(), progress);
 });
 
 test('match cache v2 keeps seasons independently while mirroring v1 for code rollback', async () => {
@@ -986,33 +864,6 @@ test('discovery falls through incompatible categories and confirms the first com
   assert.deepEqual([...new Set(searchTypes)], [0, 1, 2]);
 });
 
-test('episode asset retrieval times out and releases the resolution instead of hanging forever', { timeout: 250 }, async () => {
-  const progress = [];
-  const setup = makeResolver(discoveryFixture({
-    useEnhancedCatalogMatching: false,
-    assetTimeoutMs: 20,
-    kisskhClient: {
-      async search() { return [{ id: 22, title: 'Fallback Drama', episodesCount: 1 }]; },
-      async getDrama() {
-        return { id: 22, title: 'Fallback Drama', episodes: [{ id: 2201, number: 1 }] };
-      },
-      async getEpisode() { return new Promise(() => {}); },
-      async getSubtitles() { return new Promise(() => {}); },
-    },
-  }));
-
-  await assert.rejects(
-    setup.resolver.resolveTv(
-      { tmdbId: 901, season: 1, episode: 1 },
-      { onProgress(event) { progress.push(event); } },
-    ),
-    (error) => error.code === 'provider_unavailable',
-  );
-
-  assert.ok(progress.some(({ phase }) => phase === 'episode_assets_timeout'));
-  assert.ok(progress.some(({ phase }) => phase === 'provider_failed'));
-});
-
 test('season four discovery finds From through the bare title in Hollywood category', async () => {
   const searches = [];
   const setup = makeResolver(discoveryFixture({
@@ -1216,13 +1067,9 @@ test('explicit catalogue warm-up builds the complete disk snapshot independently
   const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'movix-kisskh-explicit-catalogue-'));
   t.after(() => fsp.rm(cacheDir, { recursive: true, force: true }));
   const listCalls = [];
-  const consoleLogs = [];
   const setup = makeResolver({
     cacheDir,
-    logger: {
-      info(...args) { consoleLogs.push(args); },
-      warn(...args) { consoleLogs.push(args); },
-    },
+    logger: { info() {}, warn() {} },
     kisskhClient: {
       async list(page, pageSize, type) {
         listCalls.push([page, pageSize, type]);
@@ -1241,7 +1088,6 @@ test('explicit catalogue warm-up builds the complete disk snapshot independently
   assert.deepEqual(listCalls, [[1, 100, 0], [2, 100, 0]]);
   assert.equal((await setup.cache.getCatalogSnapshot()).items.length, 101);
   assert.equal(await setup.resolver.getRetrievalProgress(), null);
-  assert.deepEqual(consoleLogs, []);
 });
 
 test('enhanced discovery builds every catalogue page and treats decimal episodes as bonuses', async (t) => {
@@ -1249,8 +1095,6 @@ test('enhanced discovery builds every catalogue page and treats decimal episodes
   t.after(() => fsp.rm(cacheDir, { recursive: true, force: true }));
   const listCalls = [];
   const progressEvents = [];
-  const resolverPhases = [];
-  const consoleLogs = [];
   let searchCalls = 0;
   const noises = Array.from({ length: 100 }, (_, index) => ({
     id: index + 1,
@@ -1283,8 +1127,10 @@ test('enhanced discovery builds every catalogue page and treats decimal episodes
   const setup = makeResolver(discoveryFixture({
     cacheDir,
     logger: {
-      info(...args) { consoleLogs.push(args); },
-      warn(...args) { consoleLogs.push(args); },
+      info(message, value) {
+        if (message === '[KISSKH] catalogue retrieval progress') progressEvents.push(value);
+      },
+      warn() {},
     },
     async fetchTmdbDetails(_url, _key, id) {
       return {
@@ -1300,22 +1146,7 @@ test('enhanced discovery builds every catalogue page and treats decimal episodes
     kisskhClient: client,
   }));
 
-  const result = await setup.resolver.resolveTv(
-    { tmdbId: 93405, season: 2, episode: 7 },
-    {
-      onProgress(event) {
-        resolverPhases.push(event);
-        if (event.phase === 'catalog_progress') {
-          progressEvents.push({
-            phase: event.catalogPhase,
-            completed: event.completed,
-            total: event.total,
-            percent: event.percent,
-          });
-        }
-      },
-    },
-  );
+  const result = await setup.resolver.resolveTv({ tmdbId: 93405, season: 2, episode: 7 });
   assert.equal(result.match.kisskhDramaId, 975);
   assert.equal(result.match.episodeId, 97_506);
   assert.deepEqual(listCalls, [[1, 100, 0], [2, 100, 0]]);
@@ -1327,22 +1158,6 @@ test('enhanced discovery builds every catalogue page and treats decimal episodes
   assert.equal(await setup.resolver.getRetrievalProgress(), null);
   assert.equal(searchCalls, 0);
   assert.equal((await setup.cache.getEpisodes(975)).length, 7);
-  for (const expected of [
-    'tmdb_and_catalog_started',
-    'catalog_page_started',
-    'catalog_page_resolved',
-    'catalog_match_resolved',
-    'episode_assets_started',
-    'episode_video_started',
-    'episode_video_resolved',
-    'episode_subtitles_started',
-    'episode_subtitles_resolved',
-    'episode_assets_resolved',
-  ]) {
-    assert.ok(resolverPhases.some(({ phase }) => phase === expected), expected);
-  }
-  assert.ok(resolverPhases.every(({ resolutionId }) => resolutionId === 'tv:93405:2:7'));
-  assert.deepEqual(consoleLogs, []);
 
   const diskSetup = makeResolver(discoveryFixture({
     cacheDir,

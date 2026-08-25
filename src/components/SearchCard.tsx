@@ -6,6 +6,7 @@ import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
 import { encodeId } from '../utils/idEncoder';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 interface SearchResult {
     id: number;
@@ -29,6 +30,22 @@ const POSTER_FALLBACK = `data:image/svg+xml,${encodeURIComponent('<svg width="50
 // page, repeated every time `index` shifts in the React key. Now the parse
 // happens at most once per media_type per browsing session (or after a
 // toggle / cross-tab change). — perf
+/*
+ * `backdrop-blur` a été retiré des pastilles et du bouton watchlist de ces
+ * cartes. Un flou d'arrière-plan force une couche de composition et un
+ * repaint de la zone derrière l'élément ; multiplié par les deux ou trois
+ * éléments de chaque carte et par les vingt cartes d'une grille, c'est ce qui
+ * faisait ramer le défilement des pages de genre. Les fonds ont été assombris
+ * d'autant : à l'œil, la différence ne se voit pas.
+ */
+
+/**
+ * Nombre de cartes qui jouent l'animation d'apparition. Les grilles de genre et
+ * de recherche en affichent une vingtaine d'un coup ; animer les dernières ne
+ * se voit pas et coûte autant que d'animer les premières.
+ */
+const ANIMATED_CARD_COUNT = 12;
+
 const watchlistCache: Record<string, Set<number> | undefined> = {};
 
 const getWatchlistIds = (mediaType: 'movie' | 'tv'): Set<number> => {
@@ -75,6 +92,7 @@ interface GridCardProps {
 
 export const SearchGridCard: React.FC<GridCardProps> = React.memo(({ item, index, movieLabel, serieLabel }) => {
     const { t } = useTranslation();
+    const { items: allowedItems } = useAgeRestrictedContent([item]);
     const [starred, setStarred] = useState(() => getWatchlistIds(item.media_type).has(item.id));
 
     const title = item.title || item.name || '';
@@ -99,16 +117,21 @@ export const SearchGridCard: React.FC<GridCardProps> = React.memo(({ item, index
         invalidateWatchlistCache(item.media_type);
     }, [item, title, t]);
 
+    if (allowedItems.length === 0) return null;
+
     return (
         <motion.div
-            initial={{ opacity: 0, y: 20 }}
+            // Seules les premières cartes s'animent à l'apparition. Au-delà, on
+            // faisait démarrer des dizaines d'animations simultanées pour des
+            // vignettes hors écran — coût réel, effet invisible.
+            initial={index < ANIMATED_CARD_COUNT ? { opacity: 0, y: 20 } : false}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.3, delay: Math.min(index * 0.03, 0.5) }}
             whileHover={{ scale: 1.05 }}
             className="relative group rounded-xl overflow-hidden bg-white/5 border border-white/10 hover:border-white/20 transition-colors"
         >
             {/* Badge */}
-            <span className="absolute top-2 left-2 z-10 px-2 py-1 rounded-lg bg-black/60 backdrop-blur-sm text-[10px] font-semibold uppercase tracking-wider text-white/80">
+            <span className="absolute top-2 left-2 z-10 px-2 py-1 rounded-lg bg-black/75 text-[10px] font-semibold uppercase tracking-wider text-white/80">
                 {item.media_type === 'tv' ? serieLabel : movieLabel}
             </span>
 
@@ -118,7 +141,7 @@ export const SearchGridCard: React.FC<GridCardProps> = React.memo(({ item, index
                     <motion.button
                         onClick={toggle}
                         whileTap={{ scale: 0.7 }}
-                        className={`absolute top-2 right-2 z-20 p-2 rounded-full backdrop-blur-sm transition-all duration-200 md:opacity-0 md:group-hover:opacity-100 ${starred ? 'bg-yellow-500/20 border border-yellow-400/30' : 'bg-black/40 hover:bg-black/60'}`}
+                        className={`absolute top-2 right-2 z-20 p-2 rounded-full transition-all duration-200 md:opacity-0 md:group-hover:opacity-100 ${starred ? 'bg-yellow-500/25 border border-yellow-400/30' : 'bg-black/55 hover:bg-black/70'}`}
                     >
                         <motion.div
                             key={starred ? 'on' : 'off'}
@@ -138,10 +161,17 @@ export const SearchGridCard: React.FC<GridCardProps> = React.memo(({ item, index
                 </TooltipContent>
             </Tooltip>
 
-            {/* Poster */}
+            {/* Poster
+                w342 et non w500 : une carte de grille fait ~200 px de large,
+                le w500 pesait le double pour rien — et ces pages en affichent
+                vingt à la fois. `lazy` + `async` évitent de décoder d'un bloc
+                tous les posters sous la ligne de flottaison, ce qui bloquait le
+                thread principal pendant le rendu. */}
             <img
-                src={`https://image.tmdb.org/t/p/w500${item.poster_path}`}
+                src={`https://image.tmdb.org/t/p/w342${item.poster_path}`}
                 alt={item.title || item.name}
+                loading="lazy"
+                decoding="async"
                 className="w-full aspect-[2/3] object-cover"
                 onError={(e) => { (e.target as HTMLImageElement).onerror = null; (e.target as HTMLImageElement).src = POSTER_FALLBACK; }}
             />
@@ -194,6 +224,7 @@ interface ListCardProps {
 
 export const SearchListCard: React.FC<ListCardProps> = React.memo(({ item, index, movieLabel, serieLabel, watchlistLabel, removeLabel, noDescLabel }) => {
     const { t } = useTranslation();
+    const { items: allowedItems } = useAgeRestrictedContent([item]);
     const [starred, setStarred] = useState(() => getWatchlistIds(item.media_type).has(item.id));
 
     const title = item.title || item.name || '';
@@ -218,6 +249,8 @@ export const SearchListCard: React.FC<ListCardProps> = React.memo(({ item, index
         invalidateWatchlistCache(item.media_type);
     }, [item, title, t]);
 
+    if (allowedItems.length === 0) return null;
+
     return (
         <motion.div
             initial={{ opacity: 0, x: -20 }}
@@ -229,13 +262,15 @@ export const SearchListCard: React.FC<ListCardProps> = React.memo(({ item, index
                 className="flex gap-4 p-4 rounded-xl bg-white/5 border border-white/10 hover:border-white/20 hover:bg-white/[0.08] transition-all group"
             >
                 <div className="relative flex-shrink-0">
-                    <span className="absolute top-1 left-1 z-10 px-2 py-1 rounded-lg bg-black/60 backdrop-blur-sm text-[10px] font-semibold uppercase tracking-wider text-white/80">
+                    <span className="absolute top-1 left-1 z-10 px-2 py-1 rounded-lg bg-black/75 text-[10px] font-semibold uppercase tracking-wider text-white/80">
                         {item.media_type === 'tv' ? serieLabel : movieLabel}
                     </span>
                     <img
                         className="w-20 h-28 sm:w-24 sm:h-36 rounded-lg object-cover"
-                        src={item.poster_path ? `https://image.tmdb.org/t/p/w342${item.poster_path}` : POSTER_FALLBACK}
+                        src={item.poster_path ? `https://image.tmdb.org/t/p/w185${item.poster_path}` : POSTER_FALLBACK}
                         alt={item.title || item.name}
+                        loading="lazy"
+                        decoding="async"
                         onError={(e) => { (e.target as HTMLImageElement).onerror = null; (e.target as HTMLImageElement).src = POSTER_FALLBACK; }}
                     />
                 </div>

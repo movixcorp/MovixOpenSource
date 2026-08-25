@@ -26,6 +26,7 @@ import {
 import { encodeId } from '../utils/idEncoder';
 import { SquareBackground } from '../components/ui/square-background';
 import '../styles/cinegraph.css';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 // ─── Image cache for canvas rendering ────────────────────────────────────────
 
@@ -1070,7 +1071,7 @@ const CineGraphPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* ─── Detail Panel (portaled to body so close button & top area are clickable) ─ */}
@@ -1231,7 +1232,7 @@ const CineGraphPage: React.FC = () => {
           </motion.div>
         )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* ─── Help Modal (portaled like WatchPartyTutorial) ──────────────── */}
@@ -1303,7 +1304,7 @@ const CineGraphPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* ─── Settings Modal ─────────────────────────────────────────────── */}
@@ -1551,7 +1552,7 @@ const CineGraphPage: React.FC = () => {
             </motion.div>
           )}
         </AnimatePresence>,
-        document.body
+        getOverlayPortalRoot()
       )}
 
       {/* ─── Trending / Start Screen ────────────────────────────────────── */}

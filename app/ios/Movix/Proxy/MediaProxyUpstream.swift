@@ -103,6 +103,12 @@ final class MediaProxyUpstream: @unchecked Sendable {
     if headers["Sec-Ch-Ua"] == nil {
       headers["Sec-Ch-Ua"] = MediaProxyPolicy.playbackSecChUa
     }
+    if headers["Sec-Ch-Ua-Mobile"] == nil {
+      headers["Sec-Ch-Ua-Mobile"] = MediaProxyPolicy.playbackSecChUaMobile
+    }
+    if headers["Sec-Ch-Ua-Platform"] == nil {
+      headers["Sec-Ch-Ua-Platform"] = MediaProxyPolicy.playbackSecChUaPlatform
+    }
 
     var currentURL = target.upstreamURL
     var redirects = 0
@@ -123,6 +129,18 @@ final class MediaProxyUpstream: @unchecked Sendable {
         headers: headers,
         pinnedAddresses: validated.addresses
       ))
+
+      // Corps non relevé : il arrive en flux et le lire le consommerait pour le
+      // lecteur. Ce sont les en-têtes émis qui départagent un 403.
+      MediaProxyJournal.record(
+        phase: "media/ios",
+        method: method,
+        url: currentURL.absoluteString,
+        requestHeaders: headers,
+        statusCode: response.statusCode,
+        responseHeaders: response.headers,
+        localRequestHeaders: localHeaders
+      )
 
       guard Self.redirectStatusCodes.contains(response.statusCode) else {
         return MediaProxyUpstreamResponse(

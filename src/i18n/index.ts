@@ -4,6 +4,7 @@ import LanguageDetector from 'i18next-browser-languagedetector';
 
 import { resolveCurrentDomain } from './currentDomain';
 import fr from './locales/fr.json';
+import { clearHttpCache } from '../utils/httpCache';
 
 export const SUPPORTED_LANGUAGES = [
   { code: 'fr', label: 'Fran\u00e7ais', flagUrl: 'https://flagcdn.com/w40/fr.png' },
@@ -143,6 +144,18 @@ i18n
 // Couvre les changements de langue ultérieurs vers l'anglais (sélecteur de
 // langue via changeLanguage, détection async par IP dans detectInitialLanguage).
 i18n.on('languageChanged', maybeLoadEnglishBundle);
+
+// Le cache des lectures de catalogue est indexé sur l'URL, et la plupart des
+// appels TMDB portent déjà `language=` — mais pas tous. Un vrai changement de
+// langue le vide donc entièrement, pour ne pas resservir des titres dans
+// l'ancienne. Seulement un vrai changement : i18next émet aussi l'événement au
+// démarrage, quand la langue est simplement *établie*, et vider le cache à ce
+// moment-là jetterait à chaque boot ce qui venait d'être mis de côté.
+let lastKnownLanguage: string | null = null;
+i18n.on('languageChanged', (lng: string) => {
+  if (lastKnownLanguage !== null && lastKnownLanguage !== lng) clearHttpCache();
+  lastKnownLanguage = lng;
+});
 
 // Helper to change language and persist locally
 export const changeLanguage = async (lang: SupportedLanguage): Promise<void> => {

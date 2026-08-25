@@ -31,30 +31,6 @@ Notes utiles :
 - `NUM_WORKERS` permet de régler le nombre de workers du cluster
 - MySQL et Redis sont nécessaires pour une grosse partie des routes
 
-## Initialiser ou compléter le schéma MySQL
-
-L'initialiseur requiert **MySQL 8.0.13 ou plus récent**. Cette version minimale permet de comparer les expressions, préfixes, ordres, types et visibilité des index via `INFORMATION_SCHEMA`, en plus du moteur, des charsets, collations et règles de clés étrangères.
-
-Depuis `API/Mainapi` :
-
-```bash
-npm run db:init
-```
-
-La commande analyse d'abord les tables, colonnes, index et contraintes, puis affiche toutes les opérations prévues avant la première écriture. Un drift bloquant affiche les définitions `expected` et `actual`. Si le schéma change pendant l'acquisition du verrou, aucune DDL n'est appliquée et le diagnostic demande de relancer l'initialiseur.
-
-Si la base contient déjà des tables, elle demande `Continuer ? (O/N)`. Si des changements concernent `wrapped_viewing_data` ou `wrapped_pages_data`, elle avertit avant le second prompt que les opérations peuvent causer des verrous longs, augmenter la charge, la durée et l'espace disque utilisé, puis demande exactement `Modifier les tables Wrapped ? (O/N)`.
-
-Le script est uniquement additif : aucune suppression, aucun renommage et aucune reconstruction de données. Une réponse autre que `O` ou `o` annule la confirmation concernée. N'interromps pas une création d'index Wrapped déjà confirmée : sur une table volumineuse, MySQL peut travailler longtemps.
-
-Pour afficher le plan sans exécuter de DDL :
-
-```bash
-npm run db:init -- --dry-run
-```
-
-Le dry-run se connecte tout de même à la base configurée dans `.env`. Il ne doit donc pas être confondu avec une vérification locale hors connexion.
-
 ## Architecture
 
 ```text
@@ -87,21 +63,11 @@ Le fichier `API/Mainapi/.env.example` est la référence complète. En pratique,
 - cœur applicatif : `JWT_SECRET`, `TMDB_API_KEY`, `FRONTEND_BASE_URL`
 - données : `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
 - cache et coordination : `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `NUM_WORKERS`
-- scraping / proxy : `PROXY_SERVER_URL`, `CF_PROXY_403_URL`, `BYPASS403_SERVER_URL`, `SOCKS5_PROXIES`, `HTTP_PROXIES`
+- scraping / proxy : `PROXY_SERVER_URL`, `IPTV_STREAM_PROXY`, `SOCKS5_PROXIES`, `HTTP_PROXIES`
 - anti-abuse / forms : `TURNSTILE_SECRET_KEY`, `TURNSTILE_INVISIBLE_SECRETKEY`
 - paiement / VIP : variables `VIP_*`, `BLOCKCYPHER_TOKEN`
 
 Certaines intégrations sont très spécifiques à des sources données, par exemple les cookies `DARKIWORLD_*`, `FSTREAM_LOGIN_*` ou `XTREAM_*`.
-
-## Source téléchargements (Darkino)
-
-La source téléchargements (`routes/darkiworld.js` + `utils/darkiworldSqlite.js`) lit des snapshots SQLite locaux au lieu de scraper à chaud : `mirror.sqlite`, `darkino.sqlite` et `links_small.sqlite`. Ces fichiers ne sont pas versionnés — il faut les récupérer et les extraire dans `darkino-backups/` :
-
-1. Télécharger l'archive : https://pixeldrain.com/u/n2M1s1MA
-2. Extraire les `.sqlite` dans `API/Mainapi/darkino-backups/`
-3. (Optionnel) pointer `DARKIWORLD_SQLITE_DIR` vers un autre dossier absolu — ex Pterodactyl : `/home/container/darkino-backups`
-
-Sans ces fichiers, chaque décodage de lien renvoie `sqlite_miss` (le fallback live hydracker ne s'active que si `HYDRACKER_LIVE_ENABLED=true`).
 
 ## Points d'entrée utiles
 
@@ -115,6 +81,6 @@ Sans ces fichiers, chaque décodage de lien renvoie `sqlite_miss` (le fallback l
 ## À garder en tête
 
 - Le backend actif est ici, pas dans l'ancien contenu direct de `API/`.
-- Un petit bootstrap de compatibilité initialise encore quelques tables au démarrage ; pour créer ou compléter le schéma MainAPI, utilise [l'initialiseur MySQL](#initialiser-ou-compléter-le-schéma-mysql).
+- Plusieurs tables MySQL sont initialisées automatiquement au démarrage.
 - Une partie du comportement applicatif dépend de caches disque et de proxys externes ; un bug peut venir d'ailleurs que du code route lui-même.
-- Si une feature touche la lecture vidéo, regarde aussi `API/proxiesembed/`, `API/miscs/` et parfois l'extension navigateur.
+- Si une feature touche la lecture vidéo, regarde aussi `API/proxiesembed/` et parfois l'extension navigateur.

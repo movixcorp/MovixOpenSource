@@ -162,6 +162,13 @@ function loadBridge(pipOverrides = {}, runtimeOverrides = {}) {
       return { applyMediaProxyHeaderRules: (_url, headers) => ({ ...headers }) };
     }
     if (id === './nativePlayback') return nativePlayback;
+    if (id === './networkJournal') {
+      // Journal de diagnostic : inerte ici, il ne doit rien changer au pont.
+      return {
+        isNetworkJournalEnabled: () => false,
+        recordJournalEntry: () => {},
+      };
+    }
     if (id === './playbackAwake') {
       return {
         setPlaybackAwakeOwner: (owner, active) => {

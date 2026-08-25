@@ -65,7 +65,14 @@ internal data class MediaProxySessionAccess(
 object MediaProxyPolicy {
     private const val MAX_URL_LENGTH = 16_384
     private const val MAX_HEADER_VALUE_LENGTH = 8_192
-    private const val PLAYBACK_USER_AGENT = "Mozilla/5.0 Chrome/140.0.0.0"
+    // « Mozilla/5.0 Chrome/140.0.0.0 » est un User-Agent qu'aucun navigateur
+    // n'emet : envoye a cote d'un Sec-Ch-Ua qui annonce Chrome 140, il signait
+    // nos requetes aussi surement qu'une absence d'entete. On emet donc la
+    // chaine complete, alignee sur PLAYBACK_SEC_CH_UA et sur le relais Python
+    // (API/proxiesembed/server.py, FSVID_VIDZY_CLIENT_HINTS).
+    private const val PLAYBACK_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
     // Fsvid/Vidzy exigent un Referer sur un de leurs domaines ET la presence de
     // Sec-Ch-Ua. Sans cet en-tete leur CDN repond 302 vers .../troll/master.m3u8
@@ -73,6 +80,12 @@ object MediaProxyPolicy {
     // compte, donc on aligne celle d'un Chrome recent.
     const val PLAYBACK_SEC_CH_UA =
         "\"Chromium\";v=\"140\", \"Not=A?Brand\";v=\"24\", \"Google Chrome\";v=\"140\""
+
+    // Un vrai Chrome ne dissocie jamais les trois indices client. Poser
+    // Sec-Ch-Ua seul revenait a annoncer un navigateur tout en le contredisant
+    // sur la meme requete.
+    const val PLAYBACK_SEC_CH_UA_MOBILE = "?0"
+    const val PLAYBACK_SEC_CH_UA_PLATFORM = "\"Windows\""
     private val tokenPattern = Regex("^[A-Za-z0-9_-]{8,128}$")
     private val numericIpv4Pattern = Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")
     private val uriAttributePattern = Regex("""URI=(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
@@ -91,15 +104,26 @@ object MediaProxyPolicy {
         "referer" to "Referer",
         // Fsvid/Vidzy renvoient leur flux leurre (302 vers .../troll/master.m3u8)
         // ou une 403 si Sec-Ch-Ua manque : cet en-tete doit atteindre l'amont.
+        // Ses deux jumeaux aussi : un vrai Chrome ne les dissocie jamais, et les
+        // filtrer ici revenait a signer nos requetes comme non-navigateur alors
+        // meme que le pont JS prenait soin de les poser.
         "sec-ch-ua" to "Sec-Ch-Ua",
+        "sec-ch-ua-mobile" to "Sec-Ch-Ua-Mobile",
+        "sec-ch-ua-platform" to "Sec-Ch-Ua-Platform",
         "sec-fetch-dest" to "Sec-Fetch-Dest",
         "sec-fetch-mode" to "Sec-Fetch-Mode",
         "sec-fetch-site" to "Sec-Fetch-Site",
         "user-agent" to "User-Agent",
     )
+    // Ces en-têtes-là décrivent la requête du lecteur — la plage d'octets qu'il
+    // veut, ce qu'il a déjà en cache — donc ils doivent l'emporter sur ceux du
+    // pont. Pas `accept-language` ni `accept` : ceux-là décrivent l'IDENTITÉ du
+    // client, que le pont épingle pour rejouer celle qui a obtenu le jeton.
+    // Mesuré sur un 403 LuluStream : le pont émettait
+    // « fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7 » et la requête locale du lecteur
+    // l'écrasait par la liste de locales de l'appareil (« …,ka-GE;q=0.8,… »),
+    // faisant présenter au CDN un client autre que celui qu'il avait signé.
     private val allowedLocalOverrideHeaders = setOf(
-        "accept",
-        "accept-language",
         "if-modified-since",
         "if-none-match",
         "range",

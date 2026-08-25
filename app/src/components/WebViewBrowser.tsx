@@ -1,8 +1,11 @@
 import React, {
   forwardRef,
   useCallback,
+  useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
+  useState,
 } from 'react';
 import { Linking, Platform } from 'react-native';
 import { WebView, type WebViewNavigation } from 'react-native-webview';
@@ -11,6 +14,10 @@ import type {
   WebViewMessageEvent,
   WebViewOpenWindowEvent,
 } from 'react-native-webview/lib/WebViewTypes';
+import {
+  isNetworkJournalEnabled,
+  subscribeNetworkJournal,
+} from '../services/networkJournal';
 import {
   clearBridgeCapabilities,
   handleBridgeMessage,
@@ -59,7 +66,7 @@ function getPictureInPictureShimMode(): PictureInPictureShimMode {
   return 'disabled';
 }
 
-const injectedJS = buildInjectedJavaScript({
+const BASE_INJECTION_OPTIONS = {
   pictureInPictureMode: getPictureInPictureShimMode(),
   mediaProxyRoutingEnabled:
     Platform.OS === 'android' || Platform.OS === 'ios',
@@ -70,7 +77,27 @@ const injectedJS = buildInjectedJavaScript({
   // allers-retours de pont avant de retomber sur GM_FETCH. Le handoff natif
   // (`GM_openMediaProxy`) reste actif, lui ne passe pas par le moteur web.
   mediaProxyXhrRoutingEnabled: Platform.OS === 'android',
-});
+  // Le pendant iOS du routage par la boucle locale : WebKit la refuse depuis
+  // une page https, mais route un schéma personnalisé vers le natif. Le
+  // handler est enregistré sur la configuration WKWebView (patch
+  // react-native-webview) et relaie vers le proxy local.
+  mediaProxyScheme: Platform.OS === 'ios' ? 'movix-media' : null,
+} as const;
+
+// Construit une fois par état de capture, pas à chaque rendu : le script
+// injecté est volumineux, et son contenu ne dépend que de ce booléen.
+const INJECTED_JS_BY_JOURNAL_STATE = new Map<boolean, string>();
+
+function injectedJavaScriptFor(journalConsoleEnabled: boolean): string {
+  const cached = INJECTED_JS_BY_JOURNAL_STATE.get(journalConsoleEnabled);
+  if (cached !== undefined) return cached;
+  const built = buildInjectedJavaScript({
+    ...BASE_INJECTION_OPTIONS,
+    journalConsoleEnabled,
+  });
+  INJECTED_JS_BY_JOURNAL_STATE.set(journalConsoleEnabled, built);
+  return built;
+}
 
 function isUsableHttpUrl(value: unknown): value is string {
   return (
@@ -198,6 +225,19 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         onError?.(event.nativeEvent.description);
       },
       [onError],
+    );
+
+    // Le renvoi de la console est armé dans le script injecté : il faut donc le
+    // reconstruire quand la capture change. La bascule ne prend effet qu'au
+    // chargement suivant de la page, `injectedJavaScriptBeforeContentLoaded`
+    // n'étant relu qu'à la navigation.
+    const [journalConsole, setJournalConsole] = useState(
+      isNetworkJournalEnabled,
+    );
+    useEffect(() => subscribeNetworkJournal(setJournalConsole), []);
+    const injectedJS = useMemo(
+      () => injectedJavaScriptFor(journalConsole),
+      [journalConsole],
     );
 
     const userAgent =

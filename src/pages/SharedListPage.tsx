@@ -16,12 +16,14 @@ import { encodeId } from '../utils/idEncoder';
 import { getTmdbLanguage } from '../i18n';
 import LikeDislikeButton from '../components/LikeDislikeButton';
 import { FavoriteStarIconButton, FavoriteStarPillButton } from '../components/FavoriteStarButton';
+import AgeRestrictedMedia from '../components/AgeRestrictedMedia';
 import {
   SHARED_LIST_FAVORITES_STORAGE_KEY,
   readSharedListFavorites,
   writeSharedListFavorites,
   type SharedListFavorite,
 } from '../utils/sharedListFavorites';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -613,6 +615,7 @@ const SharedListPage: React.FC = () => {
                 const canWatchlistMedia = item.type === 'movie' || item.type === 'tv';
                 const isWatchlistMedia = canWatchlistMedia ? isWatchlistMediaItem(item) : false;
                 return (
+                  <AgeRestrictedMedia key={`${item.type}-${item.id}`} item={item}>
                   <motion.div
                     key={`${item.type}-${item.id}`}
                     variants={itemVariants}
@@ -691,6 +694,7 @@ const SharedListPage: React.FC = () => {
                       </div>
                     </Link>
                   </motion.div>
+                  </AgeRestrictedMedia>
                 );
               })}
             </div>
@@ -809,7 +813,7 @@ const SharedListPage: React.FC = () => {
           </motion.div>
         )}
       </AnimatePresence>,
-      document.body
+      getOverlayPortalRoot()
     )}
     </>
   );

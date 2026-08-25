@@ -207,7 +207,7 @@ const VipPage: React.FC = () => {
                   </Button>
                 </a>
                 <a
-                  href="https://discord.com/users/mysticsaba"
+                  href="https://discord.com/users/1516102413835305021"
                   target="_blank"
                   rel="noopener noreferrer"
                 >

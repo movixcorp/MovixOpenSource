@@ -35,11 +35,6 @@ const SYNCABLE_EXACT_KEYS = new Set([
   'subtitleStyle',
   'support_popup_seen',
   'user_language',
-  // `is_vip` est un cache UI côté frontend. Le statut réel est validé côté
-  // serveur sur chaque requête sensible via /api/check-vip (x-access-key) ;
-  // forger `is_vip` en localStorage (sync ou DevTools) ne donne aucun accès
-  // VIP réel, juste un affichage trompeur. On le garde syncable pour que le
-  // statut suive l'utilisateur entre appareils sans recheck immédiat.
   'is_vip',
   'watched_movie',
   'watched_tv',

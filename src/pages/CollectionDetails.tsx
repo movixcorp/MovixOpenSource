@@ -11,6 +11,7 @@ import { SquareBackground } from '../components/ui/square-background';
 import ShinyText from '../components/ui/shiny-text';
 import BlurText from '../components/ui/blur-text';
 import AnimatedBorderCard from '../components/ui/animated-border-card';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 interface Movie {
   id: number;
@@ -99,6 +100,9 @@ const CollectionDetails: React.FC = () => {
   const API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
   const BASE_URL = 'https://api.themoviedb.org/3';
   const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/w500';
+  const { items: ageAllowedCollectionMovies, isFiltering: isFilteringCollectionMoviesByAge } = useAgeRestrictedContent(
+    (collection?.parts || []).map((movie) => ({ ...movie, media_type: 'movie' as const })),
+  );
 
   // Fonction pour optimiser les images selon le mode d'affichage
   const getOptimizedImageUrl = (path: string, size: 'small' | 'medium' | 'large' = 'medium') => {
@@ -485,8 +489,20 @@ const CollectionDetails: React.FC = () => {
     );
   }
 
+  if (collection.parts.length > 0 && isFilteringCollectionMoviesByAge) {
+    return (
+      <SquareBackground squareSize={48} borderColor="rgba(239, 68, 68, 0.10)" className="min-h-screen bg-black text-white pt-32 pb-20">
+        <div className="flex justify-center py-20">
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-red-500" />
+        </div>
+      </SquareBackground>
+    );
+  }
+
+  if (collection.parts.length > 0 && ageAllowedCollectionMovies.length === 0) return null;
+
   // Trier les films par date de sortie et filtrer selon les préférences
-  const allMovies = [...collection.parts].sort((a, b) => 
+  const allMovies = [...ageAllowedCollectionMovies].sort((a, b) =>
     new Date(a.release_date || '1900-01-01').getTime() - new Date(b.release_date || '1900-01-01').getTime()
   );
   

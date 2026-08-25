@@ -1,10 +1,9 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import {
-  AlertTriangle,
   ArrowLeft,
   CreditCard,
   Crown,
@@ -50,7 +49,6 @@ const PAYMENT_IMAGES = {
 } as const;
 
 const SUPPORT_TELEGRAM_URL = import.meta.env.VITE_SUPPORT_TELEGRAM_URL || 'https://t.me/movix_site';
-const PAYGATE_MIN_AMOUNT_EUR = 6.25;
 const isValidEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
 const VipDonatePage: React.FC = () => {
   const navigate = useNavigate();
@@ -67,26 +65,14 @@ const VipDonatePage: React.FC = () => {
     () => PACKS.find((pack) => pack.amount === selectedPack) || PACKS[0],
     [selectedPack]
   );
-  const isPaygateSelected = selectedPaymentMethod === 'paygate_hosted';
-  const isPayblisSelected = selectedPaymentMethod === 'payblis';
-  const emailRequiredByMethod = isPaygateSelected || isPayblisSelected;
-  const isPaygateAvailableForPack = activePack.amount >= 7;
-  const paygateCheckoutAmount = isPaygateSelected
-    ? Math.max(activePack.amount, PAYGATE_MIN_AMOUNT_EUR)
-    : activePack.amount;
-  const isPaygateMinimumApplied = isPaygateSelected && paygateCheckoutAmount > activePack.amount;
+  const isCryptoGateSelected = selectedPaymentMethod === 'cryptogate';
+  const emailRequiredByMethod = isCryptoGateSelected;
   const nextSteps = useMemo(() => ([
     t('vipDonations.page.nextStep1'),
     t('vipDonations.page.nextStep2'),
     t('vipDonations.page.nextStep3'),
     t('vipDonations.page.nextStep4')
   ]), [t]);
-
-  useEffect(() => {
-    if (!isPaygateAvailableForPack && selectedPaymentMethod === 'paygate_hosted') {
-      setSelectedPaymentMethod('btc');
-    }
-  }, [isPaygateAvailableForPack, selectedPaymentMethod]);
 
   const paymentMethods = useMemo<Array<{
     value: VipDisplayedPaymentMethod;
@@ -121,28 +107,16 @@ const VipDonatePage: React.FC = () => {
         accentTone: 'border-cyan-400/30 bg-cyan-400/10 text-cyan-100'
       },
       {
-        value: 'paygate_hosted',
-        label: 'PayGate.to',
-        helper: isPaygateAvailableForPack
-          ? t('vipDonations.page.paygatePayment')
-          : t('vipDonations.page.paygateUnavailableShort'),
-        ticker: t('vipDonations.payment.paygateShort'),
-        accentTone: isPaygateAvailableForPack
-          ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-100'
-          : 'border-white/15 bg-white/5 text-white/55'
-      },
+        value: 'cryptogate',
+        label: 'CryptoGate',
+        helper: t('vipDonations.page.cryptogatePayment'),
+        ticker: t('vipDonations.payment.cryptogateShort'),
+        accentTone: 'border-emerald-400/30 bg-emerald-400/10 text-emerald-100'
+      }
     ];
 
-    methods.push({
-      value: 'payblis',
-      label: 'Payblis',
-      helper: t('vipDonations.payblis.cardHelper'),
-      ticker: t('vipDonations.payment.payblisShort'),
-      accentTone: 'border-sky-400/30 bg-sky-400/10 text-sky-100'
-    });
-
     return methods;
-  }, [isPaygateAvailableForPack, t]);
+  }, [t]);
 
   const recipientOptions = useMemo<Array<{
     value: VipRecipientMode;
@@ -179,11 +153,7 @@ const VipDonatePage: React.FC = () => {
 
     if (!canSubmit) {
       if (emailRequiredByMethod && !isValidEmail(payerEmail)) {
-        toast.error(
-          isPayblisSelected
-            ? t('vipDonations.payblis.emailRequired')
-            : t('vipDonations.page.paygateEmailError')
-        );
+        toast.error(t('vipDonations.page.cryptogateEmailError'));
       } else {
         toast.error(t('vipDonations.common.turnstileRequired'));
       }
@@ -203,7 +173,7 @@ const VipDonatePage: React.FC = () => {
       );
       toast.success(t('vipDonations.page.saveUrlTitle'));
       rememberVipInvoice(invoice.publicId);
-      if ((invoice.paymentMethod === 'paygate_hosted' || invoice.paymentMethod === 'payblis') && invoice.checkoutUrl) {
+      if (invoice.paymentMethod === 'cryptogate' && invoice.checkoutUrl) {
         window.open(invoice.checkoutUrl, '_blank', 'noopener,noreferrer');
       }
       navigate(invoice.invoicePath);
@@ -377,23 +347,12 @@ const VipDonatePage: React.FC = () => {
                     <div className="grid gap-3">
                       {paymentMethods.map((paymentMethod) => {
                         const isActive = paymentMethod.value === selectedPaymentMethod;
-                        const isDisabled = paymentMethod.value === 'paygate_hosted' && !isPaygateAvailableForPack;
                         return (
                           <button
                             key={paymentMethod.value}
                             type="button"
-                            onClick={() => {
-                              if (isDisabled) {
-                                return;
-                              }
-                              setSelectedPaymentMethod(paymentMethod.value);
-                            }}
-                            disabled={isDisabled}
+                            onClick={() => setSelectedPaymentMethod(paymentMethod.value)}
                             className={`rounded-2xl border p-4 text-left transition-all ${
-                              isDisabled
-                                ? 'cursor-not-allowed border-white/10 bg-white/[0.02] opacity-60'
-                                : ''
-                            } ${
                               isActive
                                 ? 'border-yellow-500/55 bg-yellow-500/10'
                                 : 'border-white/10 bg-white/[0.03] hover:border-yellow-500/30 hover:bg-white/[0.05]'
@@ -425,89 +384,27 @@ const VipDonatePage: React.FC = () => {
                     </div>
 
                     {emailRequiredByMethod && (
-                      <div className="space-y-4">
-                        <div className="rounded-2xl border border-emerald-400/25 bg-emerald-400/8 p-4">
-                          <div className="flex items-start gap-3">
-                            <div className="rounded-xl bg-black/30 p-2.5">
-                              <Mail className="h-5 w-5 text-emerald-200" />
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <p className="font-semibold text-white">
-                                {isPayblisSelected
-                                  ? t('vipDonations.payblis.cardTitle')
-                                  : t('vipDonations.page.paygateEmailTitle')}
-                              </p>
-                              <p className="mt-1 text-sm leading-6 text-white/55">
-                                {isPayblisSelected
-                                  ? t('vipDonations.payblis.cardHelper')
-                                  : t('vipDonations.page.paygateEmailDescription')}
-                              </p>
-                              <input
-                                type="email"
-                                inputMode="email"
-                                autoComplete="email"
-                                value={payerEmail}
-                                onChange={(event) => setPayerEmail(event.target.value)}
-                                placeholder={t('vipDonations.page.paygateEmailPlaceholder')}
-                                className="mt-4 h-12 w-full rounded-xl border border-white/10 bg-black/30 px-4 text-sm text-white outline-none transition focus:border-emerald-300/50"
-                              />
-                              <p className="mt-2 text-xs text-white/40">
-                                {isValidEmail(payerEmail) || payerEmail.trim() === ''
-                                  ? t('vipDonations.page.paygateEmailHint')
-                                  : t('vipDonations.page.paygateEmailError')}
-                              </p>
-                            </div>
-                          </div>
-                        </div>
-
-                        {isPaygateSelected && (
-                          <div className="rounded-2xl border border-amber-400/25 bg-amber-400/8 p-4">
-                            <div className="flex items-start gap-3">
-                              <div className="rounded-xl bg-black/30 p-2.5">
-                                <AlertTriangle className="h-5 w-5 text-amber-200" />
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <p className="font-semibold text-white">{t('vipDonations.page.paygateKycTitle')}</p>
-                                <p className="mt-1 text-sm leading-6 text-white/55">{t('vipDonations.page.paygateKycDescription')}</p>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-
-                        {isPaygateMinimumApplied && (
-                          <div className="rounded-2xl border border-yellow-400/25 bg-yellow-400/8 p-4">
-                            <div className="flex items-start gap-3">
-                              <div className="rounded-xl bg-black/30 p-2.5">
-                                <AlertTriangle className="h-5 w-5 text-yellow-200" />
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <p className="font-semibold text-white">{t('vipDonations.page.paygateMinimumTitle')}</p>
-                                <p className="mt-1 text-sm leading-6 text-white/55">
-                                  {t('vipDonations.page.paygateMinimumDescription', {
-                                    originalAmount: formatVipFiat(i18n.language, activePack.amount, 'EUR'),
-                                    minimumAmount: formatVipFiat(i18n.language, paygateCheckoutAmount, 'EUR')
-                                  })}
-                                </p>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-
-                      </div>
-                    )}
-
-                    {!isPaygateAvailableForPack && (
-                      <div className="rounded-2xl border border-amber-400/25 bg-amber-400/8 p-4">
+                      <div className="rounded-2xl border border-emerald-400/25 bg-emerald-400/8 p-4">
                         <div className="flex items-start gap-3">
                           <div className="rounded-xl bg-black/30 p-2.5">
-                            <AlertTriangle className="h-5 w-5 text-amber-200" />
+                            <Mail className="h-5 w-5 text-emerald-200" />
                           </div>
                           <div className="min-w-0 flex-1">
-                            <p className="font-semibold text-white">{t('vipDonations.page.paygateUnavailableTitle')}</p>
-                            <p className="mt-1 text-sm leading-6 text-white/55">
-                              {t('vipDonations.page.paygateUnavailableDescription', {
-                                minimumPack: formatVipFiat(i18n.language, 7, 'EUR')
-                              })}
+                            <p className="font-semibold text-white">{t('vipDonations.page.cryptogateEmailTitle')}</p>
+                            <p className="mt-1 text-sm leading-6 text-white/55">{t('vipDonations.page.cryptogateEmailDescription')}</p>
+                            <input
+                              type="email"
+                              inputMode="email"
+                              autoComplete="email"
+                              value={payerEmail}
+                              onChange={(event) => setPayerEmail(event.target.value)}
+                              placeholder={t('vipDonations.page.cryptogateEmailPlaceholder')}
+                              className="mt-4 h-12 w-full rounded-xl border border-white/10 bg-black/30 px-4 text-sm text-white outline-none transition focus:border-emerald-300/50"
+                            />
+                            <p className="mt-2 text-xs text-white/40">
+                              {isValidEmail(payerEmail) || payerEmail.trim() === ''
+                                ? t('vipDonations.page.cryptogateEmailHint')
+                                : t('vipDonations.page.cryptogateEmailError')}
                             </p>
                           </div>
                         </div>
@@ -597,7 +494,7 @@ const VipDonatePage: React.FC = () => {
                   <div className="divide-y divide-white/10 text-sm">
                     <div className="flex items-center justify-between py-3 text-white/65 first:pt-0">
                       <span>{t('vipDonations.page.amountLabel')}</span>
-                      <span className="font-semibold text-white">{formatVipFiat(i18n.language, paygateCheckoutAmount, 'EUR')}</span>
+                      <span className="font-semibold text-white">{formatVipFiat(i18n.language, activePack.amount, 'EUR')}</span>
                     </div>
                     <div className="flex items-center justify-between py-3 text-white/65">
                       <span>{t('vipDonations.page.paymentLabel')}</span>
@@ -628,15 +525,6 @@ const VipDonatePage: React.FC = () => {
                       </span>
                     </div>
                   </div>
-
-                  {isPaygateMinimumApplied && (
-                    <p className="text-xs leading-6 text-yellow-200/80">
-                      {t('vipDonations.page.paygateMinimumSummary', {
-                        originalAmount: formatVipFiat(i18n.language, activePack.amount, 'EUR'),
-                        minimumAmount: formatVipFiat(i18n.language, paygateCheckoutAmount, 'EUR')
-                      })}
-                    </p>
-                  )}
 
                   {TURNSTILE_SITE_KEY && (
                     <div className="border-t border-white/10 pt-5">

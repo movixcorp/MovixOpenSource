@@ -17,6 +17,7 @@ const { issueJwt, getAuthIfValid } = require('../middleware/auth');
 const { getPool } = require('../mysqlPool');
 const { createRedisRateLimitStore } = require('../utils/redisRateLimitStore');
 const { verifyTurnstileFromRequest } = require('../utils/turnstile');
+const { getSessionDeviceInfo } = require('../utils/sessionDeviceInfo');
 const {
   SUPPORTED_PROVIDERS,
   isSupportedProvider,
@@ -46,6 +47,12 @@ const authRateLimit = rateLimit({
 // Récupération de la liste de mots française
 const frenchWordlist = bip39.wordlists.french;
 const DEFAULT_AVATAR = 'https://as2.ftcdn.net/v2/jpg/05/89/93/27/1000_F_589932782_vQAEAZhHnq1QCGu5ikwrYaQD0Mmurm0N.webp';
+const CLIENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function getSessionClientId(req) {
+  const clientId = String(req.get('x-movix-client-id') || '').trim();
+  return CLIENT_ID_PATTERN.test(clientId) ? clientId.toLowerCase() : null;
+}
 
 // Lazy imports from sync module
 let _syncModule = null;
@@ -54,40 +61,39 @@ function getSyncModule() {
   return _syncModule;
 }
 
-// === Session helpers ===
-const generateDeviceFingerprint = (userAgent, ip) => {
-  const fingerprint = crypto.createHash('sha256')
-    .update(`${userAgent}-${ip || 'unknown'}-${Date.now()}`)
-    .digest('hex')
-    .substring(0, 32);
-  return fingerprint;
-};
-
-const encryptDeviceInfo = (deviceInfo) => {
-  const algorithm = 'aes-256-cbc';
-  const salt = crypto.randomBytes(16);
-  const key = crypto.scryptSync(process.env.JWT_SECRET, salt, 32);
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(algorithm, key, iv);
-  let encrypted = cipher.update(deviceInfo, 'utf8', 'base64');
-  encrypted += cipher.final('base64');
-  return `${salt.toString('base64')}.${iv.toString('base64')}.${encrypted}`;
-};
-
 const createUserSession = async (userType, userId, req) => {
   try {
     const pool = getPool();
     if (!pool) { console.error('MySQL pool not ready for session creation'); return null; }
 
     const userAgent = req.headers['user-agent'] || 'Unknown';
-    const ip = req.ip || req.connection.remoteAddress || 'Unknown';
-    const sessionId = uuidv4();
-    const deviceInfo = generateDeviceFingerprint(userAgent, ip);
-    const encryptedDevice = encryptDeviceInfo(deviceInfo);
+    const clientId = getSessionClientId(req);
+    const deviceInfo = getSessionDeviceInfo({
+      userAgent,
+      clientHints: req.headers,
+    });
 
+    if (clientId) {
+      const [existingSessions] = await pool.execute(
+        "SELECT id FROM user_sessions WHERE user_id = ? AND user_type = ? AND CASE WHEN JSON_VALID(device) THEN JSON_UNQUOTE(JSON_EXTRACT(device, '$.clientId')) ELSE NULL END = ? ORDER BY accessed_at DESC LIMIT 1",
+        [userId, userType, clientId]
+      );
+
+      if (existingSessions.length > 0) {
+        const sessionId = existingSessions[0].id;
+        await pool.execute(
+          'UPDATE user_sessions SET device = ?, user_agent = ?, accessed_at = NOW() WHERE id = ? AND user_id = ? AND user_type = ?',
+          [JSON.stringify({ ...deviceInfo, clientId }), userAgent, sessionId, userId, userType]
+        );
+        console.log('[SESSION] Reused session ' + sessionId + ' for ' + userType + ':' + userId);
+        return sessionId;
+      }
+    }
+
+    const sessionId = uuidv4();
     await pool.execute(
       'INSERT INTO user_sessions (id, user_id, user_type, device, user_agent) VALUES (?, ?, ?, ?, ?)',
-      [sessionId, userId, userType, encryptedDevice, userAgent]
+      [sessionId, userId, userType, JSON.stringify({ ...deviceInfo, clientId }), userAgent]
     );
 
     console.log(`[SESSION] Created new session ${sessionId} for ${userType}:${userId}`);

@@ -48,7 +48,7 @@ const V2_DEFAULT_BUILTIN_HOSTER_ORDER: readonly string[] = [
  * l'ordre fonctionnel est défini.
  *
  * Ordre legacy : nexus_hls > nexus_file > bravo > mp4 > darkino > fstream > omega >
- * wiflix > viper > coflix > custom > frembed > vox > vostfr > rivestream_hls.
+ * wiflix > viper > coflix > custom > frembed > vox > vostfr.
  *
  * Note design : la spec §3 fusionne Films et Séries en une seule catégorie
  * `moviesTv` alors que les 2 Watch pages avaient historiquement des ordres
@@ -57,7 +57,7 @@ const V2_DEFAULT_BUILTIN_HOSTER_ORDER: readonly string[] = [
  * Les utilisateurs qui préfèrent l'ancien ordre TV peuvent le recomposer
  * manuellement via Settings → Priorité des sources.
  *
- * Les ids `viper`, `vox`, `kisskh`, `rivestream_hls`, `bravo` sont présents mais
+ * Les ids `viper`, `vox`, `kisskh`, `bravo` sont présents mais
  * n'ont de sens que pour certaines pages (film vs série vs anime) — ils
  * resteront simplement indisponibles (hasData=false) sur les pages qui ne
  * les fournissent pas.

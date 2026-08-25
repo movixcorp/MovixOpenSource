@@ -89,6 +89,13 @@ function loadBridge(overrides = {}, nativeModules = {}) {
         applyMediaProxyHeaderRules: (_url, headers) => ({ ...headers }),
       };
     }
+    if (id === './networkJournal') {
+      // Journal de diagnostic : inerte ici, il ne doit rien changer au pont.
+      return {
+        isNetworkJournalEnabled: () => false,
+        recordJournalEntry: () => {},
+      };
+    }
     if (id === './playbackAwake') return { setPlaybackAwakeOwner: () => {} };
     if (id === './pictureInPicture') {
       return {

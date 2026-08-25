@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { isUserVip } from '../../utils/authUtils';
 import { getVipHeaders } from '../../utils/vipUtils';
-import { PROXIES_EMBED_API } from '../../config/runtime';
+import { MAIN_API, PROXIES_EMBED_API } from '../../config/runtime';
 import type HlsType from 'hls.js';
 import type * as ShakaType from 'shaka-player';
 
@@ -485,7 +485,11 @@ const FranceTVPlayer: React.FC = () => {
     resetControlsTimeout();
   }, [resetControlsTimeout]);
 
-  // Native listener binding for pointer & mouse movement in FranceTVPlayer
+  /**
+   * Écouteurs natifs de mouvement de pointeur, en doublon des gestionnaires
+   * React : sous Firefox/Wayland, les `mousemove` synthétisés ne remontent pas
+   * au-dessus des calques du lecteur et l'interface ne se rappelait qu'au clic.
+   */
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -696,10 +700,14 @@ const FranceTVPlayer: React.FC = () => {
       setError(null);
 
       try {
-        const decodedUrl = decodeURIComponent(atob(encoded));
         const vipHeaders = getVipHeaders();
 
-        const res = await fetch(`${PROXIES_EMBED_API}/drm/extract?url=${encodeURIComponent(decodedUrl)}`, {
+        // `encoded` est le jeton signé remis par le catalogue /api/ftv : on le
+        // rend tel quel. Le navigateur ne connaît ni ne choisit l'adresse de la
+        // page — mainapi la retrouve en vérifiant la signature du jeton, puis
+        // relaie vers proxiesembed avec sa clé interne. Le manifeste renvoyé
+        // reste servi par proxiesembed, mais signé.
+        const res = await fetch(`${MAIN_API}/api/media/drm/extract?token=${encodeURIComponent(encoded)}`, {
           headers: { ...vipHeaders },
         });
 

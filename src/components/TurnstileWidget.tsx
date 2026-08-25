@@ -1,5 +1,8 @@
 import React, { useEffect, useRef } from 'react';
 
+import { useTurnstileBypass } from '../hooks/useTurnstileBypass';
+import { ADMIN_BYPASS_TOKEN } from '../utils/turnstileBypass';
+
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY;
 
 declare global {
@@ -35,8 +38,22 @@ const TurnstileWidget: React.FC<TurnstileWidgetProps> = ({
   const widgetIdRef = useRef<string | null>(null);
   const resolvedSiteKey = siteKey || TURNSTILE_SITE_KEY;
   const handleTokenChange = onTokenChange || onVerify || null;
+  const bypassStatus = useTurnstileBypass();
 
   useEffect(() => {
+    // Dispense admin : aucun widget, et le marqueur qui débloque les boutons
+    // conditionnés à un jeton non vide. Voir `utils/turnstileBypass.ts`.
+    if (bypassStatus === 'bypass') {
+      handleTokenChange?.(ADMIN_BYPASS_TOKEN);
+      return undefined;
+    }
+
+    // Statut encore inconnu : on attend la réponse du serveur plutôt que
+    // d'afficher un challenge qu'il faudrait retirer juste après.
+    if (bypassStatus === 'unknown') {
+      return undefined;
+    }
+
     if (!resolvedSiteKey) {
       handleTokenChange?.('');
       return undefined;
@@ -101,16 +118,20 @@ const TurnstileWidget: React.FC<TurnstileWidgetProps> = ({
       }
       widgetIdRef.current = null;
     };
-  }, [action, handleTokenChange, resolvedSiteKey, theme]);
+  }, [action, bypassStatus, handleTokenChange, resolvedSiteKey, theme]);
 
   useEffect(() => {
+    // Un dispensé n'a rien à réinitialiser : effacer le marqueur ici
+    // rebloquerait le bouton après le premier envoi.
+    if (bypassStatus !== 'challenge') return;
+
     handleTokenChange?.('');
     if (widgetIdRef.current && window.turnstile) {
       window.turnstile.reset(widgetIdRef.current);
     }
-  }, [handleTokenChange, resetSignal]);
+  }, [bypassStatus, handleTokenChange, resetSignal]);
 
-  if (!resolvedSiteKey) {
+  if (bypassStatus !== 'challenge' || !resolvedSiteKey) {
     return null;
   }
 

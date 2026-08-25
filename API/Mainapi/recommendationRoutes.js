@@ -13,6 +13,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const { fetchTmdbDetails } = require('./utils/tmdbCache');
+const { LruMap } = require('./utils/lruMap');
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -27,7 +28,9 @@ const COLLAB_CACHE_TTL  = 3 * 60 * 60;   // 3 hours
 
 // In-memory cache for TMDB endpoints NOT covered by tmdbCache.js
 // (recommendations, similar, discover, trending, genre lists, keywords, credits)
-const tmdbMemCache = new Map();
+// Capped to avoid unbounded growth — each entry holds a full TMDB JSON payload.
+const TMDB_MEM_MAX_ENTRIES = 500;
+const tmdbMemCache = new LruMap({ max: TMDB_MEM_MAX_ENTRIES });
 const TMDB_MEM_TTL = 15 * 60 * 1000; // 15 minutes in ms
 
 // Set by initRecommendationRoutes()

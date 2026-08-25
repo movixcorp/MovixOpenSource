@@ -7,6 +7,7 @@ import {
   getPendingAuthAction,
   persistResolvedSession,
 } from '../utils/accountAuth';
+import { getSessionCreationHeaders } from '../utils/sessionClientId';
 
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 type GoogleAuthWindow = Window & { __google_verify_done?: boolean };
@@ -74,7 +75,10 @@ const GoogleAuth: React.FC = () => {
         setStep(t('auth.fetchingGoogleProfile'));
         const verifyResponse = await fetch(`${import.meta.env.VITE_MAIN_API}/api/auth/google/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...getSessionCreationHeaders(),
+          },
           body: JSON.stringify({ access_token: accessToken }),
         });
 

@@ -52,10 +52,11 @@ index 80c6803..f70b87d 100644
 diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
 --- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
 +++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
-@@ -456,6 +456,16 @@
+@@ -455,10 +455,36 @@ RCTAutoInsetsProtocol>
+       _prefsUsed = YES;
      }
    }
- #endif
++#endif
 +#if !TARGET_OS_OSX
 +  // Sans cette préférence, WKWebView n'expose pas l'API Fullscreen aux
 +  // éléments HTML : `document.fullscreenEnabled` reste faux et le bouton
@@ -65,10 +66,29 @@ diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_mod
 +    prefs.elementFullscreenEnabled = YES;
 +    _prefsUsed = YES;
 +  }
-+#endif
+ #endif
    if (_prefsUsed) {
      wkWebViewConfig.preferences = prefs;
    }
++#if !TARGET_OS_OSX
++  // Schéma « movix-media » : sert au moteur web les médias qui exigent des
++  // en-têtes. L'élément video émet une requête qu'aucun crochet JS n'intercepte,
++  // donc sans Referer ni Origin le CDN la refuse ; et WebKit refuse
++  // http://127.0.0.1 depuis une page https (contenu mixte), ce qui interdit le
++  // détour par la boucle locale utilisé sur Android. Un schéma personnalisé n'y
++  // est pas soumis. La classe est cherchée à l'exécution : ce fichier est
++  // compilé dans les Pods et ne peut pas voir l'en-tête Swift de l'app.
++  Class movixSchemeHandler = NSClassFromString(@"MovixMediaSchemeHandler");
++  if (movixSchemeHandler != nil) {
++    id handler = [[movixSchemeHandler alloc] init];
++    if ([handler conformsToProtocol:@protocol(WKURLSchemeHandler)]) {
++      [wkWebViewConfig setURLSchemeHandler:handler forURLScheme:@"movix-media"];
++    }
++  }
++#endif
+   if (_incognito) {
+     wkWebViewConfig.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
+   } else if (_cacheEnabled) {
 diff --git a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts b/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
 index 8dd6cef..25f86ea 100644
 --- a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts

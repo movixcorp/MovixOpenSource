@@ -7,6 +7,7 @@ import { useAdFreePopup } from "../context/AdFreePopupContext";
 import { getAdPopupMode, subscribeToAdPopupModeChanges, type AdPopupMode } from "../utils/adPopupMode";
 import { getAdTargetUrls, isAdultAdsEnabled, subscribeToAdultAdsChanges } from "../utils/adAdultMode";
 import { SCRIPT_AD_MODE_ENABLED, loadAdScript } from "../utils/adScriptMode";
+import { getOverlayPortalRoot } from "@/utils/overlayPortal";
 
 interface AdFreePlayerAdsProps {
   onClose?: () => void;
@@ -231,7 +232,7 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
         }
       }}
     >
-      <DialogPrimitive.Portal>
+      <DialogPrimitive.Portal container={getOverlayPortalRoot()}>
         {/* Overlay avec fond bleu */}
         <DialogPrimitive.Overlay
           className="fixed inset-0 z-50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 duration-300"

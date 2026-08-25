@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { toast as sonnerToast } from 'sonner';
 import {
     Flag, Trash2, Loader2, RefreshCw, CheckCircle, XCircle, MessageSquare,
-    List, Film, Tv, Clock, User, AlertCircle
+    List, Film, Tv, Clock, User, AlertCircle, Scissors
 } from 'lucide-react';
 import { Button } from './ui/button';
 import { Badge } from './ui/badge';
@@ -39,7 +39,7 @@ interface Report {
     reporter_user_id: string;
     reporter_user_type: string;
     reporter_profile_id: string;
-    target_type: 'comment' | 'reply' | 'shared_list';
+    target_type: 'comment' | 'reply' | 'shared_list' | 'segment';
     target_id: string;
     reason: string;
     details: string | null;
@@ -59,6 +59,8 @@ interface ReportStats {
     dismissed: number;
     comments: number;
     lists: number;
+    /** Propositions de séquence signalées depuis le lecteur. */
+    segments: number;
 }
 
 const REASON_LABELS: Record<string, { labelKey: string; color: string }> = {
@@ -68,9 +70,12 @@ const REASON_LABELS: Record<string, { labelKey: string; color: string }> = {
     unmarked_spoiler: { labelKey: 'admin.reasonUnmarkedSpoiler', color: 'bg-yellow-500' },
     impersonation: { labelKey: 'admin.reasonImpersonation', color: 'bg-purple-500' },
     other: { labelKey: 'admin.reasonOther', color: 'bg-blue-500' },
+    // Réservé aux propositions de séquence : des bornes qui ne correspondent
+    // à rien dans l'épisode.
+    wrong_timestamp: { labelKey: 'admin.reasonWrongTimestamp', color: 'bg-orange-500' },
 };
 
-const DEFAULT_STATS: ReportStats = { total: 0, pending: 0, resolved: 0, dismissed: 0, comments: 0, lists: 0 };
+const DEFAULT_STATS: ReportStats = { total: 0, pending: 0, resolved: 0, dismissed: 0, comments: 0, lists: 0, segments: 0 };
 
 const AdminReports: React.FC = () => {
     const { t, i18n } = useTranslation();
@@ -203,6 +208,7 @@ const AdminReports: React.FC = () => {
             case 'comment': return <MessageSquare className="w-4 h-4" />;
             case 'reply': return <MessageSquare className="w-4 h-4" />;
             case 'shared_list': return <List className="w-4 h-4" />;
+            case 'segment': return <Scissors className="w-4 h-4" />;
             default: return <Flag className="w-4 h-4" />;
         }
     };
@@ -212,6 +218,7 @@ const AdminReports: React.FC = () => {
             case 'comment': return t('admin.comments');
             case 'reply': return t('admin.replies');
             case 'shared_list': return t('admin.sharedLists');
+            case 'segment': return t('admin.segments');
             default: return type;
         }
     };
@@ -272,6 +279,7 @@ const AdminReports: React.FC = () => {
                         <SelectItem value="comment">{t('admin.comments')}</SelectItem>
                         <SelectItem value="reply">{t('admin.replies')}</SelectItem>
                         <SelectItem value="shared_list">{t('admin.sharedLists')}</SelectItem>
+                        <SelectItem value="segment">{t('admin.segments')}</SelectItem>
                     </SelectContent>
                 </Select>
 

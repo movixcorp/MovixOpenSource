@@ -13,6 +13,13 @@ const fsp = require('fs').promises;
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { generateCacheKey } = require('../utils/cacheManager');
+const { respondWithResolvedSources } = require('../utils/embedExtraction');
+
+// VoirDrama ne sépare pas les langues : `data` est un tableau plat de lecteurs
+// dont l'URL vit dans `link`. La route sert déjà UN épisode par appel
+// (`?season=&episode=` obligatoires), donc rien à cibler en plus.
+const respondWithSources = (req, res, payload) =>
+  respondWithResolvedSources(req, res, payload, { movieMapKey: 'data', label: 'VOIRDRAMA' });
 const { fetchTmdbDetails } = require('../utils/tmdbCache');
 
 // === VOIRDRAMA CONFIGURATION ===
@@ -331,7 +338,7 @@ router.get('/:type/:tmdbid', async (req, res) => {
       if (!cachedData.success) {
         res.status(404).json(cachedData);
       } else {
-        res.json(cachedData);
+        await respondWithSources(req, res, cachedData);
       }
       dataReturned = true;
 
@@ -361,7 +368,7 @@ router.get('/:type/:tmdbid', async (req, res) => {
       return res.status(404).json(result);
     }
 
-    res.json(result);
+    await respondWithSources(req, res, result);
 
   } catch (error) {
     console.error('[API DRAMA] Error:', error);

@@ -23,6 +23,22 @@ export type VavooGroupedChannel<T extends VavooChannelInput> = T & {
   _vavooVariants: VavooChannelVariant[];
 };
 
+export interface VavooStreamLabels {
+  server: string;
+  standard: string;
+}
+
+export type VavooResolvedVariantStream<T> = T & {
+  _vavooVariantId: string;
+  title: string;
+};
+
+export interface VavooResolutionOptions<T extends { title?: string; url?: string }> {
+  onStreamsResolved?: (streams: Array<VavooResolvedVariantStream<T>>) => void;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
 interface ParsedVavooName {
   displayName: string;
   groupKey: string;
@@ -151,6 +167,96 @@ const compareVariants = (left: VavooChannelVariant, right: VavooChannelVariant):
   if (leftIsLimited !== rightIsLimited) return leftIsLimited ? 1 : -1;
 
   return left.server.localeCompare(right.server, 'fr', { sensitivity: 'base' });
+};
+
+export const formatVavooVariantLabel = (
+  variant: VavooChannelVariant,
+  labels: VavooStreamLabels,
+): string => {
+  const parts: string[] = [];
+  if (variant.quality && variant.quality !== 'Standard') parts.push(variant.quality);
+  if (variant.server) parts.push(`${labels.server} ${variant.server.toUpperCase()}`);
+  return parts.join(' · ') || labels.standard;
+};
+
+export type VavooFallbackAction = 'next' | 'wait' | 'error';
+
+export const getVavooFallbackAction = (
+  currentStreamIndex: number,
+  streamCount: number,
+  isResolving: boolean,
+): VavooFallbackAction => {
+  if (currentStreamIndex < streamCount - 1) return 'next';
+  return isResolving ? 'wait' : 'error';
+};
+
+/**
+ * Resolves every server of a grouped Vavoo channel concurrently. A failed
+ * variant is isolated so any other playable server can still open the player.
+ */
+export const resolveVavooVariantStreams = async <T extends { title?: string; url?: string }>(
+  variants: VavooChannelVariant[],
+  resolveVariant: (variantId: string, signal: AbortSignal) => Promise<{ streams?: T[] }>,
+  labels: VavooStreamLabels,
+  options: VavooResolutionOptions<T> = {},
+): Promise<Array<VavooResolvedVariantStream<T>>> => {
+  const results = await Promise.allSettled(variants.map(async (variant) => {
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort(options.signal?.reason);
+    if (options.signal?.aborted) {
+      abortFromParent();
+    } else {
+      options.signal?.addEventListener('abort', abortFromParent, { once: true });
+    }
+
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs!) : 0;
+    const timeoutId = timeoutMs > 0
+      ? setTimeout(() => {
+        const timeoutError = new Error(`Vavoo server ${variant.id} timed out`);
+        timeoutError.name = 'TimeoutError';
+        controller.abort(timeoutError);
+      }, timeoutMs)
+      : null;
+
+    let rejectOnAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      rejectOnAbort = () => {
+        const reason = controller.signal.reason;
+        const error = reason instanceof Error ? reason : new Error('Vavoo resolution aborted');
+        if (!(reason instanceof Error)) error.name = 'AbortError';
+        reject(error);
+      };
+
+      if (controller.signal.aborted) rejectOnAbort();
+      else controller.signal.addEventListener('abort', rejectOnAbort, { once: true });
+    });
+
+    try {
+      const payload = await Promise.race([
+        resolveVariant(variant.id, controller.signal),
+        aborted,
+      ]);
+      const streams = Array.isArray(payload?.streams) ? payload.streams : [];
+      const title = formatVavooVariantLabel(variant, labels);
+
+      const resolvedStreams = streams
+        .filter((stream) => typeof stream?.url === 'string' && stream.url.trim().length > 0)
+        .map((stream) => ({
+          ...stream,
+          _vavooVariantId: variant.id,
+          title,
+        }));
+
+      if (resolvedStreams.length > 0) options.onStreamsResolved?.(resolvedStreams);
+      return resolvedStreams;
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      options.signal?.removeEventListener('abort', abortFromParent);
+      if (rejectOnAbort) controller.signal.removeEventListener('abort', rejectOnAbort);
+    }
+  }));
+
+  return results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
 };
 
 /**

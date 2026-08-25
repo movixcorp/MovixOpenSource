@@ -34,16 +34,15 @@ function domainRestriction(req, res, next) {
   }
 
   // Autoriser le callback serveur-à-serveur PayGate sans dépendre d'un Origin/Referer navigateur
-  if (req.path === '/api/vip/paygate/callback') {
+  if (
+    req.path === '/api/vip/paygate/callback'
+    || req.path === '/api/vip/cryptogate/webhook'
+  ) {
     return next();
   }
 
   const allowedDomains = [
     'localhost:3000',
-    'movix.date',
-    'movix.chat',
-    'movix.cloud',
-    'movix.cash',
     'movix.blog',
     'movix.rodeo',
     'movix.club',
@@ -51,11 +50,29 @@ function domainRestriction(req, res, next) {
     'movix11.pages.dev',
     'nakios.site',
     'cinezo.site',
-    'filmib.cc'
+    'cinezo.online',
+    'filmib.cc',
+    'movix.llc',
+    'movix.cash',
+    'movix.tax',
+    'movix.cloud',
+    'movix.golf',
+    'movix.chat',
+    'movix.date',
+    'movix.show',
+    'movix.fun'
   ];
 
   const origin = req.get('origin');
   const referer = req.get('referer');
+
+  // Comportement CORS standard : une requête sans Origin ni Referer n'est pas
+  // une requête cross-origin navigateur (curl, app mobile, serveur-a-serveur,
+  // navigation directe). On la laisse passer -- seuls les Origin/Referer
+  // presents et hors whitelist sont refuses.
+  if (!origin && !referer) {
+    return next();
+  }
 
   let isAllowed = false;
 
@@ -162,7 +179,22 @@ function domainRestriction(req, res, next) {
 
 // Error handler for JSON parsing errors (malformed requests like URL-encoded form data)
 function jsonParseErrorHandler(err, req, res, next) {
+  const isCryptoGateWebhook = req.originalUrl?.split('?')[0]
+    === '/api/vip/cryptogate/webhook';
+
+  if (err.type === 'entity.too.large') {
+    if (isCryptoGateWebhook) {
+      return res.status(413).type('text/plain').send('invalid webhook');
+    }
+    return res.status(413).json({
+      success: false,
+      error: 'Request body too large'
+    });
+  }
   if (err.type === 'entity.parse.failed') {
+    if (isCryptoGateWebhook) {
+      return res.status(400).type('text/plain').send('invalid webhook');
+    }
     // Silently handle malformed JSON requests (likely bots or scanners)
     return res.status(400).json({
       success: false,

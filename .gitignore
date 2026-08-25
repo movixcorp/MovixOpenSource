@@ -64,9 +64,20 @@ API/cache/
 API/data/
 API/Mainapi/cache/
 API/Mainapi/data/
+API/Mainapi/darkino-backups
 
 # Discord bot (private; published separately)
 API/BOT/
+
+# Fichiers du dépôt privé jamais publiés ici (garde-fou de synchro)
+API/Mainapi/cinepulse_accounts.json
+API/Mainapi/mirror.sqlite*
+docs/
+extension/Chrome/Chrome.zip
+movix-mcp/
+movix-mcp-http/
+API/Mainapi/public/oauth-icons/
+API/Mainapi/exportscripts/
 
 # Claude Code / superpowers local state
 .claude/

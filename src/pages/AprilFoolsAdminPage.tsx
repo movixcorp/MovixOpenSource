@@ -18,6 +18,7 @@ import CustomDropdown from '../components/CustomDropdown';
 import AnimatedBorderCard from '../components/ui/animated-border-card';
 import ShinyText from '../components/ui/shiny-text';
 import { SquareBackground } from '../components/ui/square-background';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 type AdminSection = 'links' | 'vip-keys' | 'vip-invoices' | 'wishboard';
 type RickrollAction = 'linkAdd' | 'vipCreate' | 'invoiceValidate' | 'wishboardApprove';
@@ -618,7 +619,7 @@ const AprilFoolsAdminPage: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>,
-          document.body
+          getOverlayPortalRoot()
         )}
     </SquareBackground>
   );

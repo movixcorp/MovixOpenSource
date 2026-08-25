@@ -1,6 +1,7 @@
 import * as React from 'react';
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 import { cn } from '@/lib/utils';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 const TooltipProvider = TooltipPrimitive.Provider;
 
@@ -12,7 +13,7 @@ const TooltipContent = React.forwardRef<
   React.ElementRef<typeof TooltipPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof TooltipPrimitive.Content>
 >(({ className, sideOffset = 6, ...props }, ref) => (
-  <TooltipPrimitive.Portal>
+  <TooltipPrimitive.Portal container={getOverlayPortalRoot()}>
     <TooltipPrimitive.Content
       ref={ref}
       sideOffset={sideOffset}

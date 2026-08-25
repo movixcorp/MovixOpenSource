@@ -277,13 +277,20 @@ function rankKisskhCandidates(criteria = {}, candidates = []) {
       if (hasSeasonMarker(analyzed, requestedSeason)) score += 20;
       const candidateYear = parseYear(candidate.releaseDate ?? candidate.release_date ?? candidate.year)
         ?? analysis.year;
+      const candidateEpisodeCount = regularEpisodeCount(candidate.episodes);
+      if (requestedSeason === 1 && analyzed.markers.length === 0
+          && expectedYear !== null && candidateYear !== null
+          && Math.abs(expectedYear - candidateYear) > 1
+          && Number.isSafeInteger(criteria.expectedEpisodeCount)
+          && criteria.expectedEpisodeCount > 1
+          && candidateEpisodeCount === 1) continue;
       if (expectedYear !== null && candidateYear !== null && Math.abs(expectedYear - candidateYear) <= 1) {
         score += candidateYear === expectedYear ? 6 : 4;
       }
       const country = normalizeCountry(candidate.country ?? candidate.countryCode ?? candidate.country_code);
       if (country && expectedCountries.has(country)) score += 4;
       if (Number.isSafeInteger(criteria.expectedEpisodeCount) && criteria.expectedEpisodeCount > 0
-          && regularEpisodeCount(candidate.episodes) === criteria.expectedEpisodeCount) score += 6;
+          && candidateEpisodeCount === criteria.expectedEpisodeCount) score += 6;
       if (!best || score > best.score) best = {
         candidate,
         score,

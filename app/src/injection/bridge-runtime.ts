@@ -13,6 +13,8 @@ export function buildBridgeRuntime(
     mediaProxyRoutingEnabled?: boolean;
     mediaProxyCapabilityEnabled?: boolean;
     mediaProxyXhrRoutingEnabled?: boolean;
+    journalConsoleEnabled?: boolean;
+    mediaProxyScheme?: string | null;
   } = {},
 ): string {
   const mediaProxyRoutingEnabled = options.mediaProxyRoutingEnabled !== false;
@@ -28,6 +30,19 @@ export function buildBridgeRuntime(
   // valable : il ne transite jamais par le moteur web.
   const mediaProxyXhrRoutingEnabled =
     mediaProxyRoutingEnabled && options.mediaProxyXhrRoutingEnabled !== false;
+  // Le renvoi de la console vers le journal est armé à la construction, jamais
+  // négocié au démarrage : le runtime injecté ne doit émettre aucun message de
+  // pont qui ne soit pas une requête de la page. Éteint, le crochet ne coûte
+  // qu'un test booléen et n'émet rien.
+  const journalConsoleEnabled = options.journalConsoleEnabled === true;
+  // Nom du schéma personnalisé qui remplace la boucle locale là où le moteur
+  // web la refuse (WebKit). Vide ailleurs : sur Android la boucle locale marche
+  // et n'a besoin d'aucun détour.
+  const mediaProxySchemeName = JSON.stringify(
+    typeof options.mediaProxyScheme === 'string' && options.mediaProxyScheme
+      ? options.mediaProxyScheme
+      : null,
+  );
   return `
 (function() {
   'use strict';
@@ -119,12 +134,69 @@ export function buildBridgeRuntime(
     });
   }
 
+  // LuluStream et Veev lient le jeton de leur manifeste a l'identite du client
+  // qui l'a obtenu : leur CDN repond 403 des que celle-ci change entre les deux
+  // requetes. Or l'extraction tourne dans la WebView (Chrome Android) alors que
+  // la lecture part du natif, deguise en Chrome Windows pour les besoins de
+  // Fsvid/Vidzy — deux clients differents, donc jeton refuse. On releve ici
+  // l'identite reelle de la WebView et on la joint a la demande ; le natif ne
+  // l'applique qu'a cette grappe (voir services/mediaProxyHeaders.ts).
+  function webViewIdentityHeaders() {
+    var identity = {};
+    try {
+      if (navigator.userAgent) {
+        identity['User-Agent'] = navigator.userAgent;
+      }
+      // Chrome derive son Accept-Language de navigator.languages : premiere
+      // langue sans q, puis q decroissant de 0,1 en 0,1 (plancher 0,1).
+      var languages = navigator.languages && navigator.languages.length
+        ? [].slice.call(navigator.languages, 0, 10)
+        : (navigator.language ? [navigator.language] : []);
+      if (languages.length) {
+        identity['Accept-Language'] = languages.map(function(language, index) {
+          if (index === 0) return language;
+          return language + ';q=' + Math.max(0.1, 1 - index * 0.1).toFixed(1);
+        }).join(',');
+      }
+      var client = navigator.userAgentData;
+      if (client && client.brands && client.brands.length) {
+        identity['Sec-Ch-Ua'] = client.brands.map(function(brand) {
+          return '"' + brand.brand + '";v="' + brand.version + '"';
+        }).join(', ');
+        identity['Sec-Ch-Ua-Mobile'] = client.mobile ? '?1' : '?0';
+        identity['Sec-Ch-Ua-Platform'] = '"' + client.platform + '"';
+      }
+    } catch (e) {}
+    return identity;
+  }
+
+  // Fusion insensible a la casse : un en-tete pose par l'appelant remplace
+  // celui releve sur la WebView au lieu de coexister avec lui.
+  function withWebViewIdentity(callerHeaders) {
+    var headers = webViewIdentityHeaders();
+    var provided = callerHeaders || {};
+    for (var name in provided) {
+      if (!Object.prototype.hasOwnProperty.call(provided, name)) continue;
+      var lowered = name.toLowerCase();
+      for (var existing in headers) {
+        if (
+          Object.prototype.hasOwnProperty.call(headers, existing)
+          && existing.toLowerCase() === lowered
+        ) {
+          delete headers[existing];
+        }
+      }
+      headers[name] = provided[name];
+    }
+    return headers;
+  }
+
   function requestLocalMediaProxy(details) {
     var message = {
       type: 'GM_OPEN_MEDIA_PROXY',
       url: details.url,
       method: (details.method || 'GET').toUpperCase(),
-      headers: details.headers || {}
+      headers: withWebViewIdentity(details.headers)
     };
     if (_mediaProxyCapabilityEnabled) {
       if (!_mediaProxyCapability || !_mediaProxyGeneration) {
@@ -158,6 +230,69 @@ export function buildBridgeRuntime(
     }
     return bytes.buffer;
   }
+
+  // --- Console de la page vers le journal réseau ---
+  // Rien ne remonte autrement : react-native-webview ne publie pas la console
+  // dans logcat, et un build release n'expose pas le débogage distant. Armé à
+  // la construction : capture éteinte, le crochet n'est même pas posé.
+  var _journalOn = ${journalConsoleEnabled};
+
+  function forwardConsole(level, text) {
+    if (!_journalOn) return;
+    sendToNative({
+      type: 'GM_JOURNAL_CONSOLE',
+      id: generateId(),
+      key: level,
+      value: text
+    });
+  }
+
+  function stringifyConsoleArg(value) {
+    if (typeof value === 'string') return value;
+    if (value instanceof Error) {
+      return value.message + (value.stack ? '\\n' + value.stack : '');
+    }
+    try {
+      return JSON.stringify(value);
+    } catch (e) {
+      return String(value);
+    }
+  }
+
+  (function hookConsole() {
+    if (!_journalOn) return;
+    var levels = ['log', 'info', 'warn', 'error', 'debug'];
+    for (var i = 0; i < levels.length; i++) {
+      (function(level) {
+        var original = console[level];
+        console[level] = function() {
+          try {
+            var parts = [];
+            for (var a = 0; a < arguments.length; a++) {
+              parts.push(stringifyConsoleArg(arguments[a]));
+            }
+            forwardConsole(level, parts.join(' ').slice(0, 4000));
+          } catch (e) {}
+          if (typeof original === 'function') {
+            return original.apply(console, arguments);
+          }
+        };
+      })(levels[i]);
+    }
+    // Une promesse rejetée sans catch ne passe par aucun console.*, et c'est
+    // souvent la seule trace qu'un lecteur laisse en mourant.
+    window.addEventListener('unhandledrejection', function(event) {
+      forwardConsole('rejet', stringifyConsoleArg(event && event.reason));
+    });
+    window.addEventListener('error', function(event) {
+      if (!event) return;
+      forwardConsole(
+        'erreur',
+        (event.message || '') + ' @ ' + (event.filename || '') + ':' + (event.lineno || 0)
+      );
+    });
+
+  })();
 
   function isLocalMediaProxyCandidate(details) {
     var method = String(details.method || 'GET').toUpperCase();
@@ -237,7 +372,12 @@ export function buildBridgeRuntime(
 
   // --- GM_xmlhttpRequest ---
   function sendBridgeRequest(details) {
-    var headers = details.headers || {};
+    // Meme identite que sur le handoff natif : sur iOS le lecteur ne peut pas
+    // passer par la boucle locale et ses segments repartent par ici, donc le
+    // jeton LuluStream doit y retrouver le client qui l'a obtenu. Les en-tetes
+    // poses par l'appelant restent prioritaires, et Fsvid/Vidzy gardent leur
+    // deguisement Chrome-desktop, impose cote natif.
+    var headers = withWebViewIdentity(details.headers);
 
     var bodyStr = null;
     if (details.data != null) {
@@ -380,6 +520,17 @@ export function buildBridgeRuntime(
   // --- Exposition globale ---
   window.GM_xmlhttpRequest = GM_xmlhttpRequest;
   window.GM_openMediaProxy = GM_openMediaProxy;
+  // Une URL de boucle locale n'est jouable par le moteur web que là où il
+  // accepte de la joindre. WebKit refuse http://127.0.0.1 depuis une page
+  // https (contenu mixte, cf. plus haut), donc sur iOS une URL de proxy local
+  // posée sur un élément video est bloquée avant même de partir : le userscript
+  // a besoin de le savoir pour ne pas convertir une source jouable en source
+  // morte. Le handoff natif, lui, reste valable partout.
+  window.__MOVIX_MEDIA_PROXY_WEB_ROUTING__ = _mediaProxyXhrRoutingEnabled;
+  // Là où la boucle locale est refusée, un schéma personnalisé la remplace :
+  // WebKit route « movix-media:// » vers le natif (MediaProxySchemeHandler),
+  // qui relaie vers le proxy local. Le contenu mixte ne s'y applique pas.
+  window.__MOVIX_MEDIA_PROXY_SCHEME__ = ${mediaProxySchemeName};
   window.GM_getValue = GM_getValue;
   window.GM_setValue = GM_setValue;
   window.GM_deleteValue = GM_deleteValue;

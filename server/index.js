@@ -20,13 +20,39 @@ if (!existsSync(DIST)) {
 
 const app = new Hono();
 
+// Médias et polices servis depuis public/ : leur nom ne porte pas de hash, on
+// ne peut donc pas les déclarer immuables — mais ils ne changent quasiment
+// jamais. Le `no-cache` qui s'appliquait à eux était le pire des cas : le
+// serveur statique n'émet ni ETag ni Last-Modified, donc le navigateur n'avait
+// aucun moyen de revalider et retéléchargeait le fichier *en entier* à chaque
+// page. Le logo seul pèse près de 800 Ko, et sert de favicon partout.
+const MEDIA_ASSET_RE = /\.(?:png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot|mp4|webm|m4v|mp3|wasm)$/i;
+
+// Fichiers de pilotage : ils doivent pouvoir changer sans délai, sinon un
+// déploiement met des heures à atteindre les clients.
+const ALWAYS_REVALIDATE = new Set([
+  '/sw.js',
+  '/manifest.json',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/index.html',
+  '/_redirects',
+  '/_routes.json',
+]);
+
 app.use('/*', async (c, next) => {
   await next();
   if (c.res.headers.has('cache-control')) return;
   const path = new URL(c.req.url).pathname;
-  const isAssetHit = path.startsWith('/assets/') && c.res.status === 200;
-  if (isAssetHit) {
+  const isOk = c.res.status === 200;
+
+  if (path.startsWith('/assets/') && isOk) {
+    // Nom hashé par Vite : le contenu ne changera jamais sous cette URL.
     c.header('Cache-Control', 'public, max-age=31536000, immutable');
+  } else if (isOk && MEDIA_ASSET_RE.test(path) && !ALWAYS_REVALIDATE.has(path)) {
+    // Une journée de cache ferme, puis une semaine où la version en cache est
+    // servie immédiatement pendant que le navigateur va chercher la nouvelle.
+    c.header('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
   } else {
     c.header('Cache-Control', 'no-cache, must-revalidate');
   }

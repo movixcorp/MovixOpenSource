@@ -5,6 +5,7 @@ import axios from 'axios';
 import { useTranslation } from 'react-i18next';
 import '../styles/screensaver.css';
 import { getTmdbLanguage } from '../i18n';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -285,7 +286,7 @@ const ScreenSaver: React.FC<ScreenSaverProps> = ({ isIdle, onWake }) => {
     </AnimatePresence>
   );
 
-  return createPortal(content, document.body);
+  return createPortal(content, getOverlayPortalRoot());
 };
 
 export default ScreenSaver;

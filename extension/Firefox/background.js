@@ -4,11 +4,6 @@
 
 const browserAPI = typeof browser !== "undefined" ? browser : chrome;
 
-const WITV_BASE_URL = "https://witv.football";
-const SOSPLAY_BASE_URL = "https://streamonsport.art";
-const LIVETV_BASE_URL = "https://livetv901.me/frx/";
-const LIVETV_EMBED_ORIGIN = "https://livetv901.me";
-const LIVETV_EMBED_REFERER = LIVETV_BASE_URL;
 // Backend API URL for got-scraping based extraction.
 // Dev override: when the requesting page is localhost (Vite dev on :3000),
 // talk to the local backend (:25565) instead of prod. Set per-message from
@@ -444,9 +439,6 @@ KISSKH_BROWSER_API.runtime.onStartup.addListener(() => {
 void reconcileKisskhSessionRule().catch(() => {});
 // END KISSKH FALLBACK
 
-// Cache for Wiflix channels with their page slugs
-let wiflixChannelCache = {};
-
 // Extension enabled state
 let extensionEnabled = true;
 
@@ -456,9 +448,10 @@ const DEFAULT_EXTRACTION_PREFS = {
   m3u8: {
     voe: true, fsvid: true, vidzy: true, vidmoly: true,
     sibnet: true, uqload: true, doodstream: true, seekstreaming: true,
+    lulustream: true, veev: true, vidara: true,
   },
   livetv: {
-    wiflix: true, sosplay: true, livetv: true, matches: true,
+    northlive: true, vavoo: true, matches: true,
   },
 };
 let extractionPrefs = DEFAULT_EXTRACTION_PREFS;
@@ -468,7 +461,7 @@ let sessionStats = {
   extractions: 0,
   corsFixed: 0,
   cached: 0,
-  byType: { voe: 0, fsvid: 0, vidzy: 0, vidmoly: 0, sibnet: 0, uqload: 0, doodstream: 0, seekstreaming: 0 },
+  byType: { voe: 0, fsvid: 0, vidzy: 0, vidmoly: 0, sibnet: 0, uqload: 0, doodstream: 0, seekstreaming: 0, lulustream: 0, veev: 0, vidara: 0 },
 };
 
 // Load initial state
@@ -478,7 +471,7 @@ browserAPI.storage.local.get(["extensionEnabled", "stats", "extractionPrefs"], (
     sessionStats = { ...sessionStats, ...result.stats };
     // Guarantee byType subobject even for stats saved before this migration
     if (!sessionStats.byType) {
-      sessionStats.byType = { voe: 0, fsvid: 0, vidzy: 0, vidmoly: 0, sibnet: 0, uqload: 0, doodstream: 0, seekstreaming: 0 };
+      sessionStats.byType = { voe: 0, fsvid: 0, vidzy: 0, vidmoly: 0, sibnet: 0, uqload: 0, doodstream: 0, seekstreaming: 0, lulustream: 0, veev: 0, vidara: 0 };
     }
   }
   if (result.extractionPrefs) extractionPrefs = result.extractionPrefs;
@@ -496,7 +489,7 @@ browserAPI.runtime.onStartup.addListener(() => {
     extractions: 0,
     corsFixed: 0,
     cached: 0,
-    byType: { voe: 0, fsvid: 0, vidzy: 0, vidmoly: 0, sibnet: 0, uqload: 0, doodstream: 0, seekstreaming: 0 },
+    byType: { voe: 0, fsvid: 0, vidzy: 0, vidmoly: 0, sibnet: 0, uqload: 0, doodstream: 0, seekstreaming: 0, lulustream: 0, veev: 0, vidara: 0 },
   };
   browserAPI.storage.local.set({ stats: sessionStats });
 });
@@ -507,9 +500,6 @@ async function setupRules() {
   const existingRules =
     await browserAPI.declarativeNetRequest.getDynamicRules();
   const ruleIds = existingRules.map((rule) => rule.id);
-  await browserAPI.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: ruleIds,
-  });
 
   // Reset rule counter when rules are cleared
   ruleIdCounter = 100;
@@ -568,20 +558,24 @@ async function setupRules() {
     },
   ];
 
+  // Remove and add in a single call: removals apply before additions, and
+  // always listing the added ids in removeRuleIds keeps the call idempotent
+  // when onInstalled and onStartup both fire ("Rule with id 1 does not have
+  // a unique ID" otherwise).
   await browserAPI.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [...new Set([...ruleIds, ...rules.map((rule) => rule.id)])],
     addRules: rules,
   });
 }
 
 /**
- * Map a catalogId (e.g. "wiflix_sport") to a livetv source key.
+ * Map a catalogId (e.g. "matches_football") to a livetv source key.
  * Returns null if unknown — unknown keys are allowed by default.
  */
 function getLiveTvSourceKey(catalogId) {
   if (!catalogId || typeof catalogId !== 'string') return null;
-  if (catalogId.startsWith('wiflix_')) return 'wiflix';
-  if (catalogId.startsWith('sosplay_')) return 'sosplay';
-  if (catalogId.startsWith('livetv_')) return 'livetv';
+  if (catalogId.startsWith('northlive_')) return 'northlive';
+  if (catalogId.startsWith('vavoo_')) return 'vavoo';
   if (catalogId.startsWith('matches_')) return 'matches';
   return null;
 }
@@ -693,7 +687,12 @@ async function handleMessage(message) {
         payload.url,
       );
       if (headerInfo) {
-        await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+        await addHeadersRule(
+            headerInfo.domainPattern,
+            headerInfo.headers,
+            headerInfo.removeHeaders,
+            headerInfo.removeDomains,
+          );
         console.log(
           `[NEXUS] DNR headers set for ${payload.type}: ${headerInfo.domainPattern}`,
         );
@@ -856,7 +855,12 @@ async function handleExtractM3u8(payload) {
   try {
     const headerInfo = await Extractors.setupHeadersForService(embedType, url);
     if (headerInfo) {
-      await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+      await addHeadersRule(
+            headerInfo.domainPattern,
+            headerInfo.headers,
+            headerInfo.removeHeaders,
+            headerInfo.removeDomains,
+          );
       console.log(
         `[NEXUS] Pre-extraction DNR headers set for ${embedType}: ${headerInfo.domainPattern}`,
       );
@@ -879,7 +883,12 @@ async function handleExtractM3u8(payload) {
         url,
       );
       if (headerInfo) {
-        await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+        await addHeadersRule(
+            headerInfo.domainPattern,
+            headerInfo.headers,
+            headerInfo.removeHeaders,
+            headerInfo.removeDomains,
+          );
         console.log(
           `[NEXUS] DNR headers set for ${embedType}: ${headerInfo.domainPattern}`,
         );
@@ -1010,83 +1019,11 @@ async function getManifest() {
     idPrefixes: [],
   };
 
-  // Add Wiflix (WITV) catalogs
-  const wiflixCatalogs = [
-    { type: "tv", id: "wiflix_sport", name: "⚽ Sport" },
-    { type: "tv", id: "wiflix_cinema", name: "🎥 Cinéma" },
-    { type: "tv", id: "wiflix_generaliste", name: "📺 Généraliste" },
-    { type: "tv", id: "wiflix_documentaire", name: "🌍 Documentaire" },
-    { type: "tv", id: "wiflix_enfants", name: "🎈 Enfants" },
-    { type: "tv", id: "wiflix_info", name: "📰 Info" },
-    { type: "tv", id: "wiflix_musique", name: "🎵 Musique" },
-  ];
-
-  manifest.catalogs.push(...wiflixCatalogs);
-  manifest.idPrefixes.push("wiflix_");
-
-  // Add Bolaloca catalog (compat prefix sosplay_)
-  const sosplayCatalogs = [
-    { type: "tv", id: "sosplay_chaines", name: "📺 Chaînes (Bolaloca)" },
-  ];
-  manifest.catalogs.push(...sosplayCatalogs);
-  manifest.idPrefixes.push("sosplay_");
-
-  const livetvCatalogs = [
-    { type: "tv", id: "livetv_live", name: "🔴 En direct" },
-  ];
-  manifest.catalogs.push(...livetvCatalogs);
-  manifest.idPrefixes.push("livetv_");
-  manifest.catalogs.push(
-    { type: "tv", id: "livetv_all", name: "📅 Tous les sports" },
-    { type: "tv", id: "livetv_football", name: "⚽ Football" },
-    { type: "tv", id: "livetv_hockey", name: "🏒 Hockey" },
-    { type: "tv", id: "livetv_basketball", name: "🏀 Basketball" },
-    { type: "tv", id: "livetv_tennis", name: "🎾 Tennis" },
-    { type: "tv", id: "livetv_volleyball", name: "🏐 Volley-ball" },
-    { type: "tv", id: "livetv_handball", name: "🤾 Handball" },
-    { type: "tv", id: "livetv_rugby", name: "🏉 Rugby" },
-    { type: "tv", id: "livetv_combat", name: "🥊 Sports de combat" },
-    { type: "tv", id: "livetv_motorsport", name: "🏎️ Sports mecaniques" },
-    { type: "tv", id: "livetv_winter", name: "🎿 Sports d'hiver" },
-    { type: "tv", id: "livetv_athletics", name: "🏃 Athletisme" },
-    { type: "tv", id: "livetv_other", name: "🏟️ Autres sports" },
-  );
-
   return manifest;
 }
 
 async function getCatalog(type, catalogId, accessKey = null) {
-  // Check if this is a Wiflix catalog
-  if (catalogId.startsWith("wiflix_")) {
-    return await getWiflixCatalog(catalogId);
-  }
-
-  // Check if this is a Bolaloca/LiveTV catalog resolved by backend
-  if (catalogId.startsWith("sosplay_")) {
-    console.log(`[SOSPLAY] Fetching catalog via Backend: ${catalogId}`);
-    const response = await fetch(
-      `${API_BASE_URL}/api/livetv/catalog/tv/${catalogId}`,
-      {
-        headers: buildBackendApiHeaders(accessKey),
-      },
-    );
-    if (!response.ok) throw new Error(`Backend API error: ${response.status}`);
-    return await response.json();
-  }
-
-  if (catalogId.startsWith("livetv_")) {
-    console.log(`[LIVETV] Fetching catalog via Backend: ${catalogId}`);
-    const response = await fetch(
-      `${API_BASE_URL}/api/livetv/catalog/tv/${catalogId}`,
-      {
-        headers: buildBackendApiHeaders(accessKey),
-      },
-    );
-    if (!response.ok) throw new Error(`Backend API error: ${response.status}`);
-    return await response.json();
-  }
-
-  // Default: route to backend (handles matches_, TV Direct, etc.)
+  // Route to backend (handles matches_, northlive_, vavoo_, TV Direct, etc.)
   console.log(`[CATALOG] Fetching catalog via Backend: ${catalogId}`);
   const response = await fetch(
     `${API_BASE_URL}/api/livetv/catalog/tv/${catalogId}`,
@@ -1098,167 +1035,8 @@ async function getCatalog(type, catalogId, accessKey = null) {
   return await response.json();
 }
 
-// Wiflix catalog categories mapping (URL paths)
-const WITV_CATEGORIES = {
-  wiflix_sport: "/chaines-live/sport/",
-  wiflix_cinema: "/chaines-live/cinema/",
-  wiflix_generaliste: "/chaines-live/generaliste/",
-  wiflix_documentaire: "/chaines-live/documentaire/",
-  wiflix_enfants: "/chaines-live/enfants/",
-  wiflix_info: "/chaines-live/info/",
-  wiflix_musique: "/chaines-live/musique/",
-};
-
-// Scrape Wiflix channels from WITV website
-async function getWiflixCatalog(catalogId) {
-  const categoryPath = WITV_CATEGORIES[catalogId];
-  if (!categoryPath) {
-    throw new Error(`Unknown Wiflix catalog: ${catalogId}`);
-  }
-
-  console.log(`[WITV] Fetching catalog for: ${catalogId}`);
-
-  try {
-    const categoryUrl = `${WITV_BASE_URL}${categoryPath}`;
-    console.log(`[WITV] Category URL: ${categoryUrl}`);
-
-    const response = await fetch(categoryUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch category page: ${response.status}`);
-    }
-
-    const html = await response.text();
-    console.log(`[WITV] Category page length: ${html.length}`);
-
-    // Parse channels from HTML
-    const channels = [];
-
-    const cardRegex =
-      /<div[^>]*class="[^"]*holographic-card[^"]*"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\/(\d+)-[^"]*"[^>]*>[\s\S]*?<[^>]*class="[^"]*ann-short_price[^"]*"[^>]*>([^<]+)</gi;
-    let match;
-
-    while ((match = cardRegex.exec(html)) !== null) {
-      const id = match[1];
-      const name = match[2].trim();
-
-      if (id && name && !channels.find((c) => c.id === `wiflix_${id}`)) {
-        const slugMatch = html.match(
-          new RegExp(`href="([^"]*/${id}-[^"\.]+\.html)"`),
-        );
-        const pageSlug = slugMatch ? slugMatch[1] : null;
-
-        const channel = {
-          id: `wiflix_${id}`,
-          type: "tv",
-          name: name,
-          poster: null,
-          genres: [catalogId.replace("wiflix_", "")],
-          _pageSlug: pageSlug,
-          _categoryPath: categoryPath,
-        };
-        channels.push(channel);
-
-        wiflixChannelCache[channel.id] = channel;
-      }
-    }
-
-    // Pattern 2 fallback
-    if (channels.length === 0) {
-      console.log("[WITV] Pattern 1 failed, trying fallback pattern...");
-      const fallbackRegex =
-        /href="[^"]*\/(\d+)-([^"]+)\.html"[^>]*>[\s\S]*?<[^>]*class="[^"]*ann-short_price[^"]*"[^>]*>([^<]+)</gi;
-
-      while ((match = fallbackRegex.exec(html)) !== null) {
-        const id = match[1];
-        const name = match[3].trim();
-
-        if (id && name && !channels.find((c) => c.id === `wiflix_${id}`)) {
-          const slugMatch = html.match(
-            new RegExp(`href="([^"]*/${id}-[^"\.]+\.html)"`),
-          );
-          const pageSlug = slugMatch ? slugMatch[1] : null;
-
-          const channel = {
-            id: `wiflix_${id}`,
-            type: "tv",
-            name: name,
-            poster: null,
-            genres: [catalogId.replace("wiflix_", "")],
-            _pageSlug: pageSlug,
-            _categoryPath: categoryPath,
-          };
-          channels.push(channel);
-          wiflixChannelCache[channel.id] = channel;
-        }
-      }
-    }
-
-    // Pattern 3: Ultra-simple
-    if (channels.length === 0) {
-      console.log("[WITV] Pattern 2 failed, trying ultra-simple pattern...");
-      console.log("[WITV] HTML preview:", html.substring(0, 2000));
-
-      const simpleRegex = /href="[^"]*\/(\d+)-([^"\.]+)/gi;
-      const seenIds = new Set();
-
-      while ((match = simpleRegex.exec(html)) !== null) {
-        const id = match[1];
-        const slug = match[2];
-
-        const name = slug
-          .replace(/-/g, " ")
-          .replace(/\b\w/g, (c) => c.toUpperCase());
-
-        if (id && !seenIds.has(id)) {
-          seenIds.add(id);
-          const channel = {
-            id: `wiflix_${id}`,
-            type: "tv",
-            name: name,
-            poster: null,
-            genres: [catalogId.replace("wiflix_", "")],
-            _pageSlug: `${id}-${slug}.html`,
-            _categoryPath: categoryPath,
-          };
-          channels.push(channel);
-          wiflixChannelCache[channel.id] = channel;
-        }
-      }
-    }
-
-    console.log(`[WITV] Found ${channels.length} channels in ${catalogId}`);
-
-    return { metas: channels };
-  } catch (error) {
-    console.error("[WITV] Error fetching catalog:", error);
-    throw error;
-  }
-}
-
 async function getStream(type, channelId, accessKey = null, options = {}) {
-  // Check if this is a Wiflix channel
-  if (channelId.startsWith("wiflix_")) {
-    return await getWiflixStream(channelId, accessKey);
-  }
-
-  // Check if this is a Sosplay channel
-  if (channelId.startsWith("sosplay_")) {
-    return await getSosplayStream(channelId, accessKey);
-  }
-
-  if (channelId.startsWith("livetv_")) {
-    return await getLiveTvStream(channelId, accessKey, options);
-  }
-
-  // Default: route to backend (handles matches_, TV Direct, etc.)
+  // Route to backend (handles matches_, northlive_, vavoo_, TV Direct, etc.)
   console.log(`[STREAM] Fetching stream via Backend: ${channelId}`);
   const response = await fetch(
     `${API_BASE_URL}/api/livetv/stream/tv/${channelId}`,
@@ -1270,1425 +1048,7 @@ async function getStream(type, channelId, accessKey = null, options = {}) {
   return await response.json();
 }
 
-// Find the channel page URL from cache or by searching
-async function findWiflixChannelPageUrl(channelId) {
-  if (wiflixChannelCache[channelId]) {
-    const channel = wiflixChannelCache[channelId];
-    if (channel._pageSlug) {
-      const pageUrl = channel._pageSlug.startsWith("http")
-        ? channel._pageSlug
-        : `${WITV_BASE_URL}${channel._categoryPath}${channel._pageSlug.replace(/^\//, "")}`;
-      console.log(`[WITV] Found channel page URL in cache: ${pageUrl}`);
-      return pageUrl;
-    }
-  }
-
-  const id = channelId.replace("wiflix_", "");
-  console.log(`[WITV] Channel ${channelId} not in cache, searching...`);
-
-  for (const [catId, categoryPath] of Object.entries(WITV_CATEGORIES)) {
-    try {
-      const categoryUrl = `${WITV_BASE_URL}${categoryPath}`;
-      const response = await fetch(categoryUrl, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        },
-      });
-
-      if (!response.ok) continue;
-
-      const html = await response.text();
-      const regex = new RegExp(`href="([^"]*/${id}-[^"\.]+\.html)"`, "i");
-      const match = html.match(regex);
-
-      if (match) {
-        const channelPath = match[1];
-        const pageUrl = channelPath.startsWith("http")
-          ? channelPath
-          : `${WITV_BASE_URL}${channelPath}`;
-        console.log(`[WITV] Found channel page URL via search: ${pageUrl}`);
-        return pageUrl;
-      }
-    } catch (e) {
-      console.warn(`[WITV] Error searching in ${catId}: ${e.message}`);
-    }
-  }
-
-  return null;
-}
-
-// Wiflix (WITV) stream extraction
-async function getWiflixStream(channelId, accessKey = null) {
-  console.log(`[WITV] Extracting stream for channel: ${channelId}`);
-
-  try {
-    const channelPageUrl = await findWiflixChannelPageUrl(channelId);
-
-    if (!channelPageUrl) {
-      throw new Error(`Could not find page URL for ${channelId}`);
-    }
-
-    console.log(`[WITV] Channel page URL: ${channelPageUrl}`);
-
-    const pageResponse = await fetch(channelPageUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Referer: WITV_BASE_URL + "/",
-      },
-    });
-
-    if (!pageResponse.ok) {
-      throw new Error(`Failed to fetch channel page: ${pageResponse.status}`);
-    }
-
-    const pageHtml = await pageResponse.text();
-    console.log(`[WITV] Channel page length: ${pageHtml.length}`);
-
-    const iframeMatch = pageHtml.match(/<iframe[^>]*src=["']([^"']+)["']/i);
-
-    if (!iframeMatch) {
-      console.error("[WITV] No iframe found on channel page");
-      throw new Error("No iframe found on page");
-    }
-
-    let embedSrc = iframeMatch[1];
-    console.log(`[WITV] Found embed iframe: ${embedSrc}`);
-
-    // Type 1: witv-player.php
-    if (embedSrc.includes("witv-player.php")) {
-      const playerUrl = embedSrc.startsWith("http")
-        ? embedSrc
-        : `${WITV_BASE_URL}${embedSrc}`;
-      console.log(`[WITV] Type 1: witv-player detected, fetching ${playerUrl}`);
-
-      const playerResponse = await fetch(playerUrl, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Referer: channelPageUrl,
-        },
-      });
-
-      if (!playerResponse.ok) {
-        throw new Error(
-          `Failed to fetch player page: ${playerResponse.status}`,
-        );
-      }
-
-      const playerHtml = await playerResponse.text();
-
-      let m3u8Url = null;
-      const streamMatch = playerHtml.match(
-        /var\s+streamUrl\s*=\s*["']([^"']+)["']/,
-      );
-      if (streamMatch) {
-        m3u8Url = streamMatch[1];
-      } else {
-        const fileMatch = playerHtml.match(
-          /file:\s*["']([^"']+\.m3u8[^"']*)["']/,
-        );
-        if (fileMatch) {
-          m3u8Url = fileMatch[1];
-        } else {
-          const genericMatch = playerHtml.match(
-            /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/,
-          );
-          if (genericMatch) {
-            m3u8Url = genericMatch[1];
-          }
-        }
-      }
-
-      if (!m3u8Url) {
-        throw new Error("Could not extract stream URL from witv-player");
-      }
-
-      await addWiflixHeadersRule(m3u8Url);
-
-      return {
-        streams: [
-          {
-            title: "Orca",
-            url: m3u8Url,
-            originalUrl: m3u8Url,
-            behaviorHints: { notWebReady: false },
-          },
-        ],
-      };
-    }
-
-    // Type 2: livehdtv.com
-    if (embedSrc.includes("livehdtv.com")) {
-      const cacheKey = `witv_livehdtv_${channelId}`;
-      const cachedStream = await getFromCache(cacheKey);
-
-      if (cachedStream) {
-        console.log(`[WITV] Found valid stream in cache for ${channelId}`);
-        await addWiflixHeadersRule(
-          cachedStream.url,
-          "https://www.livehdtv.com/",
-        );
-        return { streams: [cachedStream] };
-      }
-
-      console.log(
-        `[WITV] Type 2: livehdtv detected, using backend stream API...`,
-      );
-
-      const apiUrl = `${API_BASE_URL}/api/livetv/stream/tv/${channelId}`;
-      console.log(`[WITV] Calling backend stream API: ${apiUrl}`);
-
-      try {
-        const apiResponse = await fetch(apiUrl, {
-          headers: buildBackendApiHeaders(accessKey),
-        });
-
-        if (!apiResponse.ok) {
-          throw new Error(`Backend API error: ${apiResponse.status}`);
-        }
-
-        const apiData = await apiResponse.json();
-
-        if (apiData.error) {
-          throw new Error(apiData.error);
-        }
-
-        if (!apiData.streams || apiData.streams.length === 0) {
-          throw new Error("No streams returned from backend");
-        }
-
-        const stream = apiData.streams[0];
-        const m3u8Url = stream.originalUrl || stream.url;
-
-        await addWiflixHeadersRule(m3u8Url, "https://www.livehdtv.com/");
-
-        // Verify stream availability
-        console.log("[WITV] Verifying stream availability...");
-        let retries = 0;
-        const maxRetries = 20;
-
-        while (retries < maxRetries) {
-          try {
-            const checkResponse = await fetch(m3u8Url, {
-              method: "GET",
-              headers: {
-                Origin: "https://www.livehdtv.com",
-                Referer: "https://www.livehdtv.com/",
-              },
-            });
-
-            if (checkResponse.ok) {
-              console.log(`[WITV] Stream verified after ${retries} retries`);
-              break;
-            }
-          } catch (e) {
-            // retry
-          }
-
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          retries++;
-        }
-
-        const streamData = {
-          title: "Orca",
-          url: m3u8Url,
-          originalUrl: m3u8Url,
-          behaviorHints: { notWebReady: false },
-        };
-
-        await saveToCache(cacheKey, streamData, 1);
-
-        return { streams: [streamData] };
-      } catch (apiError) {
-        console.error(
-          `[WITV] Backend API failed, trying direct fetch fallback:`,
-          apiError.message,
-        );
-
-        const livehdtvResponse = await fetch(embedSrc, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            Referer: "https://www.livehdtv.com/",
-          },
-        });
-
-        if (!livehdtvResponse.ok) {
-          throw new Error(
-            `Failed to fetch livehdtv page: ${livehdtvResponse.status}`,
-          );
-        }
-
-        const livehdtvHtml = await livehdtvResponse.text();
-
-        const innerIframeMatch = livehdtvHtml.match(
-          /<iframe[^>]*src=["']([^"']+)["']/i,
-        );
-        if (!innerIframeMatch) {
-          throw new Error("No inner iframe found in livehdtv page");
-        }
-
-        let tokenPhpUrl = innerIframeMatch[1];
-        if (!tokenPhpUrl.startsWith("http")) {
-          tokenPhpUrl = `https://www.livehdtv.com${tokenPhpUrl}`;
-        }
-
-        const tokenResponse = await fetch(tokenPhpUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            Referer: embedSrc,
-          },
-        });
-
-        if (!tokenResponse.ok) {
-          throw new Error(`Failed to fetch token.php: ${tokenResponse.status}`);
-        }
-
-        const tokenHtml = await tokenResponse.text();
-        const fileMatch = tokenHtml.match(
-          /file:\s*["']([^"']+\.m3u8[^"']*)["']/,
-        );
-
-        if (!fileMatch) {
-          throw new Error("Could not extract m3u8 from token.php");
-        }
-
-        const m3u8Url = fileMatch[1];
-        await addWiflixHeadersRule(m3u8Url, "https://www.livehdtv.com/");
-
-        return {
-          streams: [
-            {
-              title: "Orca",
-              url: m3u8Url,
-              originalUrl: m3u8Url,
-              behaviorHints: { notWebReady: false },
-            },
-          ],
-        };
-      }
-    }
-
-    // Type 3: Unknown embed - try generic extraction
-    console.log(
-      `[WITV] Unknown embed type, attempting generic extraction from: ${embedSrc}`,
-    );
-
-    const unknownUrl = embedSrc.startsWith("http")
-      ? embedSrc
-      : `${WITV_BASE_URL}${embedSrc}`;
-    const unknownResponse = await fetch(unknownUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Referer: channelPageUrl,
-      },
-    });
-
-    if (!unknownResponse.ok) {
-      throw new Error(
-        `Failed to fetch unknown embed: ${unknownResponse.status}`,
-      );
-    }
-
-    const unknownHtml = await unknownResponse.text();
-    const m3u8Match = unknownHtml.match(
-      /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/,
-    );
-
-    if (!m3u8Match) {
-      throw new Error("Could not extract stream URL from unknown embed");
-    }
-
-    const m3u8Url = m3u8Match[1];
-    await addWiflixHeadersRule(m3u8Url);
-
-    return {
-      streams: [
-        {
-          title: "Orca",
-          url: m3u8Url,
-          originalUrl: m3u8Url,
-          behaviorHints: { notWebReady: false },
-        },
-      ],
-    };
-  } catch (error) {
-    console.error("[WITV] Error extracting stream:", error);
-    throw error;
-  }
-}
-
-// Add DNR rule for Wiflix headers
-async function addWiflixHeadersRule(
-  urlPattern,
-  referer = "https://witv.football/",
-) {
-  try {
-    const url = new URL(urlPattern);
-    const domainPattern = `*://${url.hostname}/*`;
-    const origin = referer.endsWith("/") ? referer.slice(0, -1) : referer;
-
-    await addHeadersRule(domainPattern, {
-      Origin: origin,
-      Referer: referer,
-    });
-  } catch (e) {
-    console.error("[WITV] Failed to add headers rule:", e);
-  }
-}
-
-async function getBackendIframeSourceStream(
-  channelId,
-  accessKey = null,
-  logPrefix = "LIVE",
-  options = {},
-) {
-  const requestUrl = new URL(
-    `${API_BASE_URL}/api/livetv/stream/tv/${channelId}`,
-  );
-  if (options.mode === "sources") {
-    requestUrl.searchParams.set("mode", "sources");
-  }
-  if (Number.isInteger(options.sourceIndex) && options.sourceIndex >= 0) {
-    requestUrl.searchParams.set("sourceIndex", String(options.sourceIndex));
-  }
-
-  const response = await fetch(requestUrl.toString(), {
-    headers: buildBackendApiHeaders(accessKey),
-  });
-  if (!response.ok) throw new Error(`Backend API error: ${response.status}`);
-
-  const data = await response.json();
-
-  if (options.mode === "sources") {
-    console.log(
-      `[${logPrefix}] Backend returned ${data.sources?.length || 0} source(s) for ${channelId}`,
-    );
-    return data;
-  }
-
-  if (data.streams && data.streams.length > 0) {
-    const normalizedStreams = [];
-    const isLiveTvRequest =
-      channelId.startsWith("livetv_") || logPrefix === "LIVETV";
-
-    for (const stream of data.streams) {
-      if (stream._isEmbed) {
-        const url = stream.originalUrl || stream.url;
-        if (isLiveTvRequest && url?.startsWith("http")) {
-          await addLiveTvEmbedHeadersRule(url);
-        }
-
-        normalizedStreams.push({
-          ...stream,
-          url: url || stream.url,
-          originalUrl: url || stream.originalUrl,
-          referer: isLiveTvRequest ? LIVETV_EMBED_REFERER : stream.referer,
-          behaviorHints: { notWebReady: false },
-        });
-        continue;
-      }
-
-      const url = stream.originalUrl || stream.url;
-      if (!url || !url.startsWith("http")) continue;
-
-      if (isLiveTvRequest) {
-        await addLiveTvHeadersRule(url, stream.userAgent);
-      } else {
-        await addSosplayHeadersRule(url, stream.referer, stream.userAgent);
-      }
-      normalizedStreams.push({
-        ...stream,
-        url,
-        originalUrl: url,
-        referer: isLiveTvRequest ? LIVETV_EMBED_REFERER : stream.referer,
-        behaviorHints: { notWebReady: false },
-      });
-    }
-
-    data.streams = normalizedStreams;
-  }
-
-  console.log(
-    `[${logPrefix}] Backend returned ${data.streams?.length || 0} stream(s) for ${channelId}`,
-  );
-  return data;
-}
-
-async function getSosplayStream(channelId, accessKey = null) {
-  console.log(`[SOSPLAY] Fetching stream logic via Extension: ${channelId}`);
-  try {
-    return await getBackendIframeSourceStream(channelId, accessKey, "BOLALOCA");
-
-    let slug = channelId.replace("sosplay_", "");
-    let channelPageUrl = `${SOSPLAY_BASE_URL}/regardertv-${slug}-streaming-direct`;
-
-    console.log(`[SOSPLAY] Fetching channel page: ${channelPageUrl}`);
-    const pageResponse = await fetch(channelPageUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Referer: SOSPLAY_BASE_URL,
-      },
-    });
-
-    if (!pageResponse.ok) {
-      console.log(
-        `[SOSPLAY] Failed to fetch channel page: ${pageResponse.status}`,
-      );
-    }
-
-    const pageHtml = await pageResponse.text();
-
-    const serverRegex =
-      /class="[^"]*change-video[^"]*"[^>]*data-embed="([^"]+)"[^>]*>([\s\S]*?)<\/span>/gi;
-
-    let match;
-    const servers = [];
-
-    while ((match = serverRegex.exec(pageHtml)) !== null) {
-      const rawName = match[2];
-      const cleanName = rawName.replace(/<[^>]+>/g, "").trim();
-
-      if (match[1] && cleanName) {
-        const idMatch = match[1].match(/id=(\d+)\/(\d+)/);
-        servers.push({
-          embedPath: match[1],
-          name: cleanName,
-          channelNum: idMatch ? idMatch[1] : null,
-          serverNum: idMatch ? idMatch[2] : null,
-        });
-      }
-    }
-
-    console.log(
-      `[SOSPLAY] Found ${servers.length} servers: ${servers.map((s) => s.name).join(", ")}`,
-    );
-
-    const allStreams = [];
-    const allEmbeds = [];
-
-    for (const server of servers) {
-      try {
-        console.log(`[SOSPLAY] Trying server: ${server.name}`);
-
-        const partUrl = `${SOSPLAY_BASE_URL}${server.embedPath}`;
-
-        const partResponse = await fetch(partUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            Referer: channelPageUrl,
-          },
-        });
-
-        const partHtml = await partResponse.text();
-
-        const tyIframeMatch = partHtml.match(/<iframe[^>]+src=["']([^"']+)/i);
-        if (!tyIframeMatch) {
-          console.warn(`[SOSPLAY] No iframe in /part/ page for ${server.name}`);
-          continue;
-        }
-
-        let tyPageUrl = tyIframeMatch[1];
-        if (tyPageUrl.startsWith("//")) tyPageUrl = "https:" + tyPageUrl;
-        if (tyPageUrl.startsWith("/")) tyPageUrl = SOSPLAY_BASE_URL + tyPageUrl;
-
-        const tyPageResponse = await fetch(tyPageUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            Referer: partUrl,
-          },
-        });
-
-        const tyPageHtml = await tyPageResponse.text();
-
-        const playerIframeMatch = tyPageHtml.match(
-          /<iframe[^>]+src=["']([^"']+)/i,
-        );
-        if (!playerIframeMatch) {
-          console.warn(
-            `[SOSPLAY] No player iframe in ty page for ${server.name}`,
-          );
-          continue;
-        }
-
-        let playerUrl = playerIframeMatch[1];
-        if (playerUrl.startsWith("//")) playerUrl = "https:" + playerUrl;
-
-        try {
-          const playerDomain = new URL(playerUrl).hostname;
-          await addHeadersRule(`*://${playerDomain}/*`, {
-            Referer: tyPageUrl,
-            Origin: new URL(tyPageUrl).origin,
-          });
-        } catch (e) {
-          console.warn(
-            `[SOSPLAY] Could not add pre-fetch DNR rule for ${server.name}:`,
-            e,
-          );
-        }
-
-        const playerResponse = await fetch(playerUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          },
-        });
-
-        const playerHtml = await playerResponse.text();
-
-        let m3u8Url = null;
-        const isHoca =
-          server.name.toLowerCase().includes("hoca") ||
-          playerUrl.includes("hoca");
-
-        if (isHoca) {
-          m3u8Url = decodeHocaStream(playerHtml);
-        } else {
-          m3u8Url = decodeWigiStream(playerHtml);
-        }
-
-        if (m3u8Url) {
-          console.log(`[SOSPLAY] Found stream for ${server.name}: ${m3u8Url}`);
-
-          await addSosplayHeadersRule(m3u8Url, playerUrl);
-
-          allStreams.push({
-            title: `Sosplay - ${server.name}`,
-            url: m3u8Url,
-            originalUrl: m3u8Url,
-            behaviorHints: { notWebReady: false },
-            _referer: playerUrl,
-            userAgent: STREAM_PROXY_USER_AGENT,
-          });
-        } else {
-          console.warn(`[SOSPLAY] Failed to decode stream for ${server.name}`);
-        }
-      } catch (serverError) {
-        console.warn(
-          `[SOSPLAY] Error with server ${server.name}:`,
-          serverError.message || serverError,
-        );
-        continue;
-      }
-    }
-
-    if (allStreams.length > 0) {
-      console.log(
-        `[SOSPLAY] Total streams found locally: ${allStreams.length}`,
-      );
-      return { streams: allStreams };
-    }
-
-    // Fallback: Use backend API
-    console.log(
-      "[SOSPLAY] Local extraction failed, falling back to Backend API",
-    );
-    const response = await fetch(
-      `${API_BASE_URL}/api/livetv/stream/tv/${channelId}`,
-    );
-    if (!response.ok) throw new Error(`Backend API error: ${response.status}`);
-
-    const data = await response.json();
-
-    if (data.streams && data.streams.length > 0) {
-      for (const stream of data.streams) {
-        const url = stream.originalUrl || stream.url;
-        if (url && url.startsWith("http")) {
-          await addSosplayHeadersRule(url, stream.referer);
-          stream.url = url;
-          stream.behaviorHints = { notWebReady: false };
-        }
-      }
-    }
-
-    return data;
-  } catch (error) {
-    console.error("[SOSPLAY] Error fetching stream:", error);
-    throw error;
-  }
-}
-
-async function getLiveTvStream(channelId, accessKey = null, options = {}) {
-  console.log(`[LIVETV] Fetching stream logic via Extension: ${channelId}`);
-  try {
-    const sourceIndex =
-      Number.isInteger(options?.sourceIndex) && options?.sourceIndex >= 0
-        ? options.sourceIndex
-        : null;
-    const mode = options?.mode === "sources" ? "sources" : "stream";
-    const decodedPath = decodeLiveTvChannelPath(channelId);
-    if (!decodedPath) {
-      throw new Error(`Could not decode channel path for ${channelId}`);
-    }
-
-    const eventUrl = absolutizeLiveTvUrl(
-      decodedPath,
-      LIVETV_BASE_URL,
-      LIVETV_BASE_URL,
-    );
-    if (!eventUrl) {
-      throw new Error(`Could not build event URL for ${channelId}`);
-    }
-
-    const eventPage = await fetchLiveTvText(eventUrl, LIVETV_BASE_URL);
-    if (!eventPage?.html) {
-      throw new Error(`Could not fetch event page ${eventUrl}`);
-    }
-
-    const webplayerEntries = extractLiveTvWebplayerEntries(
-      eventPage.html,
-      eventPage.finalUrl || eventUrl,
-    );
-    console.log(
-      `[LIVETV] Extracted ${webplayerEntries.length} webplayer link(s) locally for ${channelId}`,
-    );
-
-    if (mode === "sources") {
-      return {
-        sources: buildLiveTvSourceOptions(webplayerEntries),
-      };
-    }
-
-    const selectedEntries =
-      sourceIndex === null
-        ? webplayerEntries
-        : webplayerEntries.filter((_, index) => index === sourceIndex);
-
-    if (selectedEntries.length === 0) {
-      return await getBackendIframeSourceStream(
-        channelId,
-        accessKey,
-        "LIVETV",
-        options,
-      );
-    }
-
-    const allStreams = [];
-    const allEmbeds = [];
-
-    for (const entry of selectedEntries) {
-      const candidateUrls = dedupeLiveTvItems(
-        [entry.exportUrl, entry.webplayerUrl].filter(Boolean),
-        (url) => url,
-      );
-
-      let resolved = { streams: [], embeds: [] };
-      for (const candidateUrl of candidateUrls) {
-        resolved = await resolveLiveTvMediaFromUrl(
-          candidateUrl,
-          eventPage.finalUrl || eventUrl,
-          6,
-          new Set(),
-        );
-
-        if (resolved.streams.length > 0 || resolved.embeds.length > 0) {
-          break;
-        }
-      }
-
-      for (const [streamIndex, stream] of resolved.streams.entries()) {
-        await addLiveTvHeadersRule(stream.url);
-        allStreams.push({
-          title:
-            resolved.streams.length > 1
-              ? `${entry.title} ${streamIndex + 1}`
-              : entry.title,
-          url: stream.url,
-          originalUrl: stream.url,
-          behaviorHints: { notWebReady: false },
-          _referer: LIVETV_EMBED_REFERER,
-          userAgent: STREAM_PROXY_USER_AGENT,
-        });
-      }
-
-      for (const [embedIndex, embed] of resolved.embeds.entries()) {
-        await addLiveTvEmbedHeadersRule(embed.url);
-        allEmbeds.push({
-          title:
-            resolved.embeds.length > 1
-              ? `${entry.title} Embed ${embedIndex + 1}`
-              : `${entry.title} Embed`,
-          url: embed.url,
-          originalUrl: embed.url,
-          referer: LIVETV_EMBED_REFERER,
-          behaviorHints: { notWebReady: false },
-          _referer: LIVETV_EMBED_REFERER,
-          userAgent: STREAM_PROXY_USER_AGENT,
-          _isEmbed: true,
-        });
-      }
-    }
-
-    const uniqueStreams = dedupeLiveTvItems(
-      allStreams,
-      (stream) => `${stream.url}__${stream._referer || ""}`,
-    );
-    const uniqueEmbeds = dedupeLiveTvItems(
-      allEmbeds,
-      (embed) => `${embed.url}__${embed._referer || ""}`,
-    );
-
-    if (uniqueStreams.length > 0 || uniqueEmbeds.length > 0) {
-      console.log(
-        `[LIVETV] Resolved ${uniqueStreams.length} direct stream(s) and ${uniqueEmbeds.length} embed(s) locally for ${channelId}`,
-      );
-      return { streams: uniqueStreams.length > 0 ? uniqueStreams : uniqueEmbeds };
-    }
-
-    console.log(
-      "[LIVETV] Local extraction failed, falling back to Backend API",
-    );
-    return await getBackendIframeSourceStream(
-      channelId,
-      accessKey,
-      "LIVETV",
-      options,
-    );
-  } catch (error) {
-    console.warn(
-      `[LIVETV] Local extraction error for ${channelId}:`,
-      error.message || error,
-    );
-    return await getBackendIframeSourceStream(
-      channelId,
-      accessKey,
-      "LIVETV",
-      options,
-    );
-  }
-}
-
-function decodeLiveTvChannelPath(channelId) {
-  try {
-    const encodedPath = String(channelId || "").replace(/^livetv_/, "");
-    const normalized = encodedPath.replace(/-/g, "+").replace(/_/g, "/");
-    const paddingLength = (4 - (normalized.length % 4 || 4)) % 4;
-    return atob(`${normalized}${"=".repeat(paddingLength)}`);
-  } catch (error) {
-    return null;
-  }
-}
-
-function absolutizeLiveTvUrl(
-  rawUrl,
-  currentUrl = "",
-  fallbackBase = LIVETV_BASE_URL,
-) {
-  if (!rawUrl) return null;
-
-  const normalized = String(rawUrl)
-    .trim()
-    .replace(/&amp;/gi, "&")
-    .replace(/\\u0026/g, "&")
-    .replace(/\\\//g, "/")
-    .replace(/\s+/g, "");
-
-  if (!normalized) return null;
-
-  if (normalized.startsWith("//")) {
-    const protocol = String(currentUrl || fallbackBase).startsWith("http://")
-      ? "http:"
-      : "https:";
-    return `${protocol}${normalized}`;
-  }
-
-  try {
-    return new URL(normalized, currentUrl || fallbackBase).href;
-  } catch (error) {
-    return null;
-  }
-}
-
-function dedupeLiveTvItems(items, getKey) {
-  const seen = new Set();
-  const deduped = [];
-
-  for (const item of items) {
-    const key = getKey(item);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(item);
-  }
-
-  return deduped;
-}
-
-function stripLiveTvHtml(value) {
-  return String(value || "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#(\d+);/g, (_, code) => {
-      const value = Number.parseInt(code, 10);
-      return Number.isFinite(value) ? String.fromCodePoint(value) : "";
-    })
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) => {
-      const value = Number.parseInt(code, 16);
-      return Number.isFinite(value) ? String.fromCodePoint(value) : "";
-    })
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function buildLiveTvExportUrl(webplayerUrl, eventUrl = "") {
-  try {
-    const parsed = new URL(webplayerUrl, eventUrl || LIVETV_BASE_URL);
-
-    if (/\/export\/webplayer\.iframe\.php$/i.test(parsed.pathname)) {
-      return parsed.href;
-    }
-
-    if (!/\/webplayer(?:2)?\.php$/i.test(parsed.pathname)) {
-      return parsed.href;
-    }
-
-    let cdnHost = parsed.hostname;
-    if (!cdnHost.startsWith("cdn.")) {
-      const eventHost = new URL(eventUrl || LIVETV_BASE_URL).hostname.replace(
-        /^www\./i,
-        "",
-      );
-      cdnHost = `cdn.${eventHost}`;
-    }
-
-    parsed.protocol = "https:";
-    parsed.hostname = cdnHost;
-    parsed.pathname = "/export/webplayer.iframe.php";
-    return parsed.href;
-  } catch (error) {
-    return webplayerUrl;
-  }
-}
-
-function extractLiveTvWebplayerEntries(html, eventUrl) {
-  const entries = [];
-  const rawHtml = String(html || "");
-  const rowPattern = /<table[^>]+class=["']lnktbj["'][\s\S]*?<\/table>/gi;
-
-  for (const rowMatch of rawHtml.matchAll(rowPattern)) {
-    const rowHtml = rowMatch[0];
-    const hrefMatch = rowHtml.match(
-      /href=["']([^"']*\/webplayer(?:2)?\.php[^"']*)["']/i,
-    );
-    if (!hrefMatch) continue;
-
-    const webplayerUrl = absolutizeLiveTvUrl(
-      hrefMatch[1],
-      eventUrl,
-      LIVETV_BASE_URL,
-    );
-    if (!webplayerUrl) continue;
-
-    let streamType = "";
-    try {
-      streamType = new URL(webplayerUrl).searchParams.get("t") || "";
-    } catch (error) {
-      streamType = "";
-    }
-
-    if (streamType.toLowerCase() === "acestream") {
-      continue;
-    }
-
-    const language =
-      stripLiveTvHtml(
-        rowHtml.match(/<img[^>]+title=["']([^"']+)["']/i)?.[1] || "",
-      ) || "Stream";
-    const bitrate = stripLiveTvHtml(
-      rowHtml.match(/class=["']bitrate["'][^>]*>([\s\S]*?)<\/td>/i)?.[1] || "",
-    );
-    const hoster = stripLiveTvHtml(
-      rowHtml.match(/class=["']lnktyt["'][^>]*>([\s\S]*?)<\/td>/i)?.[1] || "",
-    );
-    const title =
-      [language, hoster, bitrate].filter(Boolean).join(" - ") || language;
-
-    entries.push({
-      title,
-      language,
-      bitrate,
-      hoster,
-      sourceType: streamType,
-      webplayerUrl,
-      exportUrl: buildLiveTvExportUrl(webplayerUrl, eventUrl),
-    });
-  }
-
-  if (entries.length === 0) {
-    for (const hrefMatch of rawHtml.matchAll(
-      /href=["']([^"']*\/webplayer(?:2)?\.php[^"']*)["']/gi,
-    )) {
-      const webplayerUrl = absolutizeLiveTvUrl(
-        hrefMatch[1],
-        eventUrl,
-        LIVETV_BASE_URL,
-      );
-      if (!webplayerUrl) continue;
-
-      entries.push({
-        title: "Stream",
-        language: "",
-        bitrate: "",
-        hoster: "",
-        sourceType: "",
-        webplayerUrl,
-        exportUrl: buildLiveTvExportUrl(webplayerUrl, eventUrl),
-      });
-    }
-  }
-
-  if (entries.length === 0) {
-    const onclickPattern =
-      /show_webplayer\('([^']+)'\s*,\s*'([^']+)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([^']+)'\)/gi;
-
-    for (const match of rawHtml.matchAll(onclickPattern)) {
-      const [, type, contentId, eventId, linkId, countryId, streamId, lang] =
-        match;
-      if (String(type).toLowerCase() === "acestream") continue;
-
-      const webplayerUrl = absolutizeLiveTvUrl(
-        `/webplayer2.php?t=${encodeURIComponent(type)}&c=${encodeURIComponent(contentId)}&lang=${encodeURIComponent(lang)}&eid=${eventId}&lid=${linkId}&ci=${countryId}&si=${streamId}`,
-        eventUrl,
-        LIVETV_BASE_URL,
-      );
-
-      if (!webplayerUrl) continue;
-
-      entries.push({
-        title: stripLiveTvHtml(type) || "Stream",
-        language: stripLiveTvHtml(lang) || "",
-        bitrate: "",
-        hoster: "",
-        sourceType: stripLiveTvHtml(type) || "",
-        webplayerUrl,
-        exportUrl: buildLiveTvExportUrl(webplayerUrl, eventUrl),
-      });
-    }
-  }
-
-  return dedupeLiveTvItems(
-    entries,
-    (entry) => `${entry.exportUrl}__${entry.webplayerUrl}`,
-  );
-}
-
-function buildLiveTvSourceOptions(entries) {
-  return entries.map((entry, index) => ({
-    index,
-    title: entry.title || `Source ${index + 1}`,
-    language: entry.language || "",
-    bitrate: entry.bitrate || "",
-    hoster: entry.hoster || "",
-    sourceType: entry.sourceType || "",
-  }));
-}
-
-function shouldIgnoreLiveTvIframeUrl(rawUrl) {
-  const normalizedUrl = String(rawUrl || "").trim();
-  if (!normalizedUrl) {
-    return true;
-  }
-
-  if (/^(?:about:blank|javascript:|data:)/i.test(normalizedUrl)) {
-    return true;
-  }
-
-  try {
-    const parsed = new URL(normalizedUrl, LIVETV_BASE_URL);
-    const hostname = parsed.hostname.toLowerCase();
-    const pathname = parsed.pathname.toLowerCase();
-    const search = parsed.search.toLowerCase();
-    const combined = `${hostname}${pathname}${search}`;
-
-    if (
-      hostname === "ads.livetv901.me" ||
-      hostname.startsWith("ads.") ||
-      hostname.startsWith("ad.")
-    ) {
-      return true;
-    }
-
-    if (pathname.includes("getbanner.php") || search.includes("zone_id=")) {
-      return true;
-    }
-
-    if (
-      /(?:^|[./_-])(banner|ads?|popunder|popup)(?:[./_-]|$)/i.test(combined)
-    ) {
-      return true;
-    }
-  } catch (error) {
-    return false;
-  }
-
-  return false;
-}
-
-function shouldTreatLiveTvIframeAsTerminalEmbed(
-  rawUrl,
-  fallbackBase = LIVETV_BASE_URL,
-) {
-  const normalizedUrl = String(rawUrl || "").trim();
-  if (!normalizedUrl) {
-    return false;
-  }
-
-  if (/\.(m3u8|mpd)(?:[?#]|$)/i.test(normalizedUrl)) {
-    return false;
-  }
-
-  try {
-    const parsed = new URL(normalizedUrl, fallbackBase || LIVETV_BASE_URL);
-    const fallbackHost = new URL(fallbackBase || LIVETV_BASE_URL).hostname
-      .replace(/^www\./i, "")
-      .toLowerCase();
-    const hostname = parsed.hostname.replace(/^www\./i, "").toLowerCase();
-
-    if (!hostname || !fallbackHost) {
-      return false;
-    }
-
-    return hostname !== fallbackHost && !hostname.endsWith(`.${fallbackHost}`);
-  } catch (error) {
-    return false;
-  }
-}
-
-function isLiveTvExportIframePage(rawUrl) {
-  try {
-    const parsed = new URL(rawUrl, LIVETV_BASE_URL);
-    return /\/export\/webplayer\.iframe\.php$/i.test(parsed.pathname);
-  } catch (error) {
-    return false;
-  }
-}
-
-function shouldFollowLiveTvIframeForExtraction(iframeUrl, pageUrl) {
-  try {
-    const page = new URL(pageUrl, LIVETV_BASE_URL);
-    if (!isLiveTvExportIframePage(page.href)) {
-      return false;
-    }
-
-    if ((page.searchParams.get("t") || "").toLowerCase() !== "alieztv") {
-      return false;
-    }
-
-    const iframe = new URL(iframeUrl, page.href);
-    const hostname = iframe.hostname.replace(/^www\./i, "").toLowerCase();
-    const pathname = iframe.pathname.toLowerCase();
-
-    return hostname === "emb.apl395.me" && pathname === "/player/live.php";
-  } catch (error) {
-    return false;
-  }
-}
-
-function extractLiveTvIframeUrls(html, currentUrl) {
-  const iframeUrls = [];
-  const iframePattern = /<iframe[^>]+src=["']([^"']+)["']/gi;
-
-  for (const match of String(html || "").matchAll(iframePattern)) {
-    const iframeUrl = absolutizeLiveTvUrl(
-      match[1],
-      currentUrl,
-      LIVETV_BASE_URL,
-    );
-    if (iframeUrl && !shouldIgnoreLiveTvIframeUrl(iframeUrl)) {
-      iframeUrls.push(iframeUrl);
-    }
-  }
-
-  return dedupeLiveTvItems(iframeUrls, (url) => url);
-}
-
-function extractLiveTvDirectStreams(html, referer) {
-  const streams = [];
-  const cleaned = String(html || "").replace(/\\\//g, "/");
-
-  const addCandidate = (rawUrl, candidateReferer = referer) => {
-    const absoluteUrl = absolutizeLiveTvUrl(
-      rawUrl,
-      candidateReferer,
-      LIVETV_BASE_URL,
-    );
-    if (!absoluteUrl) return;
-    if (!/\.(m3u8|mpd)(?:[?#]|$)/i.test(absoluteUrl)) return;
-    streams.push({ url: absoluteUrl, referer: candidateReferer });
-  };
-
-  const packedStreamUrl = decodeWigiStream(cleaned);
-  if (packedStreamUrl) {
-    addCandidate(packedStreamUrl, referer);
-  }
-
-  const hocaStreamUrl = decodeHocaStream(cleaned);
-  if (hocaStreamUrl) {
-    addCandidate(hocaStreamUrl, referer);
-  }
-
-  for (const match of cleaned.matchAll(
-    /pl\.init\(\s*['"]([^'"]+)['"]\s*\)/gi,
-  )) {
-    addCandidate(match[1], referer);
-  }
-
-  for (const match of cleaned.matchAll(
-    /manifestUrl\s*:\s*['"]([^'"]+)['"]/gi,
-  )) {
-    addCandidate(match[1], referer);
-  }
-
-  for (const match of cleaned.matchAll(
-    /(?:source|file|src)\s*[:=]\s*['"]([^'"]+\.(?:m3u8|mpd)[^'"]*)['"]/gi,
-  )) {
-    addCandidate(match[1], referer);
-  }
-
-  for (const match of cleaned.matchAll(
-    /['"]((?:https?:)?\/\/[^'"]+\.(?:m3u8|mpd)[^'"]*)['"]/gi,
-  )) {
-    addCandidate(match[1], referer);
-  }
-
-  return dedupeLiveTvItems(
-    streams,
-    (stream) => `${stream.url}__${stream.referer || ""}`,
-  );
-}
-
-async function addLiveTvHeadersRule(
-  targetUrl,
-  userAgent = STREAM_PROXY_USER_AGENT,
-) {
-  try {
-    const url = new URL(targetUrl);
-    const rulePattern = `*://${url.host}${url.pathname}*`;
-
-    await addHeadersRule(rulePattern, {
-      Origin: LIVETV_EMBED_ORIGIN,
-      Referer: LIVETV_EMBED_REFERER,
-      "User-Agent": userAgent || STREAM_PROXY_USER_AGENT,
-    });
-  } catch (error) {
-    console.warn("[LIVETV] Failed to add page headers rule:", error);
-  }
-}
-
-async function addLiveTvEmbedHeadersRule(targetUrl) {
-  try {
-    const url = new URL(targetUrl);
-    const rulePattern = `*://${url.host}${url.pathname}*`;
-
-    await addHeadersRule(rulePattern, {
-      Origin: LIVETV_EMBED_ORIGIN,
-      Referer: LIVETV_EMBED_REFERER,
-    });
-  } catch (error) {
-    console.warn("[LIVETV] Failed to add embed headers rule:", error);
-  }
-}
-
-async function fetchLiveTvText(url, referer = "") {
-  try {
-    const absoluteUrl = absolutizeLiveTvUrl(url, referer, LIVETV_BASE_URL);
-    if (!absoluteUrl) return null;
-
-    await addLiveTvHeadersRule(absoluteUrl);
-
-    const response = await fetch(absoluteUrl, {
-      method: "GET",
-      headers: {
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "User-Agent": STREAM_PROXY_USER_AGENT,
-      },
-      cache: "no-cache",
-      redirect: "follow",
-    });
-
-    if (!response.ok) {
-      console.warn(
-        `[LIVETV] Fetch failed for ${absoluteUrl}: ${response.status} ${response.statusText}`,
-      );
-      return null;
-    }
-
-    return {
-      html: await response.text(),
-      finalUrl: response.url || absoluteUrl,
-    };
-  } catch (error) {
-    console.warn(`[LIVETV] Fetch error for ${url}:`, error.message || error);
-    return null;
-  }
-}
-
-async function resolveLiveTvMediaFromUrl(
-  startUrl,
-  referer,
-  depth = 4,
-  visited = new Set(),
-) {
-  const absoluteUrl = absolutizeLiveTvUrl(startUrl, referer, LIVETV_BASE_URL);
-  if (!absoluteUrl || visited.has(absoluteUrl)) {
-    return { streams: [], embeds: [] };
-  }
-
-  visited.add(absoluteUrl);
-
-  if (/\.(m3u8|mpd)(?:[?#]|$)/i.test(absoluteUrl)) {
-    return {
-      streams: [{ url: absoluteUrl, referer: referer || absoluteUrl }],
-      embeds: [],
-    };
-  }
-
-  const page = await fetchLiveTvText(absoluteUrl, referer);
-  if (!page?.html) {
-    return { streams: [], embeds: [] };
-  }
-
-  let streams = extractLiveTvDirectStreams(
-    page.html,
-    page.finalUrl || absoluteUrl,
-  );
-  let embeds = [];
-  const currentPageUrl = page.finalUrl || absoluteUrl;
-  const iframeUrls = extractLiveTvIframeUrls(
-    page.html,
-    page.finalUrl || absoluteUrl,
-  );
-
-  if (depth <= 0) {
-    return {
-      streams,
-      embeds: iframeUrls.map((url) => ({
-        url,
-        referer: LIVETV_EMBED_REFERER,
-      })),
-    };
-  }
-
-  for (const iframeUrl of iframeUrls) {
-    if (!shouldFollowLiveTvIframeForExtraction(iframeUrl, currentPageUrl)) {
-      embeds.push({ url: iframeUrl, referer: LIVETV_EMBED_REFERER });
-      continue;
-    }
-
-    console.log(`[LIVETV] Following iframe locally: ${iframeUrl}`);
-    const nested = await resolveLiveTvMediaFromUrl(
-      iframeUrl,
-      page.finalUrl || absoluteUrl,
-      depth - 1,
-      visited,
-    );
-    streams = streams.concat(nested.streams);
-    embeds = embeds.concat(nested.embeds);
-
-    if (nested.streams.length === 0 && nested.embeds.length === 0) {
-      embeds.push({ url: iframeUrl, referer: LIVETV_EMBED_REFERER });
-    }
-  }
-
-  return {
-    streams: dedupeLiveTvItems(
-      streams,
-      (stream) => `${stream.url}__${stream.referer || ""}`,
-    ),
-    embeds: dedupeLiveTvItems(
-      embeds,
-      (embed) => `${embed.url}__${embed.referer || ""}`,
-    ),
-  };
-}
-
-async function addSosplayHeadersRule(
-  urlPattern,
-  customReferer = null,
-  customUserAgent = STREAM_PROXY_USER_AGENT,
-) {
-  try {
-    const url = new URL(urlPattern);
-    const pathNoExt = url.pathname.replace(/\.[^/.]+$/, "");
-    const rulePattern = `*://${url.host}${pathNoExt}*`;
-
-    const referer = customReferer || "https://dishtrainer.net/";
-
-    let origin;
-    try {
-      origin = new URL(referer).origin;
-    } catch {
-      origin = "https://dishtrainer.net";
-    }
-
-    const userAgent = customUserAgent || STREAM_PROXY_USER_AGENT;
-
-    await addHeadersRule(rulePattern, {
-      Origin: origin,
-      Referer: referer,
-      "User-Agent": userAgent,
-    });
-  } catch (e) {
-    console.error("[SOSPLAY] Failed to add headers rule:", e);
-  }
-}
-
 // === UTILS ===
-
-function decodeHocaStream(html) {
-  try {
-    const atobMatch = html.match(/atob\(['"]([^'"]+)['"]\)/);
-    if (atobMatch) {
-      try {
-        const decoded = atob(atobMatch[1]);
-        if (decoded.includes(".m3u8")) return decoded;
-      } catch (e) {}
-    }
-
-    const urlArrayMatch = html.match(/return\s*\(\[([^\]]+)\]\.join/);
-    if (urlArrayMatch) {
-      try {
-        const chars = urlArrayMatch[1].match(/"([^"]*)"/g);
-        if (chars) {
-          let url = chars.map((c) => c.replace(/"/g, "")).join("");
-          url = url.replace(/\\\//g, "/");
-          if (url.includes(".m3u8")) return url;
-        }
-      } catch (e) {}
-    }
-
-    const srcMatch = html.match(
-      /(?:source|src|file)\s*[:=]\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/i,
-    );
-    if (srcMatch) {
-      return srcMatch[1].replace(/\\\//g, "/");
-    }
-
-    const m3u8Match = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)/);
-    if (m3u8Match) {
-      return m3u8Match[1].replace(/\\\//g, "/");
-    }
-
-    const packerResult = decodeWigiStream(html);
-    if (packerResult) return packerResult;
-
-    return null;
-  } catch (error) {
-    console.error("[SOSPLAY-HOCA] Error:", error.message || error);
-    return null;
-  }
-}
 
 function unpackPacker(p, a, c, k, e, d) {
   e = function (c) {
@@ -3073,12 +1433,23 @@ async function resolveFctvStream(opts) {
   return `${parsed.origin}/token-${token}${parsed.pathname}${parsed.search}`;
 }
 
-function createHeadersRule(id, urlPattern, headers) {
+function createHeadersRule(
+  id,
+  urlPattern,
+  headers,
+  removeHeaders = [],
+  requestDomains = [],
+) {
   const requestHeaders = Object.entries(headers).map(([header, value]) => ({
     header: header,
     operation: "set",
     value: value,
   }));
+  // Retirer un en-tete que le navigateur impose : `fetch` refuse de les
+  // effacer, seul declarativeNetRequest le peut. Voir fetchIpBoundPage.
+  for (const header of removeHeaders) {
+    requestHeaders.push({ header: header, operation: "remove" });
+  }
 
   return {
     id: id,
@@ -3088,7 +1459,15 @@ function createHeadersRule(id, urlPattern, headers) {
       requestHeaders: requestHeaders,
     },
     condition: {
-      urlFilter: urlPattern,
+      // Une grappe d'hébergeur se joue de `urlFilter` : LuluStream sert la même
+      // page depuis luluvdo.com, luluvid.com et consorts, et un 301 fait passer
+      // la requête d'un domaine à l'autre. `requestDomains` couvre la grappe
+      // entière, là où un motif calculé sur l'URL de départ laisse la cible du
+      // 301 sans règle — les deux se cumulant en ET, il REMPLACE `urlFilter`
+      // au lieu de s'y ajouter, sinon la cible du 301 reste exclue.
+      ...(requestDomains.length
+        ? { requestDomains: requestDomains }
+        : { urlFilter: urlPattern }),
       resourceTypes: [
         "xmlhttprequest",
         "media",
@@ -3101,10 +1480,44 @@ function createHeadersRule(id, urlPattern, headers) {
   };
 }
 
-async function addHeadersRule(urlPattern, headers) {
+/**
+ * Une règle déjà posée vise-t-elle la même chose que celle qu'on s'apprête à
+ * ajouter ? Même `urlFilter`, ou même grappe de `requestDomains` : dans les
+ * deux cas la nouvelle la remplace.
+ */
+function isSupersededRule(condition, urlPattern, requestDomains) {
+  if (!condition) return false;
+  if (urlPattern && condition.urlFilter === urlPattern) return true;
+  if (!requestDomains.length) return false;
+  const existing = condition.requestDomains || [];
+  return (
+    existing.length === requestDomains.length &&
+    existing.every((domain) => requestDomains.includes(domain))
+  );
+}
+
+async function addHeadersRule(
+  urlPattern,
+  headers,
+  removeHeaders = [],
+  requestDomains = [],
+) {
   const existingRules =
     await browserAPI.declarativeNetRequest.getDynamicRules();
   const existingIds = new Set(existingRules.map((r) => r.id));
+
+  // Les règles dynamiques survivent aux redémarrages du navigateur : sans
+  // purge, chaque extraction en empile une de plus sur la même cible. Les
+  // doublons ne sont pas inoffensifs — à priorité égale, la règle qui l'emporte
+  // sur un en-tête donné n'est pas déterminée, et une règle posée par une
+  // version précédente (sans `Accept-Language` épinglé) peut donc gagner.
+  const supersededIds = existingRules
+    .filter(
+      (rule) =>
+        !isSeekPlaybackRuleId(rule.id) &&
+        isSupersededRule(rule.condition, urlPattern, requestDomains),
+    )
+    .map((rule) => rule.id);
 
   let id = ruleIdCounter;
   while (existingIds.has(id)) {
@@ -3112,10 +1525,17 @@ async function addHeadersRule(urlPattern, headers) {
   }
   ruleIdCounter = id + 1;
 
-  const rule = createHeadersRule(id, urlPattern, headers);
+  const rule = createHeadersRule(
+    id,
+    urlPattern,
+    headers,
+    removeHeaders,
+    requestDomains,
+  );
 
   try {
     await browserAPI.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: supersededIds,
       addRules: [rule],
     });
     return id;

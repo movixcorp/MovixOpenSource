@@ -39,6 +39,8 @@
 		B10000000000000000000006 /* MediaProxySessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000006 /* MediaProxySessionStore.swift */; };
 		B10000000000000000000007 /* MediaProxySessionStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000007 /* MediaProxySessionStoreTests.swift */; };
 		B10000000000000000000008 /* MediaProxyUpstream.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000008 /* MediaProxyUpstream.swift */; };
+		B10000000000000000000010 /* MediaProxySchemeHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000010 /* MediaProxySchemeHandler.swift */; };
+		B1000000000000000000000F /* MediaProxyJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000000000000000000000F /* MediaProxyJournal.swift */; };
 		B10000000000000000000009 /* MediaProxyHTTPParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000009 /* MediaProxyHTTPParser.swift */; };
 		B1000000000000000000000A /* MediaProxyServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000000000000000000000A /* MediaProxyServer.swift */; };
 		B1000000000000000000000B /* MediaProxyHTTPParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000000000000000000000B /* MediaProxyHTTPParserTests.swift */; };
@@ -110,6 +112,8 @@
 		B20000000000000000000006 /* MediaProxySessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxySessionStore.swift; sourceTree = "<group>"; };
 		B20000000000000000000007 /* MediaProxySessionStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxySessionStoreTests.swift; sourceTree = "<group>"; };
 		B20000000000000000000008 /* MediaProxyUpstream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxyUpstream.swift; sourceTree = "<group>"; };
+		B20000000000000000000010 /* MediaProxySchemeHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxySchemeHandler.swift; sourceTree = "<group>"; };
+		B2000000000000000000000F /* MediaProxyJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxyJournal.swift; sourceTree = "<group>"; };
 		B20000000000000000000009 /* MediaProxyHTTPParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxyHTTPParser.swift; sourceTree = "<group>"; };
 		B2000000000000000000000A /* MediaProxyServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxyServer.swift; sourceTree = "<group>"; };
 		B2000000000000000000000B /* MediaProxyHTTPParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProxyHTTPParserTests.swift; sourceTree = "<group>"; };
@@ -207,6 +211,8 @@
 				B20000000000000000000005 /* MediaProxyModels.swift */,
 				B20000000000000000000006 /* MediaProxySessionStore.swift */,
 				B20000000000000000000008 /* MediaProxyUpstream.swift */,
+				B20000000000000000000010 /* MediaProxySchemeHandler.swift */,
+				B2000000000000000000000F /* MediaProxyJournal.swift */,
 				B20000000000000000000009 /* MediaProxyHTTPParser.swift */,
 				B2000000000000000000000A /* MediaProxyServer.swift */,
 				B2000000000000000000000D /* MediaProxyModule.swift */,
@@ -581,6 +587,8 @@
 				B10000000000000000000005 /* MediaProxyModels.swift in Sources */,
 				B10000000000000000000006 /* MediaProxySessionStore.swift in Sources */,
 				B10000000000000000000008 /* MediaProxyUpstream.swift in Sources */,
+				B10000000000000000000010 /* MediaProxySchemeHandler.swift in Sources */,
+				B1000000000000000000000F /* MediaProxyJournal.swift in Sources */,
 				B10000000000000000000009 /* MediaProxyHTTPParser.swift in Sources */,
 				B1000000000000000000000A /* MediaProxyServer.swift in Sources */,
 				B1000000000000000000000D /* MediaProxyModule.swift in Sources */,

@@ -5,6 +5,7 @@ import { ChevronDown, Check } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import i18n from '../i18n';
 import { useLightMode } from '../context/LightModeContext';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 interface DropdownOption {
   value: string;
@@ -320,7 +321,7 @@ const CustomDropdown: React.FC<CustomDropdownProps> = ({
         <ChevronDown className={`w-4 h-4 flex-shrink-0 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
-      {createPortal(menuContent, document.body)}
+      {createPortal(menuContent, getOverlayPortalRoot())}
     </div>
   );
 };

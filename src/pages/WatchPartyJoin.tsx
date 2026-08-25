@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useTranslation } from 'react-i18next';
 import { WATCHPARTY_API } from '../config/runtime';
+import { storeRoomToken } from '../utils/watchparty';
 
 const MAIN_API = WATCHPARTY_API;
 
@@ -87,11 +88,15 @@ const WatchPartyJoin: React.FC = () => {
       });
 
       if (response.data.success) {
+        // Token d'accès délivré par le serveur : requis pour lire la room et
+        // ouvrir la socket.
+        storeRoomToken(response.data.roomId, response.data.token);
         navigate(`/watchparty/room/${response.data.roomId}`, {
           state: {
             isHost: false,
             nickname,
-            roomCode
+            roomCode,
+            token: response.data.token
           }
         });
       } else {

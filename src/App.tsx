@@ -41,6 +41,7 @@ import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 import { IntroProvider, useIntro } from './context/IntroContext';
 import { APRIL_FOOLS_ADMIN_PATH, isAprilFoolsAdminEnabled } from './utils/aprilFools';
+import { PLAYER_FULLSCREEN_HOST_ID, releaseHostFullscreen } from './utils/playerFullscreenPersistence';
 import {
   pushPriorityToExtension,
   subscribeToPriorityChanges,
@@ -125,6 +126,7 @@ const API_HOSTNAME = (() => {
 // Component to manage episode alerts notifications
 const AlertNotificationManager: React.FC = () => {
   const [notifications, setNotifications] = useState<NotificationData[]>([]);
+  const navigate = useNavigate();
 
   // Function to check and display alerts
   const checkAlerts = (forceCheck = false) => {
@@ -193,7 +195,10 @@ const AlertNotificationManager: React.FC = () => {
     setNotifications(prev => prev.filter(n => n.id !== notificationId));
     // Mark as dismissed since user took action
     AlertService.dismissAlert(notificationId);
-    window.location.href = `/tv/${showId}`;
+    // Navigation SPA : recharger la page entière pour aller voir une série
+    // rejetait tout ce qui était déjà chargé — bundle, données, images — pour
+    // un déplacement que le routeur fait sans rien perdre.
+    navigate(`/tv/${showId}`);
   };
 
   return (
@@ -1748,6 +1753,17 @@ const AppWithIntro: React.FC = () => {
   const shouldShowHeader = !isWatchRoute && !isWrappedRoute;
   const isAprilFoolsAdminRouteEnabled = isAprilFoolsAdminEnabled(location.search);
   const isNoFooterPage = isWatchRoute;
+
+  // Le plein écran du lecteur est porté par le conteneur racine de l'app (voir
+  // `PLAYER_FULLSCREEN_HOST_ID`), pour qu'il survive au remontage du lecteur
+  // d'un épisode à l'autre. Corollaire : il ne se referme plus tout seul quand
+  // le lecteur disparaît — on le relâche donc en quittant les routes lecteur,
+  // sinon le reste du site s'afficherait en plein écran.
+  React.useEffect(() => {
+    if (isWatchRoute) return;
+    releaseHostFullscreen();
+  }, [isWatchRoute]);
+
   React.useEffect(() => {
     // Masquer le footer uniquement sur les routes lecteur
     const footer = document.querySelector('footer');
@@ -1846,7 +1862,7 @@ const AppWithIntro: React.FC = () => {
   }, []);
 
   return (
-    <div className="min-h-screen bg-black text-white relative overflow-hidden">
+    <div id={PLAYER_FULLSCREEN_HOST_ID} className="min-h-screen bg-black text-white relative overflow-clip">
       {/* Intro overlay — le site charge derrière */}
       {showIntro && (
         <Suspense fallback={null}>

@@ -26,26 +26,40 @@ export const BUILTIN_HOSTER_PATTERNS: Record<BuiltinHosterId, string[]> = {
   voe: [
     // voe.<tld> — catch-all pour tous les TLD de la famille voe
     'voe\\.',
+    // les variantes « déblocage » : voe-unblock, v-o-e-unblock, voeunbl0ck12…
+    '(?:v-?o-?e)?-?un-?bl[o0]?c?k\\d{0,2}(?:-?voe)?\\.',
     // alias aléatoires (pas de "voe" dans le nom, requiert une liste explicite).
     // Mis à jour avec les domaines observés dans les redirects 302 — voe tourne
     // ses domaines de sortie ~mensuellement, user peut ajouter de nouveaux
     // aliases via Settings → Priorité → Hosters custom & regex.
-    'ralphysuccessfull', 'claudiosepulchral',
-    'anthonysaline', 'auraleanline',
-    'letsupload', 'robertordercharacter',
-    'prepareddare', 'preferciseaccurate',
-    'conscientiousedu', 'effortlessexperim',
-    'timmaybealready',
+    '(?:19turanosephantasia|20demidistance9elongations|30sensualizeexpression|321naturelikefurfuroid|35volitantplimsoles5|449unceremoniousnasoseptal|745mingiestblissfully|adrianmissionminute|alleneconomicmatter|antecoxalbobbing1010|anthonysaline|apinchcaseation|audaciousdefaulthouse|auraleanline|availedsmallest|bigclatterhomesguideservice)\\.',
+    '(?:boonlessbestselling244|bradleyviewdoctor|brittneystandardwestern|brucevotewithin|caseyimpactstation|charlestoughrace|christopheruntilpoint|chromotypic|chuckle-tube|cindyeyefinal|claudiosepulchral|conscientiousedu|counterclockwisejacky|crownmakermacaronicism|crystaltreatmenteast|cyamidpulverulence530)\\.',
+    '(?:dianaavoidthey|diananatureforeign|donaldlineelse|edwardarriveoften|effortlessexperim|ellenpoliticalfollow|erikcoldperson|figeterpiazine|fittingcentermondaysunday|fraudclatterflyingcar|gamoneinterrupted|garylargeavailable|generatesnitrosate|goofy-banana|graceaddresscommunity|greaseball6eventual20)\\.',
+    '(?:guidon40hyporadius9|heatherdiscussionwhen|housecardsummerbutton|ianrequireadult|jamessoundcost|jamiesamewalk|jasminetesttry|jayservicestuff|jeanprofessorcentral|jefferycontrolmodel|jennifercertaindevelopment|jennifereconomicgive|jessicachoosemake|jessicayeahcatch|jilliandescribecompany|johnalwayssame)\\.',
+    '(?:johnbeyondnation|jonathansociallike|josephseveralconcern|juliewomanwish|kathleenmemberhistory|kellywhatcould|kennethofficialitem|kinoger|kristiesoundsimply|lancewhosedifficult|launchreliantcleaverriver|lauradaydo|letsupload|lisatrialidea|loriwithinfamily|lukecomparetwo)\\.',
+    '(?:lukesitturn|mariatheserepublican|marissasharecareer|matriculant401merited|matthewhotelscience|maxfinishseveral|metagnathtuggers|michaelapplysome|mikaylaarealike|nathanfromsubject|nectareousoverelate|nonesnanking|ogladaj|pamelachangemission|paulkitchendark|preferciseaccurate)\\.',
+    '(?:prepareddare|ralphysuccessfull|realfinanceblogcenter|rebeccaneverbase|rebeccapracticeloss|reputationsheriffkennethsand|richardsignfish|roberteachfinal|robertordercharacter|robertplacespace|sandratableother|sandrataxeight|scatch176duplicities|sethniceletter|shannonpersonalcost|simpulumlamerop|smoki)\\.',
+    '(?:stevenfamilyedge|stevenimaginelittle|strawberriesporail|telyn610zoanthropy|timberwoodanotia|timmaybealready|toddpartneranimal|toxitabellaeatrebates306|tracylocalschool|uptodatefinishconferenceroom|valeronevijao|walterprettytheir|wolfdyslectic|yodelswartlike)\\.',
   ],
   vidmoly: ['vidmoly'],
   uqload: ['uqload'],
   sibnet: ['sibnet'],
+  // Veev partage `doods.to` avec la nébuleuse DoodStream mais parle un tout
+  // autre protocole. Il est testé avant grâce à sa position dans
+  // BUILTIN_HOSTER_IDS — ne pas le déplacer après `doodstream`.
+  veev: ['veev\\.', 'poophq', 'doods\\.to'],
   doodstream: [
-    'doodstream', 'd0000d', 'd000d',
-    'dood\\.', 'doodster',
-    'myvidplay', 'dsvplay', 'doply',
-    'ds2play', 'ds2video', 'dood2',
+    'doodstream', 'd0000d', 'd000d', 'd0o0d', 'do0od',
+    'dood\\.', 'doodster', 'dooodster', 'dooood', 'doodcdn',
+    'myvidplay', 'dsvplay', 'doply', 'playmogo',
+    'ds2play', 'ds2video', 'dood2', 'all3do', 'do7go',
+    'vidply', 'vide0\\.net', 'vvide0', 'd-s\\.io',
   ],
+  lulustream: [
+    'lulustream', 'luluvdo', 'luluvdoo', 'luluvid', 'lulu\\.st',
+    'streamhihi', 'd00ds\\.site', 'cdn1\\.site', '732eg54de642sa',
+  ],
+  vidara: ['vidara\\.(?:to|so)'],
   seekstreaming: [
     'embedseek',
     'embed4me',
@@ -65,13 +79,43 @@ export const BUILTIN_HOSTER_PATTERNS: Record<BuiltinHosterId, string[]> = {
   fsvid: ['fsvid'],
 };
 
+/**
+ * Domaine canonique par hoster : celui que le serveur d'extraction attend en
+ * `Origin` / `Referer`. Les agrégateurs servent le lecteur sur le TLD du
+ * moment, qui tourne régulièrement ; on normalise vers celui-ci AVANT
+ * extraction uniquement — l'URL d'une iframe doit garder le domaine servi,
+ * seul dont on sait qu'il est vivant.
+ *
+ * Quand un hoster change de domaine, c'est la seule ligne à changer côté
+ * front. Penser aux headers correspondants dans
+ * `API/proxiesembed/server.py` (vidmoly_proxy_handler et RE_VMWESA).
+ */
+export const CANONICAL_HOSTER_DOMAINS: Partial<Record<BuiltinHosterId, string>> = {
+  vidmoly: 'vidmoly.org',
+  uqload: 'uqload.is',
+};
+
+/**
+ * Réécrit le domaine d'une URL vers le domaine canonique de son hoster.
+ * Sans domaine canonique déclaré, l'URL est rendue telle quelle.
+ */
+export function toCanonicalHosterDomain(url: string, hoster: BuiltinHosterId): string {
+  const canonical = CANONICAL_HOSTER_DOMAINS[hoster];
+  if (!canonical || !url) return url;
+  const family = canonical.split('.')[0];
+  return url.replace(new RegExp(`${family}\\.[a-z0-9-]+`, 'gi'), canonical);
+}
+
 /** Labels human-readable pour UI. */
 export const HOSTER_LABELS: Record<BuiltinHosterId, string> = {
   voe: 'Voe',
   vidmoly: 'Vidmoly',
   uqload: 'Uqload',
   sibnet: 'Sibnet',
+  veev: 'Veev',
   doodstream: 'DoodStream',
+  lulustream: 'LuluStream',
+  vidara: 'Vidara',
   seekstreaming: 'SeekStreaming',
   smoothpre: 'SmoothPre',
   minochinos: 'Minochinos',

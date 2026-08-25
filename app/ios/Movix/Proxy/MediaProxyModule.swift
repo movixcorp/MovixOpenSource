@@ -70,4 +70,60 @@ final class MediaProxyModule: NSObject {
       resolve(payload)
     }
   }
+
+  // MARK: - Journal réseau (diagnostic)
+  // La requête média part du natif : sans ces méthodes, ni l'utilisateur ni un
+  // inspecteur réseau ne voient les en-têtes réellement émis, et un 403
+  // d'hébergeur reste indébogable. Tout est en mémoire, éteint par défaut.
+  // Parité avec MediaProxyModule.kt.
+
+  @objc
+  func setJournalEnabled(
+    _ enabled: Bool,
+    resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    MediaProxyJournal.setEnabled(enabled)
+    resolve(enabled)
+  }
+
+  @objc
+  func getJournal(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    resolve(MediaProxyJournal.snapshot())
+  }
+
+  @objc
+  func clearJournal(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    MediaProxyJournal.clear()
+    resolve(true)
+  }
+
+  @objc
+  func recordJournalEntry(
+    _ phase: String,
+    method: String,
+    url: String,
+    headers: [String: String],
+    statusCode: NSNumber,
+    error: String?,
+    resolve: @escaping RCTPromiseResolveBlock,
+    reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let code = statusCode.intValue
+    MediaProxyJournal.record(
+      phase: phase,
+      method: method,
+      url: url,
+      requestHeaders: MediaProxyPolicy.sanitizeRequestHeaders(headers),
+      statusCode: code > 0 ? code : nil,
+      error: error
+    )
+    resolve(true)
+  }
 }

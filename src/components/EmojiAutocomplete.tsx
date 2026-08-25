@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 interface EmojiAutocompleteProps {
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -296,7 +297,7 @@ const EmojiAutocomplete: React.FC<EmojiAutocompleteProps> = ({ textareaRef, valu
         </motion.div>
       )}
     </AnimatePresence>,
-    document.body
+    getOverlayPortalRoot()
   );
 };
 

@@ -32,7 +32,11 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, X, Loader2, Volume1, Cast, Airplay, Settings, ArrowLeft, ExternalLink } from 'lucide-react';
 import { isExtensionAvailable, fetchFromExtension } from '../utils/extensionProxy';
 import { isLiveTvSourceEnabled, type LiveTvSourceKey } from '../utils/extractionPrefs';
-import type { VavooChannelVariant } from '../utils/vavooChannelGroups';
+import {
+    getVavooFallbackAction,
+    resolveVavooVariantStreams,
+    type VavooChannelVariant,
+} from '../utils/vavooChannelGroups';
 import { isLowLatencyEnabled } from '../utils/lowLatencyPref';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
@@ -47,16 +51,15 @@ import {
     requestAirPlay,
     AirPlayState
 } from '../utils/castUtils';
-import { PROXIES_EMBED_API } from '../config/runtime';
 
 // Custom Loader that keeps top-level manifest requests on the proxy URL.
 // Child playlists rewritten by proxiesembed already use stable proxied URLs;
 // forcing them back to the root manifest can break live sequence tracking.
 class ProxyLoader {
-    static _proxyBaseUrl: string = '';
-    static _originalStreamUrl: string = '';
-    static _headersParam: string = '';
-    static _manifestUrl: string = ''; // Full proxy URL to force for manifest reloads
+    // URL proxy complète (et signée) à réutiliser pour les rechargements de
+    // manifeste. On ne la reconstruit jamais à partir de morceaux : le client
+    // ne sait pas signer, et une URL non signée serait refusée par le proxy.
+    static _manifestUrl: string = '';
     static _forceLevelReloads: boolean = false; // Direct live media playlist: keep level refreshes on the source proxy URL
 
     private delegate: any;
@@ -89,11 +92,7 @@ class ProxyLoader {
         if (isManifest || isDirectLevelReload) {
             // Keep only the top-level manifest anchored on the original proxy URL.
             // Level/audio playlists must preserve their own proxied URL returned by the proxy.
-            let forceUrl = ProxyLoader._manifestUrl;
-            if (!forceUrl && ProxyLoader._proxyBaseUrl && ProxyLoader._originalStreamUrl) {
-                const encoded = encodeURIComponent(ProxyLoader._originalStreamUrl);
-                forceUrl = `${ProxyLoader._proxyBaseUrl}/proxy?url=${encoded}${ProxyLoader._headersParam}`;
-            }
+            const forceUrl = ProxyLoader._manifestUrl;
             if (forceUrl && url !== forceUrl) {
                 console.log('[ProxyLoader] Manifest reload → forced through proxy (was:', url.substring(0, 80), ')');
                 context.url = forceUrl;
@@ -253,6 +252,10 @@ class ExtensionLoader {
 
 interface Stream {
     url: string;
+    // Variante proxifiée et signée par mainapi, jointe d'office à chaque flux.
+    // Le client ne peut pas la fabriquer lui-même : proxiesembed n'accepte que
+    // des URLs signées par le backend.
+    proxyUrl?: string;
     title: string;
     behaviorHints?: {
         notWebReady?: boolean;
@@ -261,6 +264,7 @@ interface Stream {
     _isEmbed?: boolean;
     _embedPath?: string;
     _directPlay?: boolean; // Play the raw URL as-is: no proxy, no extension loader (Vavoo)
+    _vavooVariantId?: string;
     originalUrl?: string; // Original unproxied URL for extension use (Wiflix streams)
     referer?: string;
     userAgent?: string;
@@ -274,17 +278,7 @@ interface Stream {
     };
 }
 
-interface LiveTvSourceOption {
-    index: number;
-    title: string;
-    language?: string;
-    bitrate?: string;
-    hoster?: string;
-    sourceType?: string;
-}
-
 interface StreamRequestOptions {
-    mode?: 'sources';
     sourceIndex?: number;
 }
 
@@ -292,10 +286,8 @@ interface LiveTVPlayerProps {
     channelId: string;
     channelName: string;
     channelPoster?: string;
-    // Vavoo: the grouped channel's server/quality variants. Switching one calls
-    // onSelectVavooVariant(id) — the parent swaps channelId and the player refetches.
+    // Vavoo: every server/quality variant is resolved concurrently on open.
     vavooVariants?: VavooChannelVariant[];
-    onSelectVavooVariant?: (variantId: string) => void;
     onClose: () => void;
 }
 
@@ -314,8 +306,8 @@ const hasNonStandardPort = (_url: string): boolean => {
 };
 
 // Constante pour le serveur proxy embed
-const PROXIES_EMBED_API_URL = PROXIES_EMBED_API;
 const VAVOO_USER_AGENT = 'VAVOO/2.6';
+const VAVOO_VARIANT_TIMEOUT_MS = 12_000;
 
 const buildProxyHeadersForStream = (stream?: Stream, forceVavooUserAgent = false): Record<string, string> => {
     const headers: Record<string, string> = {};
@@ -336,11 +328,6 @@ const buildProxyHeadersForStream = (stream?: Stream, forceVavooUserAgent = false
     }
 
     return headers;
-};
-
-const encodeProxyHeadersParam = (headers: Record<string, string>): string => {
-    if (Object.keys(headers).length === 0) return '';
-    return `&headers=${encodeURIComponent(JSON.stringify(headers))}`;
 };
 
 const mergeHeadersIntoProxyUrl = (url: string, headers: Record<string, string>): string => {
@@ -364,7 +351,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     channelName,
     channelPoster,
     vavooVariants,
-    onSelectVavooVariant,
     onClose,
 }) => {
     const { t } = useTranslation();
@@ -389,17 +375,25 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     const hlsRecoveryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const hlsRecoveryInFlightRef = useRef(false);
     const userPausedRef = useRef(false);
+    const streamsRef = useRef<Stream[]>([]);
+    const vavooResolutionPendingRef = useRef(false);
+    const vavooResolutionOwnerRef = useRef<symbol | null>(null);
+    const waitingForVavooStreamRef = useRef<{ errorMessage: string } | null>(null);
 
     const [streams, setStreams] = useState<Stream[]>([]);
-    const [sourceOptions, setSourceOptions] = useState<LiveTvSourceOption[]>([]);
-    const [selectedSourceIndex, setSelectedSourceIndex] = useState<number | null>(null);
     const [currentStreamIndex, setCurrentStreamIndex] = useState(0);
+    const [isVavooResolving, setIsVavooResolving] = useState(false);
+
+    useEffect(() => {
+        streamsRef.current = streams;
+    }, [streams]);
 
     // FCTV native (matches) is IP-locked: the token must be minted from the
     // user's IP. So free users resolve each server in the browser via the
     // extension/userscript (RESOLVE_FCTV), which also installs the Referer rule.
     // Stubs that can't be resolved (no extension) keep an empty url and get
-    // filtered out below -> those users fall back to the embed player.
+    // filtered out below. Le repli « lecteur intégré » ayant été retiré, ces
+    // utilisateurs voient « aucun flux disponible ».
     const resolveFctvStubs = useCallback(async (rawStreams: Stream[]): Promise<Stream[]> => {
         if (!Array.isArray(rawStreams) || !rawStreams.some((s) => s._fctvLocal)) return rawStreams;
         if (!isExtensionAvailable()) return rawStreams;
@@ -430,6 +424,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     const [useProxy, setUseProxy] = useState(false);
     const [playerReinitKey, setPlayerReinitKey] = useState(0); // Increment to force player reinit
 
+
     // Cast states
     const [isCasting, setIsCasting] = useState(false);
     const [airplayState, setAirplayState] = useState<AirPlayState>({
@@ -443,11 +438,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     const MAX_458_RETRIES = 30;
     const RETRY_458_INTERVAL_MS = 500;
     const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-    const formatSourceOptionLabel = useCallback(
-        (source: { title?: string; index: number }) => source.title || t('liveTV.sourceNumber', { index: source.index + 1 }),
-        [t]
-    );
 
     const clearControlsTimeout = useCallback(() => {
         if (controlsTimeoutRef.current) {
@@ -659,7 +649,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
     // API Base URL
     const API_BASE = import.meta.env.VITE_MAIN_API || 'http://localhost:25565';
-    const isLiveTvChannel = channelId.startsWith('livetv_') || channelId.startsWith('daddylive_');
 
     // Lock the background page scroll while the player is open (embed iframe or
     // video). Scroll inside the iframe still works — it's cross-origin and
@@ -678,13 +667,17 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         };
     }, []);
 
-    const fetchChannelPayload = useCallback(async (requestOptions: StreamRequestOptions = {}) => {
-        const isNorthlive = channelId.startsWith('northlive');
-        const isMatch = channelId.startsWith('match');
-        const isVavoo = channelId.startsWith('vavoo');
+    const fetchChannelPayload = useCallback(async (
+        requestOptions: StreamRequestOptions = {},
+        requestedChannelId = channelId,
+        signal?: AbortSignal,
+    ) => {
+        const isNorthlive = requestedChannelId.startsWith('northlive');
+        const isMatch = requestedChannelId.startsWith('match');
+        const isVavoo = requestedChannelId.startsWith('vavoo');
 
         if (isExtensionAvailable() && !isNorthlive && !isMatch && !isVavoo) {
-            const srcKey = channelId.split('_')[0] as LiveTvSourceKey;
+            const srcKey = requestedChannelId.split('_')[0] as LiveTvSourceKey;
             if (!isLiveTvSourceEnabled(srcKey)) {
                 const disabledError = new Error(t('liveTV.sourceDisabledByUser', { source: srcKey })) as Error & { isDisabledByUser?: boolean };
                 disabledError.isDisabledByUser = true;
@@ -692,22 +685,19 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             }
             return await fetchFromExtension('GET_STREAM', {
                 type: 'tv',
-                id: channelId,
-                mode: requestOptions.mode,
+                id: requestedChannelId,
                 sourceIndex: requestOptions.sourceIndex
             });
         }
 
-        const requestUrl = new URL(`${API_BASE}/api/livetv/stream/tv/${channelId}`);
-        if (requestOptions.mode === 'sources') {
-            requestUrl.searchParams.set('mode', 'sources');
-        }
+        const requestUrl = new URL(`${API_BASE}/api/livetv/stream/tv/${requestedChannelId}`);
         if (Number.isInteger(requestOptions.sourceIndex) && requestOptions.sourceIndex! >= 0) {
             requestUrl.searchParams.set('sourceIndex', String(requestOptions.sourceIndex));
         }
 
         const response = await fetch(requestUrl.toString(), {
-            headers: { ...getVipHeaders() }
+            headers: { ...getVipHeaders() },
+            signal,
         });
 
         if (!response.ok) {
@@ -719,17 +709,94 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         return await response.json();
     }, [API_BASE, channelId, t]);
 
-    const loadResolvedStreams = useCallback(async (requestOptions: StreamRequestOptions = {}) => {
+    const loadResolvedStreams = useCallback(async (
+        requestOptions: StreamRequestOptions = {},
+        signal?: AbortSignal,
+    ) => {
         setIsLoading(true);
         setError(null);
 
         try {
             let loaded = false;
 
-            for (let attempt = 0; attempt < MAX_404_RETRIES && !loaded; attempt++) {
+            if (channelId.startsWith('vavoo') && vavooVariants?.length) {
+                const resolutionOwner = Symbol('vavoo-resolution');
+                vavooResolutionOwnerRef.current = resolutionOwner;
+                vavooResolutionPendingRef.current = true;
+                setIsVavooResolving(true);
+                let rawStreams: Stream[] = [];
+
                 try {
-                    const data = await fetchChannelPayload(requestOptions);
+                    rawStreams = await resolveVavooVariantStreams<Stream>(
+                        vavooVariants,
+                        (variantId, variantSignal) => fetchChannelPayload(requestOptions, variantId, variantSignal),
+                        {
+                            server: t('liveTV.server'),
+                            standard: t('liveTV.vavooStandardQuality'),
+                        },
+                        {
+                            onStreamsResolved: (resolvedStreams) => {
+                                if (
+                                    signal?.aborted
+                                    || vavooResolutionOwnerRef.current !== resolutionOwner
+                                ) return;
+                                const validStreams = resolvedStreams.filter((stream) => (
+                                    stream.url && !hasNonStandardPort(stream.url)
+                                ));
+                                if (validStreams.length === 0) return;
+
+                                const currentStreams = streamsRef.current;
+                                const knownStreams = new Set(currentStreams.map((stream) => (
+                                    `${stream._vavooVariantId || ''}|${stream.url}`
+                                )));
+                                const additions = validStreams.filter((stream) => {
+                                    const key = `${stream._vavooVariantId || ''}|${stream.url}`;
+                                    if (knownStreams.has(key)) return false;
+                                    knownStreams.add(key);
+                                    return true;
+                                });
+                                if (additions.length === 0) return;
+
+                                const nextStreams = [...currentStreams, ...additions];
+                                streamsRef.current = nextStreams;
+                                setStreams(nextStreams);
+                            },
+                            signal,
+                            timeoutMs: VAVOO_VARIANT_TIMEOUT_MS,
+                        },
+                    );
+                } finally {
+                    if (vavooResolutionOwnerRef.current === resolutionOwner) {
+                        vavooResolutionOwnerRef.current = null;
+                        vavooResolutionPendingRef.current = false;
+                        if (!signal?.aborted) setIsVavooResolving(false);
+                    }
+                }
+                if (signal?.aborted) return;
+                const validStreams = rawStreams.filter((stream) => (
+                    stream.url && !hasNonStandardPort(stream.url)
+                ));
+
+                if (validStreams.length === 0) {
+                    const emptyStreamsError = new Error(t('liveTV.noStreamsAvailable')) as Error & { isEmptyStreams?: boolean };
+                    emptyStreamsError.isEmptyStreams = true;
+                    throw emptyStreamsError;
+                }
+
+                loaded = true;
+            }
+
+            // Un 404 sur une chaîne veut souvent dire « le flux n'est pas
+            // encore publié » — d'où les tentatives espacées. Sur un match
+            // c'est autre chose : le backend vient d'interroger l'amont et
+            // n'a trouvé aucun serveur. Insister n'apporte rien, on abrège.
+            const maxAttempts = channelId.startsWith('match_') ? 3 : MAX_404_RETRIES;
+
+            for (let attempt = 0; attempt < maxAttempts && !loaded; attempt++) {
+                try {
+                    const data = await fetchChannelPayload(requestOptions, channelId, signal);
                     const rawStreams = await resolveFctvStubs(data.streams || []);
+                    if (signal?.aborted) return;
                     const validStreams = rawStreams.filter((stream: Stream) =>
                         stream.url && !hasNonStandardPort(stream.url)
                     );
@@ -742,19 +809,21 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
                     setStreams(validStreams);
                     setCurrentStreamIndex(0);
-                    if (Number.isInteger(requestOptions.sourceIndex)) {
-                        setSelectedSourceIndex(requestOptions.sourceIndex!);
-                    }
                     loaded = true;
                 } catch (innerErr: any) {
+                    if (signal?.aborted) return;
+
                     const status = innerErr?.status || innerErr?.response?.status;
                     const is404 = status === 404 || String(innerErr?.message || '').includes('(404)');
                     const isEmptyStreams = !!innerErr?.isEmptyStreams;
                     const is458 = status === 458;
+                    // Tout le reste — 401, 403, 5xx, source désactivée — est
+                    // définitif : on remonte l'erreur sans réessayer.
+                    const isRetryable = is404 || isEmptyStreams || is458;
 
-                    if ((is404 || isEmptyStreams || is458) && attempt < MAX_404_RETRIES - 1) {
+                    if (isRetryable && attempt < maxAttempts - 1) {
                         const delayMs = is458 ? RETRY_458_INTERVAL_MS : RETRY_INTERVAL_MS;
-                        console.warn(`[LiveTV] Flux indisponible (${status || 'vide'}), retry ${attempt + 1}/${MAX_404_RETRIES} dans ${delayMs}ms`);
+                        console.warn(`[LiveTV] Flux indisponible (${status || 'vide'}), retry ${attempt + 1}/${maxAttempts} dans ${delayMs}ms`);
                         await wait(delayMs);
                         continue;
                     }
@@ -767,55 +836,37 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                 throw new Error(t('liveTV.cannotFetchStreams'));
             }
         } catch (err) {
+            if (signal?.aborted) return;
             console.error('Error fetching streams:', err);
             setError(err instanceof Error ? err.message : t('liveTV.loadingError'));
         } finally {
-            setIsLoading(false);
+            if (!signal?.aborted) setIsLoading(false);
         }
-    }, [MAX_404_RETRIES, RETRY_458_INTERVAL_MS, RETRY_INTERVAL_MS, fetchChannelPayload, t]);
-
-    const loadLiveTvSources = useCallback(async () => {
-        setIsLoading(true);
-        setError(null);
-
-        try {
-            const data = await fetchChannelPayload({ mode: 'sources' });
-            const sources = Array.isArray(data.sources) ? data.sources : [];
-
-            if (sources.length === 0) {
-                throw new Error(t('liveTV.noStreamsAvailable'));
-            }
-
-            setStreams([]);
-            setCurrentStreamIndex(0);
-            setSourceOptions(sources);
-            setSelectedSourceIndex(null);
-        } catch (err) {
-            console.error('Error fetching LiveTV sources:', err);
-            setError(err instanceof Error ? err.message : t('liveTV.loadingError'));
-        } finally {
-            setIsLoading(false);
-        }
-    }, [fetchChannelPayload, t]);
+    }, [MAX_404_RETRIES, RETRY_458_INTERVAL_MS, RETRY_INTERVAL_MS, channelId, fetchChannelPayload, t, vavooVariants]);
 
     // Fetch streams for the channel (utilise notre backend qui résout les URLs)
     useEffect(() => {
+        const streamLoadController = new AbortController();
+        const cancelStreamLoad = () => {
+            vavooResolutionOwnerRef.current = null;
+            vavooResolutionPendingRef.current = false;
+            waitingForVavooStreamRef.current = null;
+            streamLoadController.abort();
+        };
+        vavooResolutionOwnerRef.current = null;
+        vavooResolutionPendingRef.current = false;
+        waitingForVavooStreamRef.current = null;
+        streamsRef.current = [];
         setStreams([]);
         setCurrentStreamIndex(0);
-        setSourceOptions([]);
-        setSelectedSourceIndex(null);
+        setIsVavooResolving(false);
         setShowSettings(false);
         setIsPlaying(false);
         resetPauseState();
         currentCastUrlRef.current = null;
 
-        if (isLiveTvChannel) {
-            void loadLiveTvSources();
-            return;
-        }
-
-        void loadResolvedStreams();
-        return;
+        void loadResolvedStreams({}, streamLoadController.signal);
+        return cancelStreamLoad;
 
         const fetchStreams = async () => {
             setIsLoading(true);
@@ -900,18 +951,69 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         };
 
         fetchStreams();
-    }, [channelId, isLiveTvChannel, loadLiveTvSources, loadResolvedStreams, resetPauseState]);
+    }, [channelId, loadResolvedStreams, resetPauseState]);
 
     // Reset proxy when changing channel or stream
     useEffect(() => {
         setUseProxy(false);
     }, [channelId, currentStreamIndex]);
 
+    const tryNextOrWaitForVavoo = useCallback((errorMessage: string): boolean => {
+        const action = getVavooFallbackAction(
+            currentStreamIndex,
+            streamsRef.current.length,
+            vavooResolutionPendingRef.current,
+        );
+
+        if (action === 'next') {
+            waitingForVavooStreamRef.current = null;
+            setError(null);
+            setCurrentStreamIndex((previousIndex) => previousIndex + 1);
+            return true;
+        }
+        if (action === 'wait') {
+            waitingForVavooStreamRef.current = { errorMessage };
+            setError(null);
+            setIsLoading(true);
+            return true;
+        }
+        return false;
+    }, [currentStreamIndex]);
+
+    useEffect(() => {
+        const waitingFailure = waitingForVavooStreamRef.current;
+        if (!waitingFailure) return;
+
+        const action = getVavooFallbackAction(
+            currentStreamIndex,
+            streams.length,
+            isVavooResolving,
+        );
+        if (action === 'next') {
+            waitingForVavooStreamRef.current = null;
+            setError(null);
+            setCurrentStreamIndex((previousIndex) => previousIndex + 1);
+        } else if (action === 'error') {
+            waitingForVavooStreamRef.current = null;
+            setError(waitingFailure.errorMessage);
+            setIsLoading(false);
+        }
+    }, [currentStreamIndex, isVavooResolving, streams.length]);
+
+    const playbackStream = streams[currentStreamIndex];
+
+    // Déclaré ici, et pas au plus près du rendu : plusieurs effets plus bas
+    // lisent `isEmbedStream` dans leur tableau de dépendances, évalué pendant
+    // le rendu. Une déclaration tardive plaçait donc l'accès dans la zone
+    // morte temporelle du `const` (ReferenceError au montage du lecteur).
+    const activeStream = streams[currentStreamIndex];
+    const hasActiveStream = !!activeStream;
+    const isEmbedStream = !!activeStream?._isEmbed;
+    const activeEmbedUrl = activeStream?.originalUrl || activeStream?.url || '';
+
     // Initialize Player (HLS or DASH)
     useEffect(() => {
-        if (streams.length === 0) return;
-
-        const currentStream = streams[currentStreamIndex];
+        const currentStream = playbackStream;
         const streamUrl = currentStream?.url;
 
         if (!streamUrl) return;
@@ -967,7 +1069,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
         // Vavoo streams typically contain "sunshine" signature or require headers that need proxy (when no extension)
         const isVavooStream = !forceDirect && (streamUrl.includes('/sunshine/') ||
-            (streams && streams[currentStreamIndex]?.behaviorHints?.notWebReady === true));
+            currentStream.behaviorHints?.notWebReady === true);
 
         // Check if this is a Wiflix stream (has originalUrl from backend, or lansdrud.space/livetvde.net domain)
         const isWiflixStream = !!currentStream.originalUrl || streamUrl.includes('lansdrud.space') || streamUrl.includes('livetvde.net');
@@ -1014,6 +1116,12 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             shouldForceProxy
         });
 
+        // URL proxifiée signée fournie d'office par mainapi avec le flux. Le
+        // navigateur ne sait pas signer et il n'existe pas d'endpoint pour le
+        // faire à sa place (ce serait un oracle de signature) : si le serveur
+        // n'en a pas joint, la lecture reste directe.
+        const signedProxyUrl = typeof currentStream.proxyUrl === 'string' ? currentStream.proxyUrl : '';
+
         // Construct final URL
         let finalUrl = mergeHeadersIntoProxyUrl(streamUrl, buildProxyHeadersForStream(currentStream, isVavooStream));
 
@@ -1021,22 +1129,15 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         if (isWiflixStream && extensionAvailable && currentStream.originalUrl) {
             finalUrl = currentStream.originalUrl;
             console.log("Wiflix: Extension will handle raw stream:", finalUrl);
-        } else if (shouldForceProxy && !extensionHandlesStream) {
-            // Only use remote proxy if extension is NOT handling it
-            const encodedUrl = encodeURIComponent(streamUrl);
-            const headersParam = encodeProxyHeadersParam(
-                buildProxyHeadersForStream(currentStream, isVavooStream)
-            );
-
-            // Configure ProxyLoader so top-level manifest requests stay on the proxy URL
-            ProxyLoader._proxyBaseUrl = PROXIES_EMBED_API_URL;
-            ProxyLoader._originalStreamUrl = streamUrl;
-            ProxyLoader._headersParam = headersParam;
-            ProxyLoader._manifestUrl = '';
+        } else if (shouldForceProxy && !extensionHandlesStream && signedProxyUrl) {
+            // Only use remote proxy if extension is NOT handling it.
+            // L'URL signée est utilisée telle quelle : la reconstruire côté
+            // client produirait une URL non signée, donc refusée par le proxy.
+            ProxyLoader._manifestUrl = signedProxyUrl;
             ProxyLoader._forceLevelReloads = false;
 
-            finalUrl = `${PROXIES_EMBED_API_URL}/proxy?url=${encodedUrl}${headersParam}`;
-            console.log("Using Remote Proxy (proxiesembed):", finalUrl);
+            finalUrl = signedProxyUrl;
+            console.log("Using Remote Proxy (proxiesembed, signé):", finalUrl);
         } else if (extensionHandlesStream) {
             // Extension handles it - use raw URL (ExtensionLoader will fetch via blob)
             console.log("Extension will handle stream (Blob Proxy):", finalUrl);
@@ -1044,9 +1145,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             // URL already proxied by backend/local proxy
             // Keep top-level manifest requests anchored on the original proxied URL.
             // Child playlists must keep the rewritten proxied URL returned by the proxy.
-            ProxyLoader._proxyBaseUrl = '';
-            ProxyLoader._originalStreamUrl = '';
-            ProxyLoader._headersParam = '';
             ProxyLoader._manifestUrl = finalUrl; // Store the full proxy URL as-is, with merged headers if needed
             ProxyLoader._forceLevelReloads = false;
             console.log("Already proxied, manifest requests will stay on:", finalUrl);
@@ -1131,10 +1229,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             player.on(MediaPlayer.events.ERROR, (e: any) => {
                 console.error('DASH Error:', e);
 
-                // Try next server if available
-                if (currentStreamIndex < streams.length - 1) {
-                    setCurrentStreamIndex(prev => prev + 1);
-                } else {
+                if (!tryNextOrWaitForVavoo(t('liveTV.playbackError'))) {
                     setError(t('liveTV.playbackError'));
                     setIsLoading(false);
                 }
@@ -1256,10 +1351,8 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                     console.error(`[HLS] Codec not supported by browser: ${codec}`);
                     hls.destroy();
                     hlsRef.current = null;
-                    // Try next server if available
-                    if (currentStreamIndex < streams.length - 1) {
+                    if (tryNextOrWaitForVavoo(t('liveTV.codecNotSupported'))) {
                         console.log('[HLS] Trying next server...');
-                        setCurrentStreamIndex(prev => prev + 1);
                     } else {
                         setError(t('liveTV.codecNotSupported'));
                         setIsLoading(false);
@@ -1297,6 +1390,21 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                     return;
                 }
 
+                // Refus d'accès : réessayer ne sert à rien, ni maintenant ni
+                // dans dix secondes. On passe au serveur suivant, ou on rend
+                // la main. Sans ce cas, un 403 non fatal ne correspondait à
+                // aucune branche et HLS.js repartait en boucle silencieuse.
+                if (status === 401 || status === 403) {
+                    console.warn(`[LiveTV] Accès refusé (${status}), abandon de ce serveur`);
+                    hls.destroy();
+                    hlsRef.current = null;
+                    if (!tryNextOrWaitForVavoo(t('liveTV.playbackError'))) {
+                        setError(t('liveTV.playbackError'));
+                        setIsLoading(false);
+                    }
+                    return;
+                }
+
                 // 458 = proxy rate-limit/transitoire — retry agressif au chargement initial
                 if (status === 458) {
                     if (hls458RetryRef.current < MAX_458_RETRIES) {
@@ -1323,7 +1431,18 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                         }, RETRY_458_INTERVAL_MS);
                         return;
                     }
-                    hls458RetryRef.current = 0;
+                    // Budget épuisé. Le compteur n'est PAS remis à zéro : il
+                    // l'était, et comme un 458 non fatal ne déclenchait aucune
+                    // autre branche, l'erreur suivante repartait d'un budget
+                    // neuf — la boucle ne s'arrêtait jamais.
+                    console.warn(`[LiveTV] 458 persistant après ${MAX_458_RETRIES} tentatives, abandon de ce serveur`);
+                    hls.destroy();
+                    hlsRef.current = null;
+                    if (!tryNextOrWaitForVavoo(t('liveTV.playbackError'))) {
+                        setError(t('liveTV.playbackError'));
+                        setIsLoading(false);
+                    }
+                    return;
                 }
 
                 // 404 ou réponse vide — retriable
@@ -1344,7 +1463,15 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                         }, retryDelay);
                         return;
                     }
-                    hls404RetryRef.current = 0;
+                    // Même raison qu'au-dessus : ne pas réarmer le compteur.
+                    console.warn(`[LiveTV] 404 persistant après ${MAX_404_RETRIES} tentatives, abandon de ce serveur`);
+                    hls.destroy();
+                    hlsRef.current = null;
+                    if (!tryNextOrWaitForVavoo(t('liveTV.playbackError'))) {
+                        setError(t('liveTV.playbackError'));
+                        setIsLoading(false);
+                    }
+                    return;
                 }
 
                 // levelParsingError (media sequence mismatch) — récupérable sur les live streams
@@ -1411,8 +1538,12 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
                 // Détecter les erreurs de codec/buffer (navigateur non supporté ou accélération GPU désactivée)
                 if (data.details === 'bufferAddCodecError' || (data.details === 'bufferAppendError' && data.fatal)) {
-                    setError(t('liveTV.codecNotSupportedFull'));
-                    setIsLoading(false);
+                    hls.destroy();
+                    hlsRef.current = null;
+                    if (!tryNextOrWaitForVavoo(t('liveTV.codecNotSupportedFull'))) {
+                        setError(t('liveTV.codecNotSupportedFull'));
+                        setIsLoading(false);
+                    }
                     return;
                 }
 
@@ -1423,10 +1554,9 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                 }
 
                 if (data.fatal) {
-                    // Try next server if available (only if proxy didn't fix it or was already active)
-                    if (currentStreamIndex < streams.length - 1) {
-                        setCurrentStreamIndex(prev => prev + 1);
-                    } else {
+                    hls.destroy();
+                    hlsRef.current = null;
+                    if (!tryNextOrWaitForVavoo(t('liveTV.playbackError'))) {
                         setError(t('liveTV.playbackError'));
                         setIsLoading(false);
                     }
@@ -1467,7 +1597,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
             resetVideoElement();
         };
-    }, [channelId, clearHlsRecoveryTimeout, currentStreamIndex, playerReinitKey, resetPauseState, resetVideoElement, scheduleHlsLiveResync, scheduleHlsReinit, seekToLiveEdge, streams, t, useProxy]);
+    }, [channelId, clearHlsRecoveryTimeout, currentStreamIndex, playbackStream, playerReinitKey, resetPauseState, resetVideoElement, scheduleHlsLiveResync, scheduleHlsReinit, seekToLiveEdge, t, tryNextOrWaitForVavoo, useProxy]);
 
     // Video event handlers
     useEffect(() => {
@@ -1650,7 +1780,12 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         hideControlsTimeout();
     }, [hideControlsTimeout]);
 
-    // Native listener binding for pointer & mouse movement in LiveTVPlayer
+    /**
+     * Écouteurs natifs de mouvement de pointeur, en doublon des gestionnaires
+     * React : sous Firefox/Wayland, les `mousemove` synthétisés ne remontent
+     * pas au-dessus des calques du lecteur et l'interface ne se rappelait
+     * qu'au clic.
+     */
     useEffect(() => {
         if (isEmbedStream) return;
         const container = containerRef.current;
@@ -1761,33 +1896,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         setIsLoading(true);
         resetPauseState();
     };
-
-    const hasVavooVariants = !!onSelectVavooVariant && (vavooVariants?.length ?? 0) > 1;
-
-    const formatVavooVariantLabel = (variant: VavooChannelVariant): string => {
-        const parts: string[] = [];
-        if (variant.quality && variant.quality !== 'Standard') parts.push(variant.quality);
-        if (variant.server) parts.push(`${t('liveTV.server')} ${variant.server.toUpperCase()}`);
-        return parts.join(' · ') || t('liveTV.vavooStandardQuality');
-    };
-
-    const handleVavooVariantSelect = (variantId: string) => {
-        setShowSettings(false);
-        if (variantId === channelId) return;
-        // The parent swaps channelId; the fetch effect resets state and reloads.
-        onSelectVavooVariant?.(variantId);
-    };
-
-    const handleLiveTvSourceSelect = useCallback((index: number) => {
-        setShowSettings(false);
-        setSelectedSourceIndex(index);
-        setStreams([]);
-        setCurrentStreamIndex(0);
-        setIsPlaying(false);
-        resetPauseState();
-        currentCastUrlRef.current = null;
-        void loadResolvedStreams({ sourceIndex: index });
-    }, [loadResolvedStreams, resetPauseState]);
 
     // Cast handlers
     const handleCast = async () => {
@@ -1919,10 +2027,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     }, [volume, onClose, showSettings, handleMouseMove]);
 
     const VolumeIcon = volume === 0 ? VolumeX : volume < 0.5 ? Volume1 : Volume2;
-    const activeStream = streams[currentStreamIndex];
-    const hasActiveStream = !!activeStream;
-    const isEmbedStream = !!activeStream?._isEmbed;
-    const activeEmbedUrl = activeStream?.originalUrl || activeStream?.url || '';
     const shouldShowPausedOverlay =
         hasActiveStream &&
         isUserPaused &&
@@ -1939,11 +2043,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         !isUserPaused &&
         !isLoading &&
         !error;
-    const showLiveTvSourcePicker = isLiveTvChannel
-        && sourceOptions.length > 0
-        && selectedSourceIndex === null
-        && !isLoading
-        && !error;
 
     return (
         <motion.div
@@ -2031,7 +2130,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                                     <ExternalLink size={18} />
                                 </button>
 
-                                {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0)) && (
+                                {streams.length > 1 && (
                                     <button
                                         onClick={() => setShowSettings(true)}
                                         className="rounded-lg bg-black/50 p-2 text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/70"
@@ -2061,60 +2160,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                     onClick={handleVideoClick}
                 />
             )}
-
-            <AnimatePresence>
-                {showLiveTvSourcePicker && (
-                    <motion.div
-                        key="livetv-source-picker"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        transition={{ duration: 0.22, ease: 'easeOut' }}
-                        className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 p-4 backdrop-blur-[2px]"
-                    >
-                        <motion.div
-                            initial={{ opacity: 0, scale: 0.94, y: 24 }}
-                            animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.96, y: 16 }}
-                            transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
-                            className="w-full max-w-2xl rounded-3xl border border-white/10 bg-neutral-950/95 p-5 shadow-2xl"
-                        >
-                        <div className="mb-4">
-                            <p className="text-xs uppercase tracking-[0.22em] text-red-400">{t('liveTV.title')}</p>
-                            <h3 className="mt-2 text-xl font-semibold text-white">{t('liveTV.chooseSourceTitle')}</h3>
-                            <p className="mt-1 text-sm text-gray-400">{t('liveTV.sourceSelectionHint')}</p>
-                        </div>
-
-                        <div className="max-h-[60vh] space-y-2 overflow-y-auto pr-1" data-lenis-prevent>
-                            {sourceOptions.map((source) => {
-                                const meta = [source.hoster || source.sourceType, source.language, source.bitrate].filter(Boolean).join(' • ');
-
-                                return (
-                                    <motion.button
-                                        key={source.index}
-                                        onClick={() => handleLiveTvSourceSelect(source.index)}
-                                        whileHover={{ scale: 1.01, y: -1 }}
-                                        whileTap={{ scale: 0.99 }}
-                                        transition={{ duration: 0.16, ease: 'easeOut' }}
-                                        className="w-full rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 text-left transition-colors hover:border-red-500/40 hover:bg-red-500/10"
-                                    >
-                                        <div className="flex items-center justify-between gap-3">
-                                            <span className="text-sm font-medium text-white">
-                                                {formatSourceOptionLabel(source)}
-                                            </span>
-                                            <span className="text-xs text-gray-500">{t('liveTV.sourceNumber', { index: source.index + 1 })}</span>
-                                        </div>
-                                        {meta && (
-                                            <p className="mt-1 text-xs text-gray-400">{meta}</p>
-                                        )}
-                                    </motion.button>
-                                );
-                            })}
-                        </div>
-                        </motion.div>
-                    </motion.div>
-                )}
-            </AnimatePresence>
 
             {/* Center play button (large tap target for mobile) */}
             <AnimatePresence>
@@ -2223,27 +2268,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                             </button>
                         )}
                     </div>
-
-                    {isLiveTvChannel && sourceOptions.length > 0 && (
-                        <div className="flex flex-col items-center gap-2 mt-4">
-                            <span className="text-gray-400 text-sm">{t('liveTV.changeLiveTvSource')}</span>
-                            <div className="flex flex-wrap gap-2 justify-center max-w-2xl">
-                                {sourceOptions.map((source) => (
-                                    <button
-                                        key={source.index}
-                                        onClick={() => handleLiveTvSourceSelect(source.index)}
-                                        className={`px-3 py-1 text-sm rounded border transition-colors ${
-                                            source.index === selectedSourceIndex
-                                                ? 'bg-red-600 border-red-600 text-white cursor-default'
-                                                : 'border-gray-600 text-gray-300 hover:bg-gray-700 hover:border-gray-500'
-                                        }`}
-                                    >
-                                        {formatSourceOptionLabel(source)}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-                    )}
 
                     {/* Source Selector in Error Screen */}
                     {streams.length > 1 && (
@@ -2378,7 +2402,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                         {/* Right controls */}
                         <div className="flex items-center gap-2">
                             {/* Settings gear (server selector) — only if >1 server */}
-                            {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0) || hasVavooVariants) && (
+                            {streams.length > 1 && (
                                 <motion.div
                                     whileHover={{ scale: 1.1 }}
                                     whileTap={{ scale: 0.9 }}
@@ -2447,7 +2471,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
             {/* Settings panel — slide-in right (server selector) */}
             <AnimatePresence>
-                {showSettings && (streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0) || hasVavooVariants) && (
+                {showSettings && streams.length > 1 && (
                     <motion.div
                         key="settings-panel"
                         initial={{ opacity: 0, width: 0 }}
@@ -2460,7 +2484,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                         {/* Header */}
                         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
                             <h3 className="text-white text-sm font-medium">
-                                {isLiveTvChannel && sourceOptions.length > 0 ? t('liveTV.sourcesTitle') : t('liveTV.server')}
+                                {t('liveTV.server')}
                             </h3>
                             <button
                                 onClick={() => setShowSettings(false)}
@@ -2472,80 +2496,8 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
                         {/* Server list */}
                         <div className="flex-1 overflow-y-auto p-2 space-y-4" data-lenis-prevent>
-                            {hasVavooVariants && (
-                                <div>
-                                    <p className="px-2 pb-2 text-[11px] font-medium uppercase tracking-[0.2em] text-gray-500">{t('liveTV.vavooServers')}</p>
-                                    <div className="space-y-1">
-                                        {vavooVariants!.map((variant) => {
-                                            const isActive = variant.id === channelId;
-
-                                            return (
-                                                <button
-                                                    key={variant.id}
-                                                    onClick={() => handleVavooVariantSelect(variant.id)}
-                                                    className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-colors cursor-pointer ${
-                                                        isActive ? 'bg-red-600/20 text-red-400' : 'text-gray-300 hover:bg-white/5'
-                                                    }`}
-                                                >
-                                                    <div className="flex items-center gap-2">
-                                                        {isActive && (
-                                                            <span className="w-2 h-2 bg-red-500 rounded-full flex-shrink-0" />
-                                                        )}
-                                                        <span className={isActive ? '' : 'ml-4'}>
-                                                            {formatVavooVariantLabel(variant)}
-                                                        </span>
-                                                        {isActive && <span className="ml-auto text-red-400">✓</span>}
-                                                    </div>
-                                                    <p className={`mt-1 text-xs ${isActive ? 'text-red-300/80' : 'text-gray-500'} ${isActive ? '' : 'ml-4'}`}>
-                                                        {variant.originalName}
-                                                    </p>
-                                                </button>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-                            )}
-
-                            {isLiveTvChannel && sourceOptions.length > 0 && (
-                                <div>
-                                    <p className="px-2 pb-2 text-[11px] font-medium uppercase tracking-[0.2em] text-gray-500">{t('watch.sources')}</p>
-                                    <div className="space-y-1">
-                                        {sourceOptions.map((source) => {
-                                            const meta = [source.hoster || source.sourceType, source.language, source.bitrate].filter(Boolean).join(' • ');
-
-                                            return (
-                                                <button
-                                                    key={source.index}
-                                                    onClick={() => handleLiveTvSourceSelect(source.index)}
-                                                    className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-colors cursor-pointer ${
-                                                        source.index === selectedSourceIndex ? 'bg-red-600/20 text-red-400' : 'text-gray-300 hover:bg-white/5'
-                                                    }`}
-                                                >
-                                                    <div className="flex items-center gap-2">
-                                                        {source.index === selectedSourceIndex && (
-                                                            <span className="w-2 h-2 bg-red-500 rounded-full flex-shrink-0" />
-                                                        )}
-                                                        <span className={source.index === selectedSourceIndex ? '' : 'ml-4'}>
-                                                            {formatSourceOptionLabel(source)}
-                                                        </span>
-                                                    </div>
-                                                    {meta && (
-                                                        <p className={`mt-1 text-xs ${source.index === selectedSourceIndex ? 'text-red-300/80' : 'text-gray-500'}`}>
-                                                            {meta}
-                                                        </p>
-                                                    )}
-                                                </button>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-                            )}
-
                             {streams.length > 1 && (
                                 <div>
-                                    {((isLiveTvChannel && sourceOptions.length > 0) || hasVavooVariants) && (
-                                        <p className="px-2 pb-2 text-[11px] font-medium uppercase tracking-[0.2em] text-gray-500">Flux</p>
-                                    )}
                                     <div className="space-y-1">
                             {streams.map((stream, index) => (
                                 <button

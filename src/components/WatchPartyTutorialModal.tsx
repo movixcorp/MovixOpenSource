@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { X, HelpCircle, Users, ChevronLeft, ChevronRight } from 'lucide-react';
 import useEmblaCarousel from 'embla-carousel-react';
 import { useTranslation } from 'react-i18next';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 interface WatchPartyTutorialModalProps {
     isOpen: boolean;
@@ -237,7 +238,7 @@ const WatchPartyTutorialModal: React.FC<WatchPartyTutorialModalProps> = ({ isOpe
             {modalContent}
             {zoomOverlay}
         </>,
-        document.body
+        getOverlayPortalRoot()
     );
 };
 

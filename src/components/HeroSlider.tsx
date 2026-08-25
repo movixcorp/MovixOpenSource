@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import useEmblaCarousel from 'embla-carousel-react';
+import type { EmblaOptionsType } from 'embla-carousel';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Play, Info, Star, Calendar, Pause } from 'lucide-react';
 import axios from 'axios';
@@ -7,9 +8,28 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import { encodeId } from '../utils/idEncoder';
 import ShinyText from './ui/shiny-text';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 const AUTO_SLIDE_MS = 6000;
+
+// Sur mobile, taper « Regarder » ratait une fois sur deux : Embla démarre son
+// drag dès le premier `touchmove` et appelle `preventDefault()`, ce qui pousse
+// Chrome/Safari à supprimer le `click` synthétisé. Un doigt qui glisse de 2-3px
+// pendant le tap ne naviguait donc jamais. `watchDrag` sort les éléments
+// interactifs du geste de drag : un tap dessus reste un vrai clic (on perd
+// juste la possibilité de démarrer un swipe pile sur un bouton).
+const isInteractiveTarget = (target: EventTarget | null): boolean =>
+  target instanceof Element && !!target.closest('a, button, [role="button"]');
+
+// Objet figé au niveau module : `useEmblaCarousel` compare les options (les
+// fonctions via leur source) et re-init si elles changent — un littéral inline
+// recréé à chaque render déclencherait des reInit inutiles.
+const HERO_EMBLA_OPTIONS: EmblaOptionsType = {
+  loop: true,
+  duration: 40,
+  watchDrag: (_emblaApi, evt) => !isInteractiveTarget(evt.target),
+};
 
 // Detect weak hardware (TVs, low-end Android, etc.) and start the slider in
 // pause + skip the GPU-heavy animations. Without this, the original was
@@ -56,7 +76,7 @@ interface HeroSliderProps {
 // entirely → 0 RAM, 0 CPU, no logo fetch, no images downloaded.
 const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
   const { t } = useTranslation();
-  const [emblaRef, emblaApi] = useEmblaCarousel({ loop: true, duration: 40 });
+  const [emblaRef, emblaApi] = useEmblaCarousel(HERO_EMBLA_OPTIONS);
   const autoSlideInterval = useRef<NodeJS.Timeout | null>(null);
   const [logoUrls, setLogoUrls] = useState<{ [key: number]: string | null }>({});
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -65,6 +85,10 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
   const [isVisible, setIsVisible] = useState(true);
   const logoCache = useRef<{ [key: number]: string | null }>({});
   const progressStartRef = useRef<number>(performance.now());
+  // Incrémenté à chaque redémarrage du cycle (changement de slide OU
+  // interaction utilisateur). Sert de `key` à la barre de progression pour que
+  // l'animation CSS et le timer JS repartent toujours ensemble.
+  const [progressKey, setProgressKey] = useState(0);
 
   // Fetch logo URLs for all items with sessionStorage caching
   useEffect(() => {
@@ -132,14 +156,18 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
   const pausedAtRef = useRef<number | null>(null);
   const isPausedRef = useRef(isPaused);
   useEffect(() => { isPausedRef.current = isPaused; }, [isPaused]);
+  const restartCycle = useCallback(() => {
+    progressStartRef.current = performance.now();
+    pausedAtRef.current = isPausedRef.current ? performance.now() : null;
+    setProgressKey((k) => k + 1);
+  }, []);
 
   // Track selected slide for UI state + reset progress on slide change
   // Only depends on emblaApi so the handler is NOT re-registered on pause toggle
   useEffect(() => {
     if (!emblaApi) return;
     const onSelect = () => {
-      progressStartRef.current = performance.now();
-      pausedAtRef.current = isPausedRef.current ? performance.now() : null;
+      restartCycle();
       setSelectedIndex(emblaApi.selectedScrollSnap());
     };
     onSelect();
@@ -147,7 +175,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
     return () => {
       emblaApi.off('select', onSelect);
     };
-  }, [emblaApi]);
+  }, [emblaApi, restartCycle]);
 
   // Pause when the hero scrolls off-screen — saves the auto-slide timer +
   // progress animation when the user is browsing further down the page.
@@ -204,12 +232,27 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
     emblaApi.on('pointerDown', pauseOnPointer);
     emblaApi.on('pointerUp', scheduleNext);
 
+    // Embla n'émet plus `pointerDown` quand le doigt se pose sur un bouton
+    // (cf. `watchDrag`) : sans ça, la slide pouvait tourner pile pendant le tap
+    // et le CTA disparaissait sous le doigt. On écoute donc le DOM directement
+    // et on redonne un cycle complet après chaque interaction.
+    const root = emblaApi.rootNode();
+    const onPointerDownDom = () => {
+      if (autoSlideInterval.current) clearTimeout(autoSlideInterval.current);
+    };
+    root?.addEventListener('pointerdown', onPointerDownDom, { passive: true });
+    root?.addEventListener('pointerup', restartCycle, { passive: true });
+    root?.addEventListener('pointercancel', restartCycle, { passive: true });
+
     return () => {
       if (autoSlideInterval.current) clearTimeout(autoSlideInterval.current);
       emblaApi.off('pointerDown', pauseOnPointer);
       emblaApi.off('pointerUp', scheduleNext);
+      root?.removeEventListener('pointerdown', onPointerDownDom);
+      root?.removeEventListener('pointerup', restartCycle);
+      root?.removeEventListener('pointercancel', restartCycle);
     };
-  }, [emblaApi, isPaused, isVisible, selectedIndex]);
+  }, [emblaApi, isPaused, isVisible, progressKey, restartCycle]);
 
   // Horizontal wheel support
   useEffect(() => {
@@ -239,10 +282,10 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
 
   const scrollTo = useCallback((idx: number) => {
     if (emblaApi) {
-      progressStartRef.current = performance.now();
+      restartCycle();
       emblaApi.scrollTo(idx);
     }
-  }, [emblaApi]);
+  }, [emblaApi, restartCycle]);
 
   const getYear = (item: Media) => {
     const date = item.release_date || item.first_air_date;
@@ -385,7 +428,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
                               <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                                 <Link
                                   to={`/${item.media_type}/${encodeId(item.id)}`}
-                                  className="inline-flex items-center gap-2 bg-red-600 hover:bg-red-500 text-white px-4 sm:px-6 md:px-7 py-2.5 sm:py-3 rounded-xl sm:rounded-2xl text-sm sm:text-base font-semibold transition-colors shadow-lg shadow-red-600/30"
+                                  className="inline-flex items-center justify-center gap-2 bg-red-600 hover:bg-red-500 text-white px-5 sm:px-6 md:px-7 py-3 sm:py-3 min-h-[48px] rounded-xl sm:rounded-2xl text-sm sm:text-base font-semibold transition-colors shadow-lg shadow-red-600/30 touch-manipulation"
                                 >
                                   <Play className="w-4 h-4 sm:w-5 sm:h-5 fill-current" />
                                   {t('home.hero.play')}
@@ -394,7 +437,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
                               <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                                 <Link
                                   to={`/${item.media_type}/${encodeId(item.id)}`}
-                                  className="inline-flex items-center gap-2 bg-white/15 hover:bg-white/25 text-white px-4 sm:px-6 md:px-7 py-2.5 sm:py-3 rounded-xl sm:rounded-2xl text-sm sm:text-base font-medium border border-white/20 transition-colors"
+                                  className="inline-flex items-center justify-center gap-2 bg-white/15 hover:bg-white/25 text-white px-5 sm:px-6 md:px-7 py-3 sm:py-3 min-h-[48px] rounded-xl sm:rounded-2xl text-sm sm:text-base font-medium border border-white/20 transition-colors touch-manipulation"
                                 >
                                   <Info className="w-4 h-4 sm:w-5 sm:h-5" />
                                   {t('home.hero.moreInfo')}
@@ -415,19 +458,25 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
         {/* Bottom controls: dots + progress bar + pause */}
         <div className="absolute bottom-3 sm:bottom-4 md:bottom-6 left-0 right-0 z-30 flex items-center justify-center gap-4 px-3 sm:px-6 pointer-events-none">
           <div className="flex items-center gap-2 sm:gap-3 bg-black/60 border border-white/10 rounded-full px-3 sm:px-4 py-1.5 sm:py-2 pointer-events-auto">
-            {/* Dots */}
+            {/* Dots — le point ne mesure que 6px : le bouton l'entoure d'une zone
+                tactile de 14x30px via un padding réabsorbé par une marge
+                négative — le rendu visuel de la barre reste identique. */}
             <div className="flex items-center gap-1.5">
               {items.map((_, idx) => (
                 <button
                   key={idx}
                   onClick={() => scrollTo(idx)}
                   aria-label={`Slide ${idx + 1}`}
-                  className={`transition-all rounded-full ${
-                    idx === selectedIndex
-                      ? 'w-8 h-1.5 bg-white'
-                      : 'w-1.5 h-1.5 bg-white/40 hover:bg-white/60'
-                  }`}
-                />
+                  className="group flex items-center justify-center px-1 -mx-1 py-3 -my-3 touch-manipulation"
+                >
+                  <span
+                    className={`block transition-all rounded-full ${
+                      idx === selectedIndex
+                        ? 'w-8 h-1.5 bg-white'
+                        : 'w-1.5 h-1.5 bg-white/40 group-hover:bg-white/60'
+                    }`}
+                  />
+                </button>
               ))}
             </div>
 
@@ -437,7 +486,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
             {/* Progress bar */}
             <div className="w-12 sm:w-20 h-1 bg-white/15 rounded-full overflow-hidden">
               <div
-                key={selectedIndex}
+                key={progressKey}
                 className={`h-full w-full bg-red-500 rounded-full hero-progress-fill ${frozen ? 'is-paused' : ''}`}
                 style={{ ['--hero-duration' as string]: `${AUTO_SLIDE_MS}ms` } as React.CSSProperties}
               />
@@ -447,7 +496,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
             <button
               onClick={() => setIsPaused((p) => !p)}
               aria-label={isPaused ? 'Play' : 'Pause'}
-              className="text-white/70 hover:text-white transition-colors"
+              className="flex items-center justify-center p-2 -m-2 text-white/70 hover:text-white transition-colors touch-manipulation"
             >
               {isPaused ? <Play className="w-3.5 h-3.5 fill-current" /> : <Pause className="w-3.5 h-3.5 fill-current" />}
             </button>
@@ -462,6 +511,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
 // entirely when the user disabled the hero in Settings. This is what saves
 // the freeze: no inner = no Embla, no logo fetch, no images, no timers.
 const HeroSlider: React.FC<HeroSliderProps> = ({ items }) => {
+  const { items: allowedItems } = useAgeRestrictedContent(items);
   const [isHidden, setIsHidden] = useState(() => {
     if (typeof localStorage === 'undefined') return false;
     return localStorage.getItem('settings_hide_hero') === 'true';
@@ -477,8 +527,8 @@ const HeroSlider: React.FC<HeroSliderProps> = ({ items }) => {
     };
   }, []);
 
-  if (isHidden) return null;
-  return <HeroSliderInner items={items} />;
+  if (isHidden || allowedItems.length === 0) return null;
+  return <HeroSliderInner items={allowedItems} />;
 };
 
 export default React.memo(HeroSlider);

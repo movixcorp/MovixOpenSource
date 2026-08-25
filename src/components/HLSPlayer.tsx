@@ -1,9 +1,43 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import { getFrembedBase } from '../utils/frembedConfig';
-import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, memo, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, memo, useMemo, useSyncExternalStore } from 'react';
 import type HlsType from 'hls.js';
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, Rewind, FastForward, Volume1, ChevronRight, PictureInPicture, Users, Loader2, Repeat, Cast, Airplay, Info, X, Copy, Check, Lock, Gauge } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, Rewind, FastForward, Volume1, ChevronRight, PictureInPicture, Users, Loader2, Repeat, Cast, Airplay, Info, X, Copy, Check, Lock, Gauge, Scissors } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import SkipSegmentPrompt from './SkipSegmentPrompt';
+import SkipTransitionOverlay, { SKIP_FADE_IN_MS, SKIP_FADE_OUT_MS } from './SkipTransitionOverlay';
+import SegmentStudio, { type KnownRange } from './SegmentStudio';
+import SegmentVotePrompt from './SegmentVotePrompt';
+import UpNextPanel from './UpNextPanel';
+import type { UpNextSpoiler } from './UpNextPanel';
+import {
+  NEXT_CONTENT_PREFS_CHANGE_EVENT,
+  getNextContentPrefs,
+  hasStoredNextContentPrefs,
+  isThresholdReached,
+  setNextContentPrefs,
+  type NextContentPrefs,
+} from '../utils/nextContentPrefs';
+import { useTmdbImages } from '../hooks/useTmdbImages';
+import {
+  deleteCommunitySegment,
+  extractCommunityErrorCode,
+  reportCommunitySegment,
+  submitCommunitySegment,
+  voteCommunitySegment,
+  type CommunitySubmission,
+  type SegmentReportReason,
+} from '../services/mediaSegmentsService';
+import { useLightMode } from '../context/LightModeContext';
+import { useMediaSegments } from '../hooks/useMediaSegments';
+import type { MediaSegment } from '../services/mediaSegmentsService';
+import * as skipSegmentPrefs from '../utils/skipSegmentPrefs';
+import type {
+  ProviderId,
+  SegmentKind,
+  SegmentTypeSettings,
+  SkipSegmentSettings,
+} from '../utils/skipSegmentPrefs';
 import axios from 'axios';
 import type pakoType from 'pako';
 
@@ -54,8 +88,7 @@ import { prepareCastSourceWithFallback } from '../utils/castSourcePreparation';
 import { useAntiSpoilerSettings } from '../hooks/useAntiSpoilerSettings';
 import { useTranslation } from 'react-i18next';
 import { encodeId } from '../utils/idEncoder';
-import { RIVESTREAM_PROXIES } from '../config/rivestreamProxy';
-import { PROXY_BASE_URL, PROXIES_EMBED_API } from '../config/runtime';
+import { PROXIES_EMBED_API } from '../config/runtime';
 import { getTmdbLanguage } from '../i18n';
 import { getCoflixPreferredUrl } from '../utils/coflix';
 import { safePlay } from '../utils/safePlay';
@@ -113,15 +146,46 @@ import type { SeekStreamingHlsSource } from '../utils/seekStreamingCandidates';
 import { fetchKisskhSubtitle } from '../services/kisskhService';
 import { createVttBlobUrl, kisskhTrackToVtt } from '../utils/kisskhSubtitles';
 import { applySelectedTextTrackMode } from '../utils/subtitleTrackSelection';
+import {
+  HLS_PLAYER_ROOT_ATTRIBUTE,
+  KEEP_FULLSCREEN_PREF_KEY,
+  PLAYER_FULLSCREEN_FILL_CLASS,
+  RESUME_PLAYBACK_PREF_KEY,
+  enterPlayerFullscreen,
+  exitPlayerFullscreen,
+  getFullscreenElement,
+  isEpisodeAutoplaySuppressed,
+  isHostFullscreenActive,
+  isKeepFullscreenEnabled,
+  isResumePlaybackEnabled,
+  readEpisodeHandoff,
+  restoreEpisodeHandoff,
+  setKeepFullscreenEnabled,
+  setResumePlaybackEnabled,
+} from '../utils/playerFullscreenPersistence';
+import { getPointerKind, getServerPointerKind, subscribePointerKind } from '../utils/pointerKind';
 import { formatSubtitleTextToSafeHtml } from '../utils/subtitleFormatting';
+import { useSubtitlePreferences } from '../hooks/useSubtitlePreferences';
+import {
+  calculateSubtitlePlacement,
+  getSubtitleEdgeStyles,
+  getSubtitleSafeWidthCss,
+  normalizeSubtitlePreferences,
+  SUBTITLE_FONT_FAMILIES,
+  SUBTITLE_STYLE_CHANGED_EVENT,
+  SUBTITLE_STYLE_PREVIEW_EVENT,
+} from '../utils/subtitlePreferences';
 import {
   cuesToWebVtt,
   isolateSubtitleTrack,
   prepareCastSubtitleTracks,
   resolveCastSubtitleSource,
   resolveSelectedSubtitleTrack,
+  subtitleTextToWebVtt,
   type CastSubtitleCandidate,
 } from '../utils/subtitleDelivery';
+import { useExternalSubtitles } from '../hooks/useExternalSubtitles.ts';
+import type { SubtitleTrack } from '../services/subtitles/index.ts';
 import type {
   KisskhFallbackTransport,
   KisskhSource,
@@ -185,7 +249,6 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   vox_main: 'vox',
   kisskh_main: 'kisskh',
   bravo_main: 'bravo',
-  rivestream_main: 'rivestream_hls',
   vostfr_main: 'vostfr',
   frembed_main: 'frembed',
   mp4: 'mp4',
@@ -297,33 +360,36 @@ function decideHlsVideoFallback({
 // Add TMDB API key
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 
-// Constante pour contrôler la vérification VIP pour Rivestream
-const ENABLE_RIVESTREAM_VIP_CHECK = false;
-
-// Helper function to check if Rivestream is available (VIP check if enabled)
-const isRivestreamAvailable = (): boolean => {
-  if (!ENABLE_RIVESTREAM_VIP_CHECK) {
-    return true; // Si la vérification VIP est désactivée, Rivestream est toujours disponible
-  }
-  return isUserVip();
-};
-
-// Helper function to extract original URL from proxy URL
-const getOriginalUrl = (url: string): string => {
-  const proxyPrefix = `${PROXY_BASE_URL}/proxy/`;
-  if (PROXY_BASE_URL && url.includes(proxyPrefix)) {
-    return url.replace(proxyPrefix, '');
-  }
-  return url;
-};
-
 // Add this utility at the top of the component (after imports, before HLSPlayer)
 const clampVolume = (v: number) => Math.max(0, Math.min(1, v));
 
+// Uqload change de TLD au gré des saisies (.vc, .cx, .to…) alors que
+// l'extracteur ne connaît que `uqload.is` : on normalise donc l'hôte de la
+// PAGE embed avant de la lui transmettre.
+//
+// La réécriture doit s'arrêter là. Ce que l'extracteur renvoie est une URL de
+// proxy signée (`?url=…&exp=…&sig=…`) dont la cible est un CDN
+// `strmN.uqload.<tld>`. L'ancien remplacement global attrapait aussi ce
+// `uqload.<tld>`-là et changeait l'hôte couvert par la signature : proxiesembed
+// refusait alors l'URL en `bad_signature`. On ne touche donc ni aux URLs
+// portant un paramètre `url=` (donc signées) ni aux sous-domaines CDN.
+const UQLOAD_EMBED_HOSTNAME = /^(?:www\.)?uqload\.[a-z0-9-]+$/i;
+
 const normalizeUqloadEmbedUrl = (url: string): string => {
-  return url
-    .replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is')
-    .replace(/uqload%2e[a-z0-9-]+/gi, 'uqload%2eis');
+  if (!url) return url;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url, window.location.origin);
+  } catch {
+    return url;
+  }
+
+  if (parsed.searchParams.has('url')) return url;
+  if (!UQLOAD_EMBED_HOSTNAME.test(parsed.hostname)) return url;
+
+  parsed.hostname = 'uqload.is';
+  return parsed.toString();
 };
 
 // On DNS-level ISP blocks, cascading through every remaining HLS source is
@@ -464,7 +530,6 @@ const isMP4Source = (url: string): boolean => {
 
   // Check for specific proxy patterns
   if ((
-    (PROXY_BASE_URL && lowerUrl.includes(`${PROXY_BASE_URL.toLowerCase()}/proxy/`)) ||
     (PROXIES_EMBED_API && lowerUrl.includes(`${PROXIES_EMBED_API.toLowerCase()}/proxy/`)) ||
     lowerUrl.includes('localhost') ||
     lowerUrl.includes('127.0.0.1')
@@ -485,6 +550,58 @@ const isMP4Source = (url: string): boolean => {
   return false;
 };
 
+/**
+ * Vrai quand la forme de l'URL ne tranche pas entre HLS et MP4.
+ *
+ * Veev sert son MP4 sous une URL opaque — `/px/<jeton>?osr=…` — sans extension
+ * de fichier ni `.m3u8` à reconnaître. `isMP4Source` répond alors « non » par
+ * défaut, hls.js reçoit les 197 Mo de vidéo en guise de manifeste et échoue en
+ * `manifestLoadError`. Plutôt que d'inscrire un domaine de plus dans la liste,
+ * ces URLs-là sont interrogées : leur `Content-Type` tranche.
+ */
+const isAmbiguousMediaSource = (url: string): boolean => {
+  const lowerUrl = normalizeUqloadEmbedUrl(url).toLowerCase();
+  if (!lowerUrl.startsWith('http')) return false;
+  if (isMP4Source(url)) return false;
+  // Une extension explicite suffit : inutile de payer un aller-retour.
+  return !/\.(?:m3u8|mpd|ts|m4s|mp4|m4v|webm|mkv)(?:[?#]|$)/.test(lowerUrl);
+};
+
+/**
+ * Type réel d'une source, lu sur la réponse plutôt que deviné sur l'URL.
+ *
+ * Une requête `Range: bytes=0-0` suffit : un octet, et les en-têtes avec. Le
+ * `Content-Type` est exposé au JS même en cross-origin — c'est un en-tête de
+ * réponse « CORS-safelisted », donc lisible sans `Access-Control-Expose-Headers`.
+ * En cas d'échec (CORS fermé, `Range` refusé, hôte injoignable) on rend `null`
+ * et l'appelant garde la détection par la forme de l'URL.
+ */
+const probeMediaContentType = async (
+  url: string,
+  signal: AbortSignal,
+): Promise<'mp4' | 'hls' | null> => {
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-0' },
+      signal,
+    });
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType) return null;
+    if (/^(?:video|audio)\/(?!vnd\.apple\.mpegurl)/.test(contentType)) return 'mp4';
+    if (
+      contentType.includes('mpegurl')
+      || contentType.includes('dash+xml')
+      || contentType.startsWith('text/')
+    ) {
+      return 'hls';
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
 function resolveCastContentType(
   url: string,
   isExplicitMp4: boolean,
@@ -496,12 +613,7 @@ function resolveCastContentType(
 
 // Utility function to create HLS config based on domain
 const createHlsConfig = (src: string) => {
-  const isPulseTopstrime = src.includes('pulse.topstrime.online');
   const isServersicuro = src.includes('serversicuro.cc');
-
-  if (isPulseTopstrime) {
-    console.log('🔧 Applying pulse.topstrime.online optimizations: limited concurrent requests (max 4 segments)');
-  }
 
   if (isServersicuro) {
     console.log('🔧 Applying serversicuro.cc optimizations: enhanced audio support and buffer management');
@@ -510,11 +622,11 @@ const createHlsConfig = (src: string) => {
   return {
     enableWorker: true,
     lowLatencyMode: isLowLatencyEnabled('movies'), // opt-in via Settings › Performance
-    startFragPrefetch: !isPulseTopstrime, // Désactiver le prefetch pour pulse.topstrime.online
-    backBufferLength: isPulseTopstrime ? 30 : (isServersicuro ? 60 : 90),
-    maxBufferLength: isPulseTopstrime ? 4 : (isServersicuro ? 20 : 30), // Augmenter pour serversicuro
-    maxMaxBufferLength: isPulseTopstrime ? 8 : (isServersicuro ? 300 : 600), // Augmenter pour serversicuro
-    maxBufferSize: isPulseTopstrime ? 4 * 1000 * 1000 : (isServersicuro ? 30 * 1000 * 1000 : 60 * 1000 * 1000), // Augmenter pour serversicuro
+    startFragPrefetch: true,
+    backBufferLength: isServersicuro ? 60 : 90,
+    maxBufferLength: isServersicuro ? 20 : 30, // Augmenter pour serversicuro
+    maxMaxBufferLength: isServersicuro ? 300 : 600, // Augmenter pour serversicuro
+    maxBufferSize: isServersicuro ? 30 * 1000 * 1000 : 60 * 1000 * 1000, // Augmenter pour serversicuro
     maxBufferHole: 0.5,
     highBufferWatchdogPeriod: 2,
     // Configuration pour prévenir les erreurs de buffer append
@@ -540,16 +652,6 @@ const createHlsConfig = (src: string) => {
       liveBackBufferLength: 30,
       liveMaxBackBufferLength: 60
     }),
-    // Limiter les requêtes simultanées pour pulse.topstrime.online
-    ...(isPulseTopstrime && {
-      maxLoadingDelay: 6000, // Délai max entre les requêtes (plus long)
-      fragLoadingTimeOut: 30000, // Timeout plus long pour les fragments
-      manifestLoadingTimeOut: 15000, // Timeout pour le manifest
-      levelLoadingTimeOut: 15000, // Timeout pour les niveaux
-      fragLoadingMaxRetry: 1, // Moins de tentatives automatiques
-      levelLoadingMaxRetry: 1,
-      manifestLoadingMaxRetry: 1
-    })
   };
 
 
@@ -642,48 +744,8 @@ const handle429Error = (
   ) => unknown,
 ) => {
   const failedUrl = data.frag?.url || data.url || 'unknown';
-  const isTopstrime = failedUrl.includes('pulse.topstrime.online');
 
-  // Check for Rivestream proxy rotation
-  const isProxyUrl = failedUrl.includes('.workers.dev/proxy?url=');
-  const currentProxyIndex = RIVESTREAM_PROXIES.findIndex(proxy => failedUrl.includes(proxy));
-
-  if (currentProxyIndex !== -1 || isProxyUrl) {
-    console.log('🚨 Rivestream Proxy 429 detected, switching proxy...');
-    const nextProxyIndex = currentProxyIndex !== -1 ? (currentProxyIndex + 1) % RIVESTREAM_PROXIES.length : 0;
-    const nextProxy = RIVESTREAM_PROXIES[nextProxyIndex];
-
-    let newUrl;
-    if (currentProxyIndex !== -1) {
-      const currentProxy = RIVESTREAM_PROXIES[currentProxyIndex];
-      newUrl = failedUrl.replace(currentProxy, nextProxy);
-      console.log(`🔄 Switching from ${currentProxy} to ${nextProxy}`);
-    } else {
-      try {
-        const urlObj = new URL(failedUrl);
-        const oldHost = urlObj.host;
-        urlObj.host = nextProxy;
-        newUrl = urlObj.toString();
-        console.log(`🔄 Switching from ${oldHost} (proxy pattern detected) to ${nextProxy}`);
-      } catch (e) {
-        newUrl = failedUrl.replace(/^(https?:\/\/)[^\/]+/, `$1${nextProxy}`);
-      }
-    }
-
-    requestFallback?.(() => {
-      const sourceChangeEvent = new CustomEvent('sourceChange', {
-        detail: { type: 'rivestream_hls', url: newUrl, id: 'rivestream_retry', origin: 'auto-fallback', fromSrc: currentSrc || failedUrl }
-      });
-      window.dispatchEvent(sourceChangeEvent);
-    });
-    return;
-  }
-
-  if (isTopstrime) {
-    console.error('🚨 Error 429 detected on pulse.topstrime.online');
-  } else {
-    console.error('🚨 Error 429 detected');
-  }
+  console.error('🚨 Error 429 detected');
   console.log('🔍 Failed request details:', failedUrl);
 
   // Sauvegarder la position actuelle et les informations du fragment qui a échoué
@@ -700,7 +762,7 @@ const handle429Error = (
   }
 
   // Vérifier si on a trop d'erreurs 429 consécutives
-  const retryKey = `429_${isTopstrime ? 'topstrime' : 'other'}`;
+  const retryKey = '429_other';
   if (!(window as any).error429RetryCount) {
     (window as any).error429RetryCount = {};
   }
@@ -796,6 +858,12 @@ interface HLSPlayerProps {
     name?: string;
     overview?: string;
     vote_average?: number;
+    /**
+     * Image de l'épisode. La carte « À suivre » retombait sur le fond de la
+     * série, donc la même vignette pour tous les épisodes.
+     */
+    still_path?: string | null;
+    air_date?: string;
   } | null;
   onNextEpisode?: (seasonNumber: number, episodeNumber: number) => void;
   movieId?: string;  // ID TMDB du film
@@ -808,9 +876,6 @@ interface HLSPlayerProps {
   nexusHlsSources?: SeekStreamingHlsSource[];
   nexusFileSources?: { url: string; label: string }[];
   purstreamSources?: { url: string; label: string }[];
-  rivestreamSources?: { url: string; label: string; quality: number; service: string; category: string }[];
-  rivestreamCaptions?: { label: string; file: string }[];
-  loadingRivestream?: boolean;
   frembedAvailable?: boolean;
   customSources?: string[];
   omegaSources?: any[];
@@ -855,6 +920,20 @@ interface HLSPlayerProps {
   currentEpisodeInfo?: EpisodeInfo | null;
   onEpisodeSelect?: (seasonNumber: number, episodeNumber: number) => void;
 
+  /**
+   * Cible du plein écran.
+   *
+   * - `'player'` (défaut) : le conteneur du lecteur, comme n'importe quel
+   *   lecteur embarqué (aperçus, watch party, où le lecteur ne remplit pas la
+   *   fenêtre).
+   * - `'page'` : le conteneur racine de l'application, qui lui n'est jamais
+   *   démonté. C'est ce qui permet au plein écran de survivre au changement
+   *   d'épisode (et au changement de source), puisque le lecteur, lui, est
+   *   remonté à chaque fois. À réserver aux pages où le lecteur occupe déjà
+   *   toute la fenêtre.
+   */
+  fullscreenTarget?: 'player' | 'page';
+
   // Threshold configuration for when to show next episode/movie popup
   // Examples:
   //   - 95 (simple number = percentage mode)
@@ -871,6 +950,18 @@ interface HLSPlayerProps {
    */
   priorityCategory?: 'moviesTv' | 'anime';
 }
+
+// === Saut d'intro / outro / resume ==========================================
+// Couleurs des segments dans la barre de progression. Volontairement distinctes
+// du rouge de la progression et du gris du buffer, et suffisamment opaques pour
+// rester lisibles sous la barre lue.
+const SEGMENT_LABEL_KEY: Record<SegmentKind, string> = {
+  intro: 'watch.segmentIntro',
+  recap: 'watch.segmentRecap',
+  outro: 'watch.segmentOutro',
+  credits: 'watch.segmentCredits',
+  preview: 'watch.segmentPreview',
+};
 
 interface MovieInfo {
   title: string;
@@ -920,36 +1011,6 @@ interface WatchProgress {
   duration: number;
 }
 
-interface NextEpisodePromptProps {
-  showPrompt: boolean;
-  nextEpisode?: {
-    title?: string;
-    name?: string;
-    episode_number?: number;
-    season_number?: number;
-    episodeNumber?: number;
-    seasonNumber?: number;
-    overview?: string;
-    still_path?: string;
-    vote_average?: number;
-  } | null;
-  tvShow?: {
-    name: string;
-    backdrop_path?: string;
-  } | null;
-  onPlay: () => void;
-  onIgnore: () => void;
-  shouldHide: (contentType: 'seasonImages' | 'episodeNames' | 'episodeImages' | 'episodeOverviews' | 'nextEpisodeInfo') => boolean;
-  getMaskedContent: (originalContent: string, contentType: 'seasonImages' | 'episodeNames' | 'episodeImages' | 'episodeOverviews' | 'nextEpisodeInfo', maskText?: string, episodeNumber?: number) => string;
-}
-
-// Add new interface for subtitle styling
-interface SubtitleStyle {
-  fontSize: number; // Font size in rem (0.5 to 3)
-  backgroundOpacity: number; // Background opacity (0 to 1)
-  color: string; // Hex color code (e.g., #ffffff, #ffff00)
-  delay: number; // Delay in seconds (can be negative for early display)
-}
 
 // Add new interface for zoom functionality
 interface ZoomState {
@@ -1045,10 +1106,25 @@ export interface HLSPlayerRef {
 }
 
 // Convert HLSPlayer to use forwardRef
+/**
+ * Délai d'escamotage de la barre de lecture en plein écran quand *rien* ne l'a
+ * programmé — c'est-à-dire quand il n'y a ni souris ni clic pour le faire :
+ * télé, box, télécommande.
+ */
+const FULLSCREEN_IDLE_HIDE_MS = 1_500;
+
+/**
+ * Fenêtre morte après l'entrée en plein écran. Le basculement déplace toute la
+ * mise en page sous le curseur ; certains navigateurs en profitent pour émettre
+ * un `mousemove` que personne n'a provoqué. Le prendre pour un geste ferait
+ * resurgir l'interface qu'on vient tout juste d'escamoter.
+ */
+const FULLSCREEN_SETTLE_MS = 500;
+
 const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   src,
   controls = true,
-  autoPlay = true,
+  autoPlay: autoPlayProp = true,
   className = '',
   poster,
   backdrop,
@@ -1070,9 +1146,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   nexusHlsSources = [],
   nexusFileSources = [],
   purstreamSources = [],
-  rivestreamSources = [],
-  rivestreamCaptions = [],
-  loadingRivestream = false,
   frembedAvailable = false,
   customSources = [],
   omegaSources = [],
@@ -1101,6 +1174,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   showTitle,
   currentEpisodeInfo,
   onEpisodeSelect,
+  fullscreenTarget = 'player',
   nextContentThreshold = 95, // Default to 95%
   // WatchPartyRoom integration props
   onPlayerPlay,
@@ -1113,6 +1187,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 }, ref) => {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+
+  // Réglage « reprendre la lecture » désactivé : en navigation SPA le document
+  // garde son activation utilisateur, donc la lecture repartirait toute seule.
+  // On neutralise `autoPlay` pour ce montage-ci uniquement — décidé une fois au
+  // montage, pour que les effets qui dépendent de `autoPlay` restent stables.
+  const [suppressEpisodeAutoplay] = useState(() => isEpisodeAutoplaySuppressed());
+  const autoPlay = autoPlayProp && !suppressEpisodeAutoplay;
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<HlsType | null>(null);
@@ -1126,6 +1207,36 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const isSelectedKisskhMp4 = kisskhSources.some(source => (
     source.type === 'mp4' && source.url === src
   ));
+  // URLs dont le `Content-Type` a révélé un MP4 alors que leur forme ne disait
+  // rien. Voir probeMediaContentType : la sonde est asynchrone, ce state est ce
+  // qui relance l'effet de lecture avec la bonne décision.
+  const [contentTypeMp4Urls, setContentTypeMp4Urls] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  useEffect(() => {
+    if (!src || !isAmbiguousMediaSource(src)) return;
+    const normalized = normalizeUqloadEmbedUrl(src);
+    if (contentTypeMp4Urls.has(normalized)) return;
+    const controller = new AbortController();
+    probeMediaContentType(normalized, controller.signal).then(kind => {
+      if (kind !== 'mp4' || controller.signal.aborted) return;
+      setContentTypeMp4Urls(previous => {
+        if (previous.has(normalized)) return previous;
+        const next = new Set(previous);
+        next.add(normalized);
+        return next;
+      });
+    });
+    return () => controller.abort();
+  }, [contentTypeMp4Urls, src]);
+  /** `isMP4Source`, enrichi de ce que la sonde a appris sur le Content-Type. */
+  const isMp4SourceResolved = useCallback(
+    (candidate: string) => (
+      isMP4Source(candidate)
+      || contentTypeMp4Urls.has(normalizeUqloadEmbedUrl(candidate))
+    ),
+    [contentTypeMp4Urls],
+  );
   useLayoutEffect(() => {
     onShowSourcesRef.current = onShowSources;
   }, [onShowSources]);
@@ -1282,7 +1393,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   });
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState<number>(0);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  // Le lecteur peut être monté *pendant* un plein écran déjà en cours (épisode
+  // suivant, changement de source) : on part de l'état réel du document plutôt
+  // que de « fenêtré », sinon la première frame s'affiche en mode fenêtré.
+  const [isFullscreen, setIsFullscreen] = useState(() => Boolean(getFullscreenElement()));
+  /** Plein écran porté par le conteneur racine de l'app : le lecteur doit alors occuper l'écran lui-même. */
+  const [isPageFullscreen, setIsPageFullscreen] = useState(() => isHostFullscreenActive());
   const [showControls, setShowControls] = useState(true);
   const [buffered, setBuffered] = useState<TimeRanges | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -1473,37 +1589,37 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   }, [contentQualityKey]);
 
-  // External subtitles (OpenSubtitles) states
-  const [availableExternalLangCodes, setAvailableExternalLangCodes] = useState<Set<string> | null>(null);
-  const [externalLangsLoading, setExternalLangsLoading] = useState(false);
-  const allExternalLanguages = useMemo(
-    () => {
-      const localizedLanguages = t('watch.externalSubtitleLanguages', { returnObjects: true });
-      if (!localizedLanguages || typeof localizedLanguages !== 'object') {
-        return [];
-      }
+  // Sous-titres externes : la recherche vit desormais dans le registre de
+  // providers (src/services/subtitles). Le panneau filtre en local.
+  const externalQuery = useMemo(() => {
+    if (tvShowId && seasonNumber != null && episodeNumber != null) {
+      return {
+        type: 'tv' as const,
+        tmdbId: String(tvShowId),
+        season: Number(seasonNumber),
+        episode: Number(episodeNumber),
+      };
+    }
+    if (movieId) {
+      return { type: 'movie' as const, tmdbId: String(movieId) };
+    }
+    return null;
+  }, [movieId, tvShowId, seasonNumber, episodeNumber]);
 
-      return Object.entries(localizedLanguages as Record<string, string>).map(([code, label]) => ({
-        code,
-        label,
-      }));
-    },
-    [t, i18n.language, i18n.resolvedLanguage]
-  );
-  // Filter to only show languages that have subtitles available for this movie/episode
-  const externalLanguages = useMemo(
-    () => {
-      if (availableExternalLangCodes === null) return allExternalLanguages;
-      return allExternalLanguages.filter(lang => availableExternalLangCodes.has(lang.code));
-    },
-    [allExternalLanguages, availableExternalLangCodes]
-  );
-  const [selectedExternalLang, setSelectedExternalLang] = useState<string | null>(null);
-  const [selectedExternalSub, setSelectedExternalSub] = useState<any | null>(null);
-  const [externalSubs, setExternalSubs] = useState<any[]>([]);
-  const [externalLoading, setExternalLoading] = useState(false);
+  const preferredSubtitleLang = (i18n.language || 'fr').split('-')[0];
+  const {
+    tracks: externalTracks,
+    loading: externalLoading,
+    providerErrors: externalProviderErrors,
+  } = useExternalSubtitles(externalQuery, preferredSubtitleLang);
+
+  const [selectedExternalSub, setSelectedExternalSub] = useState<SubtitleTrack | null>(null);
   const [loadingSubtitle, setLoadingSubtitle] = useState(false);
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
+  /** Dernier état de plein écran connu, pour ne réagir qu'aux transitions. */
+  const wasFullscreenRef = useRef(false);
+  /** Fin de la fenêtre morte suivant l'entrée en plein écran (timestamp ms). */
+  const fullscreenSettleUntilRef = useRef(0);
   const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
   const [currentAudioTrack, setCurrentAudioTrack] = useState<number>(0);
   // Nouvel état pour la largeur du menu paramètres
@@ -1560,6 +1676,19 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const rightTapTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isTouchDevice, setIsTouchDevice] = useState(false);
 
+  /**
+   * Le pointeur réellement en cours, et non ce dont l'appareil est capable.
+   * `isTouchDevice` reste juste pour tout ce qui relève du geste tactile
+   * (double tap, libellés d'aide) ; le comportement souris, lui, se décide
+   * ici, sinon une dalle tactile le supprimait sur une machine pilotée à la
+   * souris. Voir `utils/pointerKind.ts`.
+   */
+  const isMousePointer = useSyncExternalStore(
+    subscribePointerKind,
+    getPointerKind,
+    getServerPointerKind,
+  ) === 'mouse';
+
   // Tap detection refs for single vs double tap on touch devices
   const lastTapTimeRef = useRef<number>(0);
   const lastTapSideRef = useRef<'left' | 'right' | null>(null);
@@ -1595,9 +1724,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [, setM3u8Url] = useState<string | null>(null);
   const [, setLoadingError] = useState(false);
   const [, setSelectedSubtitleUrl] = useState<string | null>(null);
-  const [showNextEpisodePrompt, setShowNextEpisodePrompt] = useState(false);
   const [, setSelectedSubtitleLang] = useState<string | null>(null);
-  const imdbCacheRef = useRef<Record<string, string | null>>({});
   const [hoverState, setHoverState] = useState<{
     time: number | null;
     x: number;
@@ -1638,60 +1765,151 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     setActiveTranslatedSubtitleId(null);
   }, [contentQualityKey]);
 
-  const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(() => {
-    // Try to load saved subtitle style from localStorage
-    const savedStyle = localStorage.getItem('subtitleStyle');
-    if (savedStyle) {
-      try {
-        const parsed = JSON.parse(savedStyle);
-
-        // Migrate from old format if needed
-        let fontSize = 1.5;
-        if (typeof parsed.fontSize === 'string') {
-          // Old format: 'small' | 'medium' | 'large'
-          fontSize = parsed.fontSize === 'small' ? 1 : parsed.fontSize === 'large' ? 2 : 1.5;
-        } else if (typeof parsed.fontSize === 'number') {
-          fontSize = parsed.fontSize;
-        }
-
-        let backgroundOpacity = 0.4;
-        if (typeof parsed.backgroundColor === 'string') {
-          // Old format: 'transparent' | 'semi' | 'dark'
-          backgroundOpacity = parsed.backgroundColor === 'transparent' ? 0.1 : parsed.backgroundColor === 'dark' ? 0.7 : 0.4;
-        } else if (typeof parsed.backgroundOpacity === 'number') {
-          backgroundOpacity = parsed.backgroundOpacity;
-        }
-
-        // Migrate color from old format if needed
-        let color = '#ffffff';
-        if (typeof parsed.color === 'string') {
-          if (parsed.color === 'yellow') {
-            color = '#fcd34d'; // yellow-300
-          } else if (parsed.color === 'white') {
-            color = '#ffffff';
-          } else if (parsed.color.startsWith('#')) {
-            color = parsed.color;
-          }
-        }
-
-        return {
-          fontSize,
-          backgroundOpacity,
-          color,
-          delay: parsed.delay || 0
-        };
-      } catch (e) {
-        console.error('Error parsing saved subtitle style', e);
-      }
-    }
-    // Default values if nothing saved or error parsing
-    return {
-      fontSize: 1.5, // 1.5rem - medium size
-      backgroundOpacity: 0.4, // 40% opacity - semi transparent
-      color: '#ffffff', // white
-      delay: 0
-    };
+  const {
+    preferences: subtitlePreferences,
+    patchPreferences: patchSubtitlePreferences,
+    previewPreferences: previewSubtitlePreferences,
+    commitPreferences: commitSubtitlePreferences,
+    resetAppearance: resetSubtitleAppearance,
+  } = useSubtitlePreferences();
+  const subtitleDelayRef = useRef(subtitlePreferences.delay);
+  const videoWrapperRef = useRef<HTMLDivElement | null>(null);
+  const subtitleCuePositionRef = useRef<HTMLDivElement | null>(null);
+  const subtitleCueBlockRef = useRef<HTMLDivElement | null>(null);
+  const controlBarRef = useRef<HTMLDivElement | null>(null);
+  const subtitlePreviewActiveRef = useRef(false);
+  const subtitleLivePreferencesRef = useRef(subtitlePreferences);
+  const subtitleControlsInsetRef = useRef(12);
+  const [subtitleControlsInset, setSubtitleControlsInset] = useState(12);
+  const [subtitleViewport, setSubtitleViewport] = useState({
+    width: 0,
+    height: 0,
+    blockWidth: 0,
+    blockHeight: 0,
   });
+
+  useEffect(() => {
+    subtitleDelayRef.current = subtitlePreferences.delay;
+  }, [subtitlePreferences.delay]);
+
+  useEffect(() => {
+    subtitleLivePreferencesRef.current = subtitlePreferences;
+  }, [subtitlePreferences]);
+
+  useEffect(() => {
+    const applySubtitlePreview = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return;
+      const previous = subtitleLivePreferencesRef.current;
+      const next = normalizeSubtitlePreferences(event.detail);
+      subtitleLivePreferencesRef.current = next;
+
+      if (next.delay !== previous.delay) {
+        subtitleDelayRef.current = next.delay;
+        const video = videoRef.current;
+        const activeTrack = video
+          ? Array.from(video.textTracks).find((track) => track.mode === 'hidden')
+          : undefined;
+        if (video && activeTrack) refreshActiveCues(video, activeTrack, next.delay);
+      }
+
+      const wrapper = videoWrapperRef.current;
+      const position = subtitleCuePositionRef.current;
+      const cue = subtitleCueBlockRef.current;
+      if (!wrapper || !position || !cue) return;
+
+      subtitlePreviewActiveRef.current = true;
+      position.style.transition = 'none';
+      cue.style.transition = 'none';
+
+      const wrapperWidth = wrapper.clientWidth;
+      const wrapperHeight = wrapper.clientHeight;
+      const scale = Math.max(0.35, Math.min(wrapperWidth / 1920, wrapperHeight / 1080));
+      const geometryChanged = next.fontSizePx !== previous.fontSizePx
+        || next.fontFamily !== previous.fontFamily
+        || next.fontWeight !== previous.fontWeight
+        || next.positionXPercent !== previous.positionXPercent
+        || next.bottomOffsetPx !== previous.bottomOffsetPx;
+
+      if (next.color !== previous.color) cue.style.color = next.color;
+      if (next.fontFamily !== previous.fontFamily) cue.style.fontFamily = SUBTITLE_FONT_FAMILIES[next.fontFamily];
+      if (next.fontSizePx !== previous.fontSizePx) cue.style.fontSize = `${next.fontSizePx * scale}px`;
+      if (next.fontWeight !== previous.fontWeight) cue.style.fontWeight = `${next.fontWeight}`;
+      if (next.backgroundEnabled !== previous.backgroundEnabled || next.backgroundOpacity !== previous.backgroundOpacity) {
+        cue.style.backgroundColor = next.backgroundEnabled ? `rgba(0,0,0,${next.backgroundOpacity})` : 'transparent';
+      }
+      if (next.edgeStyle !== previous.edgeStyle
+        || next.edgeColor !== previous.edgeColor
+        || next.edgeSizePx !== previous.edgeSizePx) {
+        const edgeStyles = getSubtitleEdgeStyles(next.edgeStyle, next.edgeColor, next.edgeSizePx, scale);
+        cue.style.textShadow = edgeStyles.textShadow;
+        cue.style.setProperty('-webkit-text-stroke', edgeStyles.WebkitTextStroke);
+        cue.style.paintOrder = edgeStyles.paintOrder ?? '';
+      }
+
+      if (geometryChanged) {
+        const placement = calculateSubtitlePlacement(next, {
+          width: wrapperWidth,
+          height: wrapperHeight,
+          blockWidth: cue.offsetWidth,
+          blockHeight: cue.offsetHeight,
+          controlsInset: subtitleControlsInsetRef.current,
+        });
+        position.style.left = `${placement.leftPx}px`;
+        position.style.bottom = `${placement.bottomPx}px`;
+      }
+    };
+
+    const finishSubtitlePreview = (event: Event) => {
+      if (event instanceof CustomEvent) {
+        subtitleLivePreferencesRef.current = normalizeSubtitlePreferences(event.detail);
+      }
+      subtitlePreviewActiveRef.current = false;
+      subtitleCuePositionRef.current?.style.removeProperty('transition');
+      subtitleCueBlockRef.current?.style.removeProperty('transition');
+    };
+
+    window.addEventListener(SUBTITLE_STYLE_PREVIEW_EVENT, applySubtitlePreview);
+    window.addEventListener(SUBTITLE_STYLE_CHANGED_EVENT, finishSubtitlePreview);
+    return () => {
+      window.removeEventListener(SUBTITLE_STYLE_PREVIEW_EVENT, applySubtitlePreview);
+      window.removeEventListener(SUBTITLE_STYLE_CHANGED_EVENT, finishSubtitlePreview);
+    };
+  }, []);
+
+  useEffect(() => {
+    const wrapper = videoWrapperRef.current;
+    if (!wrapper) return;
+
+    const measureSubtitles = () => {
+      if (subtitlePreviewActiveRef.current) return;
+      const cueBlock = subtitleCueBlockRef.current;
+      const nextViewport = {
+        width: wrapper.clientWidth,
+        height: wrapper.clientHeight,
+        blockWidth: cueBlock?.offsetWidth ?? 0,
+        blockHeight: cueBlock?.offsetHeight ?? 0,
+      };
+      setSubtitleViewport(current => (
+        current.width === nextViewport.width
+        && current.height === nextViewport.height
+        && current.blockWidth === nextViewport.blockWidth
+        && current.blockHeight === nextViewport.blockHeight
+          ? current
+          : nextViewport
+      ));
+    };
+
+    measureSubtitles();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', measureSubtitles);
+      return () => window.removeEventListener('resize', measureSubtitles);
+    }
+
+    const observer = new ResizeObserver(measureSubtitles);
+    observer.observe(wrapper);
+    if (subtitleCueBlockRef.current) observer.observe(subtitleCueBlockRef.current);
+    return () => observer.disconnect();
+  }, [subtitleContainerVisible]);
   // Ajout d'un nouveau state pour le format d'affichage
   const [videoAspectRatio, setVideoAspectRatio] = useState<'cover' | 'contain' | '16:9' | '4:3' | 'original'>('contain');
   const [, setIsLandscape] = useState(window.innerWidth > window.innerHeight);
@@ -1712,7 +1930,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [showSwiftflowMenu, setShowSwiftflowMenu] = useState(false);
   const [showViperMenu, setShowViperMenu] = useState(false);
   const [showVoxMenu, setShowVoxMenu] = useState(false);
-  const [showRivestreamMenu, setShowRivestreamMenu] = useState(false);
   const [showBravoMenu, setShowBravoMenu] = useState(false);
 
   // Setup cinep DNR headers for PurStream sources (non-VIP extension users)
@@ -1854,6 +2071,27 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const lastAuthoritativeCastStatusRef = useRef(castStatus);
   const isCasting = castStatus.connected;
   const postCastPlaybackSuppressedRef = useRef(isCasting);
+
+  useLayoutEffect(() => {
+    const controlBar = controlBarRef.current;
+    const measureControlInset = () => {
+      const nextInset = showControls && controls && !isCasting && controlBar
+        ? controlBar.offsetHeight + 8
+        : 12;
+      subtitleControlsInsetRef.current = nextInset;
+      setSubtitleControlsInset((current) => current === nextInset ? current : nextInset);
+    };
+
+    measureControlInset();
+    if (!controlBar || typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', measureControlInset);
+      return () => window.removeEventListener('resize', measureControlInset);
+    }
+
+    const observer = new ResizeObserver(measureControlInset);
+    observer.observe(controlBar);
+    return () => observer.disconnect();
+  }, [controls, isCasting, showControls]);
 
   useEffect(() => {
     if (!isCasting) return;
@@ -2485,19 +2723,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         language: source.language,
         isVip: source.isVip
       })) : [],
-      // Add Rivestream HLS sources (VO/VOSTFR) to the media info
-      rivestreamSources: Array.isArray(rivestreamSources) ? rivestreamSources.map(source => ({
-        url: source.url,
-        label: source.label,
-        quality: source.quality,
-        service: source.service,
-        category: source.category
-      })) : [],
-      // Add captions/subtitles for Rivestream sources
-      captions: Array.isArray(rivestreamCaptions) ? rivestreamCaptions.map(caption => ({
-        label: caption.label,
-        file: caption.file
-      })) : [],
       // Add currently selected Nexus source info for proper Bravo player transmission
       currentNexusSource: currentNexusSource,
       // Add currently selected Bravo source info
@@ -2615,7 +2840,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       mp4Sources: mp4Sources?.length || 0,
       nexusHlsSources: nexusHlsSources?.length || 0,
       nexusFileSources: nexusFileSources?.length || 0,
-      rivestreamSources: rivestreamSources?.length || 0,
       frembedAvailable,
       customSources: customSources?.length || 0,
       omegaSources: omegaSources?.length || 0,
@@ -2853,33 +3077,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }
     }
 
-    // Process Rivestream sources - Add main button with dropdown menu (VIP check si activé)
-    if (isRivestreamAvailable()) {
-      if (rivestreamSources && rivestreamSources.length > 0) {
-        embedSources.push({
-          type: 'rivestream_main',
-          id: 'rivestream_main',
-          label: `🎬 ${t('watch.voVostfrPlayer', { n: 'HLS' })} (${rivestreamSources.length})`,
-          url: '#',
-        });
-      } else if (loadingRivestream) {
-        embedSources.push({
-          type: 'rivestream_main',
-          id: 'rivestream_main',
-          label: `⏳ ${t('watch.loadingVoVostfr')}`,
-          url: '#',
-        });
-      } else {
-        // Bouton pour déclencher le chargement si pas encore chargé
-        embedSources.push({
-          type: 'rivestream_hls',
-          id: 'rivestream_trigger',
-          label: `🌎 ${t('watch.voVostfrPlayer', { n: 'HLS' })}`,
-          url: '#',
-        });
-      }
-    }
-
     // Ajouter les sources VOSTFR dans un menu déroulant
     embedSources.push({
       type: 'vostfr_main',
@@ -2893,6 +3090,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     // Définir les lecteurs VO/VOSTFR à conserver (enlever 6, 4 et 2)
     if (showVostfrMenu) {
       const vostfrSources = [
+        { id: '111movies', label: '111Movies', url: '' },
         { id: 'peachify', label: 'Peachify', url: '' }, // Peachify (priorité, FR subs + accent Movix)
         { id: 'vostfr', label: 'Videasy', url: '' }, // Videasy
         { id: 'vidlink', label: 'Vidlink', url: '' }, // vidlink
@@ -2909,14 +3107,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         // boutons Sources/Open dupliqués (rendus dans le parent ET dans l'iframe imbriqué).
         if (tvShowId != null && seasonNumber != null && episodeNumber != null) {
           // TV Show URLs
-          if (source.id === 'peachify') finalUrl = `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
+          if (source.id === '111movies') finalUrl = `https://111movies.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}`;
+          else if (source.id === 'peachify') finalUrl = `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
           else if (source.id === 'vidlink') finalUrl = `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}`; // vidlink.pro
           else if (source.id === 'vidsrccc') finalUrl = `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}`;
           else if (source.id === 'vostfr') finalUrl = `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}`; // Videasy
           else if (source.id === 'vidsrcwtf1') finalUrl = `https://vidsrc.wtf/api/1/tv/?id=${tvShowId}&s=${seasonNumber}&e=${episodeNumber}`; // Assumed pattern
         } else if (movieId) {
           // Movie URLs (existing logic)
-          if (source.id === 'peachify') finalUrl = `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626`;
+          if (source.id === '111movies') finalUrl = `https://111movies.net/movie/${movieId}`;
+          else if (source.id === 'peachify') finalUrl = `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626`;
           else if (source.id === 'vidlink') finalUrl = `https://vidlink.pro/movie/${movieId}`; // vidlink.pro
           else if (source.id === 'vidsrccc') finalUrl = `https://vidsrc.io/embed/movie?tmdb=${movieId}`;
           else if (source.id === 'vostfr') finalUrl = `https://player.videasy.net/movie/${movieId}`;
@@ -2961,8 +3161,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     loadingKisskh,
     nexusHlsSources?.length,
     nexusFileSources?.length,
-    rivestreamSources?.length,
-    loadingRivestream,
     frembedAvailable,
     customSources?.length,
     omegaSources?.length,
@@ -3022,7 +3220,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // Fonction pour gérer le changement de source
   const handleSourceChange = (sourceType: string, sourceId: string, sourceUrl: string) => {
     // --- Dropdown Toggle Handling (Doesn't close settings) ---
-    if (sourceType === 'darkino_main' || sourceType === 'omega_main' || sourceType === 'multi_main' || sourceType === 'vostfr_main' || sourceType === 'nexus_main' || sourceType === 'fstream_main' || sourceType === 'wiflix_main' || sourceType === 'j1f_main' || sourceType === 'swiftflow_main' || sourceType === 'viper_main' || sourceType === 'vox_main' || sourceType === 'rivestream_main' || sourceType === 'bravo_main') {
+    if (sourceType === 'darkino_main' || sourceType === 'omega_main' || sourceType === 'multi_main' || sourceType === 'vostfr_main' || sourceType === 'nexus_main' || sourceType === 'fstream_main' || sourceType === 'wiflix_main' || sourceType === 'j1f_main' || sourceType === 'swiftflow_main' || sourceType === 'viper_main' || sourceType === 'vox_main' || sourceType === 'bravo_main') {
       setShowDarkinoMenu(sourceType === 'darkino_main' ? !showDarkinoMenu : false);
       setShowOmegaMenu(sourceType === 'omega_main' ? !showOmegaMenu : false);
       setShowCoflixMenu(sourceType === 'multi_main' ? !showCoflixMenu : false);
@@ -3034,7 +3232,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       setShowSwiftflowMenu(sourceType === 'swiftflow_main' ? !showSwiftflowMenu : false);
       setShowViperMenu(sourceType === 'viper_main' ? !showViperMenu : false);
       setShowVoxMenu(sourceType === 'vox_main' ? !showVoxMenu : false);
-      setShowRivestreamMenu(sourceType === 'rivestream_main' ? !showRivestreamMenu : false);
       setShowBravoMenu(sourceType === 'bravo_main' ? !showBravoMenu : false);
       return; // Return here, DON'T close settings
     }
@@ -3098,11 +3295,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       if (wiflixSources && wiflixSources[index]) {
         targetUrl = wiflixSources[index].url || '';
       }
-    } else if (sourceType === 'rivestream') {
-      const index = parseInt(sourceId.split('_')[1], 10);
-      if (rivestreamSources && rivestreamSources[index]) {
-        targetUrl = rivestreamSources[index].url || '';
-      }
     } else if (sourceType === 'bravo') {
       const index = parseInt(sourceId.split('_')[1], 10);
       if (purstreamSources && purstreamSources[index]) {
@@ -3120,7 +3312,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
     // Note: Frembed, Custom, VOSTFR, AdFree M3U8 already use correct sourceUrl
 
-    if (!targetUrl && sourceType !== 'vostfr_main' && sourceType !== 'vostfr_main' && sourceType !== 'omega_main' && sourceType !== 'multi_main' && sourceType !== 'darkino_main' && sourceType !== 'rivestream_main' && sourceType !== 'bravo_main' && sourceType !== 'vox_main') {
+    if (!targetUrl && sourceType !== 'vostfr_main' && sourceType !== 'vostfr_main' && sourceType !== 'omega_main' && sourceType !== 'multi_main' && sourceType !== 'darkino_main' && sourceType !== 'bravo_main' && sourceType !== 'vox_main') {
       console.error("Could not determine target URL for source:", sourceType, sourceId);
       return;
     }
@@ -3342,7 +3534,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const normalizedSrc = normalizeUqloadEmbedUrl(src);
     const isMP4 = kisskhSources.some(source => (
       source.type === 'mp4' && source.url === normalizedSrc
-    )) || isMP4Source(normalizedSrc);
+    )) || isMP4Source(normalizedSrc)
+      || contentTypeMp4Urls.has(normalizedSrc);
     // Bravo/Purstream fournit des liens mp4 compatibles avec cette logique
     if (isMP4) {
       // For MP4, directly set the source on the video element
@@ -3634,8 +3827,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       });
 
       hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
-        const isPulseTopstrime = src.includes('pulse.topstrime.online');
-        if (isPulseTopstrime && data.frag && typeof data.frag.sn === 'number') {
+        if (data.frag && typeof data.frag.sn === 'number') {
           // Si un segment qui était dans la liste des échecs 429 est maintenant chargé avec succès
           if (failed429Segments.has(data.frag.sn)) {
             console.log(`✅ Segment ${data.frag.sn} loaded successfully after 429 retry`);
@@ -3757,9 +3949,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
         // Vérifier si c'est une erreur 429 (Too Many Requests)
         const is429Error = data.response && data.response.code === 429;
-        const isPulseTopstrime = src.includes('pulse.topstrime.online');
 
-        if (is429Error && isPulseTopstrime) {
+        if (is429Error) {
           handle429Error(hls, videoRef, data, src, requestHlsFallback);
           return;
         }
@@ -4087,7 +4278,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.src = '';
       };
     }
-  }, [src, autoPlay, subtitleUrl, Hls, requestHlsFallback, isCasting, kisskhSources]); // REMOVED playbackSpeed
+  }, [src, autoPlay, subtitleUrl, Hls, requestHlsFallback, isCasting, kisskhSources, contentTypeMp4Urls]); // REMOVED playbackSpeed
 
   // Auto next episode preference (must be declared before useEffect that references it)
   const [autoNextEpisodeEnabled, setAutoNextEpisodeEnabled] = useState(() => {
@@ -4098,6 +4289,73 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   useEffect(() => {
     localStorage.setItem('playerAutoNextEpisodePref', JSON.stringify(autoNextEpisodeEnabled));
   }, [autoNextEpisodeEnabled]);
+
+  /**
+   * Le studio de repérage est-il ouvert ?
+   *
+   * Passe par un ref parce que l'état est déclaré bien plus bas (il dépend du
+   * hook des segments), alors que les deux endroits qui doivent le consulter —
+   * la fin de vidéo et `handleTimeUpdate` — sont ici.
+   *
+   * Ce qu'il commande : tant que le studio est ouvert, l'épisode suivant ne
+   * démarre pas tout seul et la proposition « À suivre » ne s'ouvre pas. Relever
+   * un générique demande justement d'aller au bout de l'épisode et d'y rester ;
+   * la passation automatique arrivait au pire moment et faisait perdre le
+   * relevé en cours. C'est une suspension, pas un réglage : la préférence de
+   * l'utilisateur n'est pas touchée et reprend seule à la fermeture.
+   */
+  const studioOpenRef = useRef(false);
+
+  // Reprise du lecteur d'un épisode à l'autre (séries / animes)
+  const [keepFullscreenOnEpisodeChange, setKeepFullscreenOnEpisodeChange] = useState(
+    () => isKeepFullscreenEnabled(),
+  );
+  const [resumePlaybackOnEpisodeChange, setResumePlaybackOnEpisodeChange] = useState(
+    () => isResumePlaybackEnabled(),
+  );
+
+  useEffect(() => {
+    setKeepFullscreenEnabled(keepFullscreenOnEpisodeChange);
+  }, [keepFullscreenOnEpisodeChange]);
+
+  useEffect(() => {
+    setResumePlaybackEnabled(resumePlaybackOnEpisodeChange);
+  }, [resumePlaybackOnEpisodeChange]);
+
+  // Garder les réglages synchronisés entre plusieurs lecteurs / onglets
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === KEEP_FULLSCREEN_PREF_KEY) {
+        setKeepFullscreenOnEpisodeChange(isKeepFullscreenEnabled());
+      } else if (event.key === RESUME_PLAYBACK_PREF_KEY) {
+        setResumePlaybackOnEpisodeChange(isResumePlaybackEnabled());
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
+
+  /**
+   * Le changement d'épisode recharge complètement la page : on rejoue donc ici
+   * l'état laissé par le lecteur précédent (plein écran, lecture en cours).
+   * Réservé aux séries et animes, pour qu'un film ouvert entre-temps ne
+   * consomme pas le marqueur laissé par un épisode.
+   */
+  const isEpisodicPlayer = Boolean(tvShowId || isAnime);
+
+  useEffect(() => {
+    if (!isEpisodicPlayer) return;
+    const state = readEpisodeHandoff();
+    if (!state) return;
+
+    return restoreEpisodeHandoff({
+      state,
+      getContainer: () => containerRef.current,
+      getVideo: () => videoRef.current,
+      useHost: fullscreenTarget === 'page',
+    });
+  }, [isEpisodicPlayer, src, fullscreenTarget]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -4136,7 +4394,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       if (nextMovie) {
         setShowNextMovie(true);
       }
-      if (nextEpisode && onNextEpisode && autoNextEpisodeEnabled) {
+      if (nextEpisode && onNextEpisode && autoNextEpisodeEnabled && !studioOpenRef.current) {
         onNextEpisode(nextEpisode.seasonNumber, nextEpisode.episodeNumber);
       }
     };
@@ -4325,6 +4583,17 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const video = videoRef.current;
     if (!video) return;
 
+    // Une piste externe chargee via loadExternalSubtitle devient un `internal:N`
+    // (voir enableTrack) et selectedExternalSub sert juste a garder son surlignage
+    // dans le panneau. Si on selectionne un autre id, cette piste externe n'est
+    // plus active : on l'oublie. On ne le fait pas quand `subtitleId` est deja la
+    // selection courante (ex: restauration apres remount du <video>), sinon
+    // loadExternalSubtitle rappelle handleSubtitleChange puis setSelectedExternalSub(sub)
+    // juste apres, donc la remise a zero est immediatement ecrasee par le meme batch.
+    if (subtitleId !== currentSubtitleRef.current) {
+      setSelectedExternalSub(null);
+    }
+
     translationAbortRef.current = true;
     setTranslationProgress(null);
     setTranslationLang(null);
@@ -4364,7 +4633,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           const liveIndex = liveTracks.indexOf(trackElement?.track || track);
           if (liveIndex < 0) return;
           const selectedTrack = applySelectedTextTrackMode(liveTracks, `internal:${liveIndex}`);
-          if (selectedTrack) refreshActiveCues(video, selectedTrack, subtitleStyle.delay);
+          if (selectedTrack) refreshActiveCues(video, selectedTrack, subtitlePreferences.delay);
         };
         reapplySelectedTrack();
         if (trackElement && trackElement.readyState !== 2) {
@@ -4423,154 +4692,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCasting, preparedKisskhSubtitles]);
 
-  // Fetch imdb id from TMDB for a movieId or tvShowId (strip leading 'tt' for OpenSubtitles)
-  const fetchImdbId = async (tmdbId?: string | number, isTvShow: boolean = false): Promise<string | null> => {
-    if (!tmdbId) return null;
-    const key = String(tmdbId);
-    const cacheKey = `${key}_${isTvShow ? 'tv' : 'movie'}`;
-
-    if (imdbCacheRef.current[cacheKey]) return imdbCacheRef.current[cacheKey];
-
-    try {
-      const endpoint = isTvShow ? 'tv' : 'movie';
-      const url = `https://api.themoviedb.org/3/${endpoint}/${key}/external_ids?api_key=${TMDB_API_KEY}`;
-      const res = await axios.get(url);
-      const imdb = res.data?.external_ids?.imdb_id || res.data?.imdb_id || null; // e.g. 'tt1300854'
-
-      if (imdb) {
-        imdbCacheRef.current[cacheKey] = imdb.replace(/^tt/, '');
-        return imdbCacheRef.current[cacheKey];
-      }
-      imdbCacheRef.current[cacheKey] = null;
-      return null;
-    } catch (err) {
-      console.error('Error fetching imdb id from TMDB', err);
-      imdbCacheRef.current[cacheKey] = null;
-      return null;
-    }
-  };
-
-  // Fetch available subtitle languages from OpenSubtitles for the current movie/episode
-  useEffect(() => {
-    let cancelled = false;
-
-    const fetchAvailableLanguages = async () => {
-      const hasMovieId = !!movieId;
-      const hasTvShowId = !!tvShowId;
-
-      if (!hasMovieId && !hasTvShowId) {
-        setAvailableExternalLangCodes(null);
-        return;
-      }
-
-      setExternalLangsLoading(true);
-      try {
-        let imdb: string | null = null;
-        let osUrl: string;
-
-        if (hasTvShowId && tvShowId && seasonNumber && episodeNumber) {
-          imdb = await fetchImdbId(tvShowId, true);
-          if (!imdb) { setExternalLangsLoading(false); return; }
-          osUrl = `https://rest.opensubtitles.org/search/episode-${episodeNumber}/imdbid-${imdb}/season-${seasonNumber}`;
-        } else if (hasMovieId) {
-          imdb = await fetchImdbId(movieId, false);
-          if (!imdb) { setExternalLangsLoading(false); return; }
-          osUrl = `https://rest.opensubtitles.org/search/imdbid-${imdb}`;
-        } else {
-          setExternalLangsLoading(false);
-          return;
-        }
-
-        const res = await axios.get(osUrl, { headers: { 'User-Agent': 'Movix/1.0' } });
-        if (cancelled) return;
-
-        if (Array.isArray(res.data)) {
-          const langs = new Set<string>();
-          for (const sub of res.data) {
-            if (sub.SubLanguageID) langs.add(sub.SubLanguageID);
-          }
-          setAvailableExternalLangCodes(langs);
-        } else {
-          setAvailableExternalLangCodes(new Set());
-        }
-      } catch (err) {
-        console.error('Error fetching available subtitle languages', err);
-        if (!cancelled) setAvailableExternalLangCodes(null);
-      } finally {
-        if (!cancelled) setExternalLangsLoading(false);
-      }
-    };
-
-    fetchAvailableLanguages();
-    return () => { cancelled = true; };
-  }, [movieId, tvShowId, seasonNumber, episodeNumber]);
-
-  // When user selects an external language, query OpenSubtitles for that imdb id
-  const handleExternalLanguageSelect = async (langCode: string) => {
-    setSelectedExternalLang(langCode);
-    setExternalSubs([]);
-
-    // Check if we have either a movie or TV show ID
-    const hasMovieId = !!movieId;
-    const hasTvShowId = !!tvShowId;
-
-    if (!hasMovieId && !hasTvShowId) {
-      console.warn('No movieId or tvShowId (TMDB) provided, external subtitles require one of these');
-      return;
-    }
-
-    setExternalLoading(true);
-    try {
-      let imdb: string | null = null;
-      let osUrl: string;
-
-      if (hasTvShowId && tvShowId && seasonNumber && episodeNumber) {
-        // TV Show: use the new route format for series
-        imdb = await fetchImdbId(tvShowId, true);
-        if (!imdb) {
-          console.warn('No imdb id found for TV show', tvShowId);
-          setExternalLoading(false);
-          return;
-        }
-
-        // Format: episode-{episodeNumber}/imdbid-{imdb}/season-{seasonNumber}/sublanguageid-{langCode}
-        osUrl = `https://rest.opensubtitles.org/search/episode-${episodeNumber}/imdbid-${imdb}/season-${seasonNumber}/sublanguageid-${langCode}`;
-      } else if (hasMovieId) {
-        // Movie: use the existing route format
-        imdb = await fetchImdbId(movieId, false);
-        if (!imdb) {
-          console.warn('No imdb id found for movie', movieId);
-          setExternalLoading(false);
-          return;
-        }
-
-        osUrl = `https://rest.opensubtitles.org/search/imdbid-${imdb}/sublanguageid-${langCode}`;
-      } else {
-        console.warn('Missing required parameters for external subtitles');
-        setExternalLoading(false);
-        return;
-      }
-
-      // OpenSubtitles requires a User-Agent header; set a simple one
-      console.log(`Fetching OpenSubtitles from: ${osUrl}`);
-      const res = await axios.get(osUrl, { headers: { 'User-Agent': 'Movix/1.0' } });
-      if (Array.isArray(res.data)) {
-        console.log(`Found ${res.data.length} subtitle results for ${hasTvShowId ? 'TV show' : 'movie'}`);
-        setExternalSubs(res.data);
-      } else {
-        console.log('No subtitle results found or unexpected response format');
-        setExternalSubs([]);
-      }
-    } catch (err) {
-      console.error('Error fetching OpenSubtitles', err);
-      setExternalSubs([]);
-    } finally {
-      setExternalLoading(false);
-    }
-  };
-
   // Load selected external subtitle into the video by creating a <track> element
-  const loadExternalSubtitle = async (sub: any) => {
+  const loadExternalSubtitle = async (sub: SubtitleTrack) => {
     if (!videoRef.current || !sub) return;
     setLoadingSubtitle(true);
     try {
@@ -4587,12 +4710,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
       const trackEl = document.createElement('track');
       trackEl.kind = 'subtitles';
-      trackEl.label = `${sub.LanguageName || sub.SubLanguageID || selectedExternalLang} - ${sub.SubFileName || 'External'}`;
-      trackEl.srclang = sub.ISO639 || sub.SubLanguageID || (selectedExternalLang || 'und');
+      trackEl.label = `${sub.lang} - ${sub.label}`;
+      trackEl.srclang = sub.lang || 'und';
       trackEl.setAttribute('data-external', '1');
 
-      // Prefer the official SubDownloadLink (it's a .gz containing an .srt)
-      const downloadLink = sub.SubDownloadLink || sub.SubDownloadLinkForBrowser || sub.DownloadLink || sub.Link || null;
+      // Le registre de providers garantit une URL non vide sur chaque piste.
+      const downloadLink = sub.url;
       if (downloadLink) {
         try {
           // Download and extract the .gz file locally using PAKO
@@ -4610,18 +4733,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           const buffer = new Uint8Array(arrayBuffer);
 
           subtitleDecoding: {
-          // Check if it's a valid gzip file
-          if (buffer.length < 2 || buffer[0] !== 0x1f || buffer[1] !== 0x8b) {
-            console.warn('File does not appear to be gzipped, trying direct processing');
-            // Try to process as regular SRT file
+          // On suit d'abord `sub.encoding`, mais on garde le test d'en-tete
+          // gzip (1f 8b) comme garde-fou : OpenSubtitles sert parfois du SRT
+          // nu sur une URL en `.gz`.
+          if (sub.encoding !== 'gzip' || buffer.length < 2 || buffer[0] !== 0x1f || buffer[1] !== 0x8b) {
+            // Texte direct : conversion deleguee au helper partage.
             const srtContent = new TextDecoder('utf-8', { fatal: false }).decode(buffer);
-            const vttContent = 'WEBVTT\n\n' + srtContent
-              .replace(/^\s*\d+\s*$/gm, '')
-              .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-            const blob = new Blob([vttContent], { type: 'text/vtt' });
-            const objUrl = URL.createObjectURL(blob);
-            trackEl.src = objUrl;
-            console.log('Processed as regular SRT file');
+            trackEl.src = URL.createObjectURL(
+              new Blob([subtitleTextToWebVtt(srtContent)], { type: 'text/vtt' }),
+            );
             break subtitleDecoding;
           }
 
@@ -4671,13 +4791,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             }
           }
 
-          // Clean up the SRT content (same logic as server.js)
+          // Conversion SRT -> WebVTT deleguee au helper partage : il gere le
+          // BOM, les retours chariot Windows, les octets nuls, les numeros de
+          // cue et l'echappement des lignes de controle WebVTT.
           srtContent = srtContent.replace(/\r\n/g, '\n').trim();
-
-          // Convert SRT to VTT format
-          const vttContent = 'WEBVTT\n\n' + srtContent
-            .replace(/^\s*\d+\s*$/gm, '') // Remove sequence numbers
-            .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2'); // Convert commas to dots in timestamps
+          const vttContent = subtitleTextToWebVtt(srtContent);
 
           const blob = new Blob([vttContent], { type: 'text/vtt' });
           const objUrl = URL.createObjectURL(blob);
@@ -4687,16 +4805,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           }
         } catch (err) {
           console.error('Failed to fetch/extract external subtitle with PAKO:', err);
-          // fallback: try to use SubDownloadLink directly (may be blocked by CORS)
+          // Repli : pointer le <track> directement sur l'URL d'origine
+          // (peut etre bloque par CORS).
           trackEl.src = downloadLink;
-        }
-      } else {
-        // No download link: try common ID based cloud URL (may be blocked)
-        const id = sub.IDSubtitleFile || sub.IDSubtitle || sub.ID || sub.SubID || '';
-        if (id) {
-          trackEl.src = `https://cloudnestra.com/sub/ops-${id}.vtt&ext=.vtt`;
-        } else {
-          console.warn('No usable download link for subtitle', sub);
         }
       }
 
@@ -4870,13 +4981,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     setCurrentSubtitle(`translated:${entry.id}`);
     setIsKisskhSubtitleSelected(false);
 
-    const adjustedTime = video.currentTime - subtitleStyle.delay;
+    const adjustedTime = video.currentTime - subtitlePreferences.delay;
     const cues = entry.cues.filter(cue => (
       cue.startTime <= adjustedTime && adjustedTime <= cue.endTime
     ));
     setActiveSubtitleCues(cues);
     setSubtitleContainerVisible(cues.length > 0);
-  }, [subtitleStyle.delay, translatedSubtitleHistory]);
+  }, [subtitlePreferences.delay, translatedSubtitleHistory]);
 
   useEffect(() => {
     if (!activeTranslatedSubtitleId) return;
@@ -4885,7 +4996,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     if (!entry || !video) return;
 
     const refreshTranslatedCues = () => {
-      const adjustedTime = video.currentTime - subtitleStyle.delay;
+      const adjustedTime = video.currentTime - subtitlePreferences.delay;
       const cues = entry.cues.filter(cue => (
         cue.startTime <= adjustedTime && adjustedTime <= cue.endTime
       ));
@@ -4896,7 +5007,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     refreshTranslatedCues();
     video.addEventListener('timeupdate', refreshTranslatedCues);
     return () => video.removeEventListener('timeupdate', refreshTranslatedCues);
-  }, [activeTranslatedSubtitleId, isCasting, subtitleStyle.delay, translatedSubtitleHistory]);
+  }, [activeTranslatedSubtitleId, isCasting, subtitlePreferences.delay, translatedSubtitleHistory]);
 
   useEffect(() => {
     if (
@@ -5080,7 +5191,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         setActiveTranslatedSubtitleId(entry.id);
         setCurrentSubtitle(`translated:${entry.id}`);
         setIsKisskhSubtitleSelected(false);
-        const adjustedTime = video.currentTime - subtitleStyle.delay;
+        const adjustedTime = video.currentTime - subtitlePreferences.delay;
         const activeCues = entry.cues.filter(cue => (
           cue.startTime <= adjustedTime && adjustedTime <= cue.endTime
         ));
@@ -5088,7 +5199,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         setSubtitleContainerVisible(activeCues.length > 0);
       }
     }
-  }, [batchTranslateChunk, currentSubtitle, subtitleStyle.delay, t, translateSubsTo]);
+  }, [batchTranslateChunk, currentSubtitle, subtitlePreferences.delay, t, translateSubsTo]);
 
   // Cancel ongoing translation
   const cancelSubtitleTranslation = useCallback(() => {
@@ -5108,9 +5219,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [activeTranslatedSubtitleId]);
 
   const handleMouseMove = useCallback((e?: Event | React.MouseEvent | PointerEvent) => {
-    // Ignore touch drag events (touch taps/toggles are handled separately)
-    if (touchActiveRef.current) return;
+    // Rien à faire pour un `mousemove` synthétisé par un tap, ni pendant un
+    // geste tactile en cours. On se fie au pointeur employé, pas à la dalle :
+    // une machine tactile pilotée à la souris doit rappeler l'interface.
+    if (!isMousePointer || touchActiveRef.current) return;
+    // Le pointeur porté par l'évènement tranche avant même que le store
+    // `pointerKind` n'ait propagé son changement au rendu.
     if (e && 'pointerType' in e && (e as PointerEvent).pointerType === 'touch') return;
+    // Mouvement émis par le seul basculement en plein écran, pas par
+    // l'utilisateur : voir `FULLSCREEN_SETTLE_MS`.
+    if (Date.now() < fullscreenSettleUntilRef.current) return;
 
     setShowControls(true);
     if (controlsTimeoutRef.current) {
@@ -5125,7 +5243,48 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }
       }, 5000);
     }
-  }, [isPlaying, showCastMenu, showForwardAnimation, showRewindAnimation, showLeftTapAnimation, showRightTapAnimation]);
+  }, [isMousePointer, isPlaying, showCastMenu, showForwardAnimation, showRewindAnimation, showLeftTapAnimation, showRightTapAnimation]);
+
+  /**
+   * Écouteurs natifs de mouvement de pointeur, en plus des gestionnaires React.
+   *
+   * Sous Firefox/Wayland, la synthèse d'évènements de React ne remonte pas
+   * fiablement les `mousemove` au-dessus des calques du lecteur : l'interface
+   * ne se rappelait qu'au clic. On double donc l'écoute au niveau du DOM, sur
+   * le conteneur et sur le document (ce dernier n'agissant qu'en plein écran
+   * ou pour une cible interne au lecteur).
+   */
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const onUserPointerActivity = (e: Event) => {
+      handleMouseMove(e);
+    };
+
+    const events = ['pointermove', 'mousemove', 'pointerenter', 'mouseenter'];
+
+    events.forEach(eventName => {
+      container.addEventListener(eventName, onUserPointerActivity, { passive: true });
+    });
+
+    const handleDocumentPointerMove = (e: Event) => {
+      if (document.fullscreenElement || container.contains(e.target as Node)) {
+        onUserPointerActivity(e);
+      }
+    };
+
+    document.addEventListener('pointermove', handleDocumentPointerMove, { passive: true });
+    document.addEventListener('mousemove', handleDocumentPointerMove, { passive: true });
+
+    return () => {
+      events.forEach(eventName => {
+        container.removeEventListener(eventName, onUserPointerActivity);
+      });
+      document.removeEventListener('pointermove', handleDocumentPointerMove);
+      document.removeEventListener('mousemove', handleDocumentPointerMove);
+    };
+  }, [handleMouseMove]);
 
 
   const togglePlay = () => {
@@ -5527,120 +5686,132 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   };
 
+  /**
+   * Escamote toute l'interface du lecteur : barre de lecture, panneaux et
+   * menus. C'est ce qu'obtient déjà un clic sur la vidéo, en une fonction.
+   */
+  const hidePlayerChrome = useCallback(() => {
+    setShowControls(false);
+    if (controlsTimeoutRef.current) {
+      clearTimeout(controlsTimeoutRef.current);
+      controlsTimeoutRef.current = undefined;
+    }
+    setShowSettings(false);
+    setShowVolumeSlider(false);
+    setShowCastMenu(false);
+    setShowInternalEpisodesMenu(false);
+    setShowSeasonDropdown(false);
+    setShowStreamInfo(false);
+    setShowShortcutsHelp(false);
+  }, []);
+
   const toggleFullscreen = async () => {
     const playerElement = containerRef.current;
     const videoElement = videoRef.current as HTMLVideoElementWithWebkit | null;
 
     if (!playerElement || !videoElement) return;
 
-    const doc = document as Document & {
-      webkitFullscreenElement?: Element | null;
-      webkitExitFullscreen?: () => Promise<void> | void;
-    };
-
     const isFullscreenNow = Boolean(
-      doc.fullscreenElement ||
-      doc.webkitFullscreenElement ||
-      videoElement.webkitDisplayingFullscreen === true,
+      getFullscreenElement() || videoElement.webkitDisplayingFullscreen === true,
     );
 
-    if (!isFullscreenNow) {
-      const tryRequestFullscreen = async (element: HTMLElement | HTMLVideoElementWithWebkit) => {
-        const extendedElement = element as typeof element & {
-          webkitRequestFullscreen?: () => Promise<void> | void;
-          mozRequestFullScreen?: () => Promise<void> | void;
-          msRequestFullscreen?: () => Promise<void> | void;
-        };
-
-        const requestFullscreenFn =
-          element.requestFullscreen ||
-          extendedElement.webkitRequestFullscreen ||
-          extendedElement.mozRequestFullScreen ||
-          extendedElement.msRequestFullscreen;
-
-        if (typeof requestFullscreenFn !== 'function') return false;
-
-        try {
-          await Promise.resolve(requestFullscreenFn.call(element));
-          return true;
-        } catch (err) {
-          const error = err as Error;
-          console.error(`Error attempting to enable full-screen mode: ${error.message} (${error.name})`);
-          return false;
-        }
-      };
-
-      let hasEnteredFullscreen = false;
-
-      for (const target of [playerElement, videoElement]) {
-        if (!target) continue;
-
-        if (await tryRequestFullscreen(target)) {
-          hasEnteredFullscreen = true;
-          break;
-        }
-      }
-
-      if (!hasEnteredFullscreen && typeof videoElement.webkitEnterFullscreen === 'function') {
-        try {
-          videoElement.webkitEnterFullscreen();
-          hasEnteredFullscreen = true;
-        } catch (err) {
-          const error = err as Error;
-          console.error(`Error attempting to enable iOS full-screen mode: ${error.message} (${error.name})`);
-        }
-      }
-
-      if (!hasEnteredFullscreen) {
-        console.warn('Fullscreen API not available on this device.');
-      }
-    } else {
-      if (typeof doc.exitFullscreen === 'function') {
-        try {
-          await doc.exitFullscreen();
-        } catch (err) {
-          const error = err as Error;
-          console.error(`Error attempting to exit full-screen mode: ${error.message} (${error.name})`);
-        }
-      }
-
-      if (typeof doc.webkitExitFullscreen === 'function') {
-        try {
-          await Promise.resolve(doc.webkitExitFullscreen());
-        } catch (err) {
-          const error = err as Error;
-          console.error(`Error attempting to exit webkit full-screen mode: ${error.message} (${error.name})`);
-        }
-      }
-
-      if (typeof videoElement.webkitExitFullscreen === 'function') {
-        try {
-          videoElement.webkitExitFullscreen();
-        } catch (err) {
-          const error = err as Error;
-          console.error(`Error attempting to exit iOS full-screen mode: ${error.message} (${error.name})`);
-        }
-      }
+    if (isFullscreenNow) {
+      await exitPlayerFullscreen(videoElement);
+      return;
     }
+
+    // `fullscreenTarget === 'page'` vise le conteneur racine de l'application
+    // plutôt que le conteneur du lecteur. C'est ce qui permet au plein écran de
+    // tenir d'un épisode à l'autre : le lecteur est remonté à chaque changement
+    // d'épisode ou de source, l'élément racine non. Sans ça, sa destruction
+    // ferait sortir du plein écran, et le rétablir demanderait une nouvelle
+    // activation utilisateur — ce que Firefox refuse hors d'un vrai geste.
+    await enterPlayerFullscreen({
+      container: playerElement,
+      video: videoElement,
+      useHost: fullscreenTarget === 'page',
+    });
   };
 
   useEffect(() => {
-    const handleFullscreenChange = () => {
+    const syncFullscreenState = () => {
       const video = videoRef.current as HTMLVideoElementWithWebkit | null;
-      const doc = document as Document & { webkitFullscreenElement?: Element | null };
-      setIsFullscreen(
-        Boolean(doc.fullscreenElement || doc.webkitFullscreenElement || (video && video.webkitDisplayingFullscreen)),
+      const nowFullscreen = Boolean(
+        getFullscreenElement() || (video && video.webkitDisplayingFullscreen),
       );
+
+      setIsFullscreen(nowFullscreen);
+      setIsPageFullscreen(fullscreenTarget === 'page' && isHostFullscreenActive());
+
+      if (nowFullscreen && !wasFullscreenRef.current) {
+        // À l'entrée en plein écran, l'interface s'efface d'elle-même. Le
+        // masquage automatique existant est déclenché par la souris ; sur une
+        // télé ou une box il n'y en a pas, et la barre de lecture restait
+        // affichée jusqu'à ce qu'on clique exprès pour s'en débarrasser.
+        fullscreenSettleUntilRef.current = Date.now() + FULLSCREEN_SETTLE_MS;
+        hidePlayerChrome();
+      } else if (!nowFullscreen && wasFullscreenRef.current) {
+        // En sortant, on rend l'interface : sans geste pour la rappeler, le
+        // lecteur fenêtré resterait nu.
+        setShowControls(true);
+      }
+
+      wasFullscreenRef.current = nowFullscreen;
     };
 
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+    // Au montage aussi : le plein écran peut déjà être en cours (changement
+    // d'épisode ou de source), et l'interface doit alors s'effacer pareil.
+    syncFullscreenState();
+
+    document.addEventListener('fullscreenchange', syncFullscreenState);
+    document.addEventListener('webkitfullscreenchange', syncFullscreenState);
 
     return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
+      document.removeEventListener('fullscreenchange', syncFullscreenState);
+      document.removeEventListener('webkitfullscreenchange', syncFullscreenState);
     };
-  }, []);
+  }, [fullscreenTarget, hidePlayerChrome]);
+
+  // L'escamotage automatique de la barre n'est armé que par un mouvement de
+  // souris ou un clic sur la vidéo. Sans l'un ni l'autre — télé, box,
+  // télécommande — il ne l'est jamais, et la barre reste posée sur le film. En
+  // plein écran on l'arme donc nous-mêmes dès que rien d'autre ne l'a fait, ce
+  // qui rattrape aussi tout ce qui rallumerait l'interface juste après le
+  // basculement.
+  useEffect(() => {
+    if (!isFullscreen || !showControls || !isPlaying || isLocked) return;
+    // Un panneau ouvert, c'est une lecture en cours : on ne le referme pas au
+    // nez de l'utilisateur.
+    if (
+      showSettings || showCastMenu || showVolumeSlider
+      || showInternalEpisodesMenu || showStreamInfo || showShortcutsHelp
+    ) return;
+    // Les animations +10/-10 doivent rester visibles jusqu'au bout.
+    if (
+      showForwardAnimation || showRewindAnimation
+      || showLeftTapAnimation || showRightTapAnimation
+    ) return;
+    // Un escamotage est déjà programmé (souris, clic) : il fait le travail.
+    if (controlsTimeoutRef.current) return;
+
+    controlsTimeoutRef.current = setTimeout(() => {
+      controlsTimeoutRef.current = undefined;
+      setShowControls(false);
+      setShowVolumeSlider(false);
+    }, FULLSCREEN_IDLE_HIDE_MS);
+
+    const armed = controlsTimeoutRef.current;
+    return () => {
+      clearTimeout(armed);
+      // Ne pas effacer la référence si un autre minuteur a pris la place.
+      if (controlsTimeoutRef.current === armed) controlsTimeoutRef.current = undefined;
+    };
+  }, [
+    isFullscreen, showControls, isPlaying, isLocked,
+    showSettings, showCastMenu, showVolumeSlider,
+    showInternalEpisodesMenu, showStreamInfo, showShortcutsHelp,
+    showForwardAnimation, showRewindAnimation, showLeftTapAnimation, showRightTapAnimation,
+  ]);
 
   // Add state for PiP error message display
   const [pipError, setPipError] = useState<string | null>(null);
@@ -5674,7 +5845,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     if (cues.length === 0) return;
 
     const blobUrl = URL.createObjectURL(new Blob([
-      cuesToWebVtt(cues, subtitleStyle.delay),
+      cuesToWebVtt(cues, subtitlePreferences.delay),
     ], { type: 'text/vtt;charset=utf-8' }));
     const trackElement = document.createElement('track');
     trackElement.kind = 'subtitles';
@@ -5716,7 +5887,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [
     activeTranslatedSubtitleId,
     cleanupPipSubtitleTrack,
-    subtitleStyle.delay,
+    subtitlePreferences.delay,
     translatedSubtitleHistory,
   ]);
 
@@ -6050,7 +6221,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         label: `${entry.sourceLabel} → ${entry.targetLanguage.toUpperCase()}`,
         language: entry.targetLanguage,
         active: activeTranslatedSubtitleId === entry.id,
-        vtt: cuesToWebVtt(entry.cues, subtitleStyle.delay),
+        vtt: cuesToWebVtt(entry.cues, subtitlePreferences.delay),
       });
     }
 
@@ -6106,7 +6277,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           label: textTrack.label || textTrack.language || `Sous-titres ${index + 1}`,
           language: normalizeSubtitleLanguageCode(textTrack.language, textTrack.label),
           active: textTrack === activeTextTrack,
-          vtt: cuesToWebVtt(cues, subtitleStyle.delay),
+          vtt: cuesToWebVtt(cues, subtitlePreferences.delay),
         });
       }
     }
@@ -6122,20 +6293,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         active: hlsRef.current?.subtitleTrack === index && !activeTranslatedSubtitleId,
         url: castSubtitleSource.url,
         contentType: castSubtitleSource.contentType,
-      });
-    }
-
-    for (const [index, caption] of rivestreamCaptions.entries()) {
-      if (!caption.file || elementLabels.has(caption.label.trim().toLowerCase())) continue;
-      candidates.push({
-        id: `rivestream:${index}:${caption.file}`,
-        label: caption.label || `Sous-titres ${index + 1}`,
-        language: normalizeSubtitleLanguageCode(undefined, caption.label),
-        active: currentSubtitle === `rivestream:${index}`,
-        url: caption.file,
-        contentType: /\.srt(?:$|[?#])/i.test(caption.file)
-          ? 'application/x-subrip'
-          : 'text/vtt',
       });
     }
 
@@ -6169,9 +6326,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [
     activeTranslatedSubtitleId,
     currentSubtitle,
-    preparedKisskhSubtitles,
-    rivestreamCaptions,
-    subtitleStyle.delay,
+    preparedKisskhSubtitles,    subtitlePreferences.delay,
     subtitleUrl,
     t,
     translatedSubtitleHistory,
@@ -6569,40 +6724,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       document.removeEventListener('mouseup', handleMouseUp);
     };
   }, [isCastDragging, castDuration, handleCastProgressDragMove, handleCastProgressDragEnd]);
-
-  // Native listener binding for pointer & mouse movement to ensure controls wake up
-  // across all platforms (including Firefox on Linux Wayland)
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    const onUserPointerActivity = (e: Event) => {
-      handleMouseMove(e);
-    };
-
-    const events = ['pointermove', 'mousemove', 'pointerenter', 'mouseenter'];
-
-    events.forEach(eventName => {
-      container.addEventListener(eventName, onUserPointerActivity, { passive: true });
-    });
-
-    const handleDocumentPointerMove = (e: Event) => {
-      if (document.fullscreenElement || container.contains(e.target as Node)) {
-        onUserPointerActivity(e);
-      }
-    };
-
-    document.addEventListener('pointermove', handleDocumentPointerMove, { passive: true });
-    document.addEventListener('mousemove', handleDocumentPointerMove, { passive: true });
-
-    return () => {
-      events.forEach(eventName => {
-        container.removeEventListener(eventName, onUserPointerActivity);
-      });
-      document.removeEventListener('pointermove', handleDocumentPointerMove);
-      document.removeEventListener('mousemove', handleDocumentPointerMove);
-    };
-  }, [handleMouseMove]);
 
   // Add event listener for PIP changes initiated outside our button
   useEffect(() => {
@@ -7011,6 +7132,32 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       'ca': { name: t('languages.ca'), countryCode: 'ES' },
       'ga': { name: t('languages.ga'), countryCode: 'IE' },
       'cy': { name: t('languages.cy'), countryCode: 'GB' },
+      // Langues remontees par les sources de sous-titres externes et absentes
+      // de la table d'origine : sans elles, le filtre affichait le code brut
+      // ("sq (2)", "ta (2)") avec un globe a la place du drapeau.
+      'sq': { name: t('languages.sq'), countryCode: 'AL' },
+      'bs': { name: t('languages.bs'), countryCode: 'BA' },
+      'mk': { name: t('languages.mk'), countryCode: 'MK' },
+      'is': { name: t('languages.is'), countryCode: 'IS' },
+      'nb': { name: t('languages.nb'), countryCode: 'NO' },
+      'af': { name: t('languages.af'), countryCode: 'ZA' },
+      'am': { name: t('languages.am'), countryCode: 'ET' },
+      'om': { name: t('languages.om'), countryCode: 'ET' },
+      'fa': { name: t('languages.fa'), countryCode: 'IR' },
+      'ur': { name: t('languages.ur'), countryCode: 'PK' },
+      'bn': { name: t('languages.bn'), countryCode: 'BD' },
+      'ta': { name: t('languages.ta'), countryCode: 'IN' },
+      'te': { name: t('languages.te'), countryCode: 'IN' },
+      'ml': { name: t('languages.ml'), countryCode: 'IN' },
+      'si': { name: t('languages.si'), countryCode: 'LK' },
+      // Pas de drapeau : langue sans Etat associe, ou codes propres a
+      // OpenSubtitles qui designent une variante plutot qu'un pays.
+      'ku': { name: t('languages.ku') },
+      'ae': { name: t('languages.ae') },
+      'ea': { name: t('languages.ea') },
+      'ze': { name: t('languages.ze') },
+      'pb': { name: t('languages.pb'), countryCode: 'BR' },
+      'zt': { name: t('languages.zt'), countryCode: 'TW' },
       'unknown': { name: t('common.unknown', 'Unknown') }
     };
     const normalizedCode = normalizeSubtitleLanguageCode(code);
@@ -7065,36 +7212,36 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     localStorage.setItem('playerSaveProgressPref', JSON.stringify(saveProgressEnabled));
   }, [saveProgressEnabled]);
 
-  // States for next content threshold configuration
-  const [nextContentThresholdMode, setNextContentThresholdMode] = useState<'percentage' | 'timeBeforeEnd'>(() => {
-    const savedMode = localStorage.getItem('playerNextContentThresholdMode');
-    if (savedMode) return savedMode as 'percentage' | 'timeBeforeEnd';
-
-    // Initialize from prop if it's an object with mode
-    if (typeof nextContentThreshold === 'object' && 'mode' in nextContentThreshold) {
-      return nextContentThreshold.mode;
-    }
-    return 'percentage'; // Default
-  });
-
-  const [nextContentThresholdValue, setNextContentThresholdValue] = useState<number>(() => {
-    const savedValue = localStorage.getItem('playerNextContentThresholdValue');
-    if (savedValue) return parseFloat(savedValue);
-
-    // Initialize from prop
+  // Réglages de la proposition « À suivre » (déclencheur, forme, décompte).
+  // Le prop `nextContentThreshold` ne sert plus que de valeur initiale, et
+  // seulement tant que l'utilisateur n'a rien réglé lui-même : ses préférences
+  // sont synchronisées entre appareils, elles ne doivent pas être écrasées par
+  // le défaut d'une page.
+  const [nextPrefs, setNextPrefs] = useState<NextContentPrefs>(() => {
+    const stored = getNextContentPrefs();
+    if (hasStoredNextContentPrefs()) return stored;
     if (typeof nextContentThreshold === 'number') {
-      return nextContentThreshold;
-    } else if (typeof nextContentThreshold === 'object' && 'value' in nextContentThreshold) {
-      return nextContentThreshold.value;
+      return { ...stored, trigger: 'threshold', thresholdMode: 'percentage', percentage: nextContentThreshold };
     }
-    return 95; // Default
+    if (nextContentThreshold && typeof nextContentThreshold === 'object') {
+      return nextContentThreshold.mode === 'timeBeforeEnd'
+        ? { ...stored, trigger: 'threshold', thresholdMode: 'timeBeforeEnd', timeBeforeEnd: nextContentThreshold.value }
+        : { ...stored, trigger: 'threshold', thresholdMode: 'percentage', percentage: nextContentThreshold.value };
+    }
+    return stored;
   });
 
-  // Effect to save threshold preferences to localStorage
+  // Le panneau de réglages écrit directement dans localStorage : on se recale
+  // sur l'événement plutôt que de faire redescendre un setter par props.
   useEffect(() => {
-    localStorage.setItem('playerNextContentThresholdMode', nextContentThresholdMode);
-    localStorage.setItem('playerNextContentThresholdValue', nextContentThresholdValue.toString());
-  }, [nextContentThresholdMode, nextContentThresholdValue]);
+    const handleChange = () => setNextPrefs(getNextContentPrefs());
+    window.addEventListener(NEXT_CONTENT_PREFS_CHANGE_EVENT, handleChange);
+    return () => window.removeEventListener(NEXT_CONTENT_PREFS_CHANGE_EVENT, handleChange);
+  }, []);
+
+  const updateNextPrefs = useCallback((patch: Partial<NextContentPrefs>) => {
+    setNextPrefs(setNextContentPrefs(patch));
+  }, []);
 
   // Update saveProgress function
   const saveProgress = useCallback(() => {
@@ -7222,24 +7369,36 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     };
   }, [saveProgress]);
 
-  // Helper function to determine if next content popup should be shown
+  /**
+   * Début du générique de fin, et état de chargement des bases de séquences.
+   *
+   * Passe par un ref parce que `useMediaSegments` est appelé plus bas dans le
+   * composant (il dépend d'états déclarés après celui-ci) : un effet placé
+   * après le hook y dépose le résultat, et `handleTimeUpdate` le lit sans
+   * dépendre de l'ordre des déclarations.
+   */
+  const outroTriggerRef = useRef<{ start: number | null; loading: boolean }>({ start: null, loading: false });
+
+  /**
+   * Faut-il proposer la suite maintenant ?
+   *
+   * Sur `trigger === 'segment'`, c'est le début du générique qui commande.
+   * Quand aucun n'est connu pour ce contenu, on retombe sur le seuil réglé —
+   * pas sur un défaut arbitraire : le mode pourcentage / temps avant la fin
+   * reste celui que l'utilisateur a choisi.
+   */
   const shouldShowNextContent = (currentTime: number, duration: number): boolean => {
     if (!duration || duration === 0) return false;
 
-    const progress = (currentTime / duration) * 100;
-    const remaining = duration - currentTime;
-
-    // Use internal states instead of prop
-    if (nextContentThresholdMode === 'percentage') {
-      return progress >= nextContentThresholdValue;
+    if (nextPrefs.trigger === 'segment') {
+      const { start, loading } = outroTriggerRef.current;
+      if (start !== null) return currentTime >= start;
+      // Tant que les bases répondent, on ne déclenche pas le repli : sinon le
+      // seuil passerait devant un générique qui arrive une seconde plus tard.
+      if (loading) return false;
     }
 
-    // Handle timeBeforeEnd mode
-    if (nextContentThresholdMode === 'timeBeforeEnd') {
-      return remaining <= nextContentThresholdValue;
-    }
-
-    return false;
+    return isThresholdReached(nextPrefs, currentTime, duration);
   };
 
   const handleTimeUpdate = (e: any) => {
@@ -7253,8 +7412,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       saveProgress();
     }
 
-    // Afficher le film suivant ou l'épisode suivant selon le seuil configuré
-    if (shouldShowNextContent(player.currentTime, player.duration)) {
+    // Afficher le film suivant ou l'épisode suivant selon le seuil configuré.
+    // Le studio suspend la proposition : elle recouvre le panneau de relevé et
+    // arme la passation automatique au moment précis où l'on travaille dessus.
+    if (!studioOpenRef.current && shouldShowNextContent(player.currentTime, player.duration)) {
       if (nextMovie && !showNextMovieOverlay && !hasIgnored) {
         setShowNextMovieOverlay(true);
       } else if (nextEpisode && !showNextEpisodeOverlay && !hasDeclinedNextEpisode && autoNextEpisodeEnabled) {
@@ -7349,6 +7510,676 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   }, [autoPlay]);
 
+  /**
+   * Playlist du niveau réellement exploitable.
+   *
+   * `hls.currentLevel` vaut -1 tant que la qualité est en automatique et
+   * qu'aucun niveau n'a encore été arrêté : `hls.levels[-1]` est `undefined`,
+   * et tout ce qui en dépend échoue silencieusement. On retombe donc sur le
+   * niveau en cours de chargement, puis sur le premier, puis sur n'importe
+   * quel niveau dont la playlist est déjà connue.
+   */
+  const getActiveLevelDetails = useCallback(() => {
+    const hls = hlsRef.current;
+    if (!hls) return null;
+    for (const index of [hls.currentLevel, hls.loadLevel, hls.firstLevel]) {
+      const details = index >= 0 ? hls.levels[index]?.details : undefined;
+      if (details?.fragments?.length) return details;
+    }
+    return hls.levels.find(level => level?.details?.fragments?.length)?.details ?? null;
+  }, []);
+
+  // Préférences d'animation : mode léger, appareil modeste ou
+  // `prefers-reduced-motion` coupent les transitions et le flou.
+  const { effectivePrefs: animationPrefs } = useLightMode();
+
+  // ==========================================================================
+  // Saut d'intro / résumé / outro / crédits / aperçu
+  //
+  // Placé ici (et pas plus haut) parce que le bloc dépend de `showOsd`,
+  // `handleReplay` et des états de popup, et qu'il doit rester AVANT le
+  // `useEffect` des raccourcis clavier qui référencera `confirmActivePrompt`.
+  // ==========================================================================
+
+  // La lecture a-t-elle réellement démarré ? Conditionne l'appel aux bases de
+  // segments (réglage `deferLoading`) : rien ne doit se disputer la bande
+  // passante avec le manifeste HLS et les premiers fragments, et le lecteur ne
+  // doit jamais attendre une réponse d'API pour démarrer.
+  const [playbackStarted, setPlaybackStarted] = useState(false);
+  useEffect(() => {
+    if (isPlaying) setPlaybackStarted(true);
+  }, [isPlaying]);
+  useEffect(() => {
+    setPlaybackStarted(false);
+  }, [src]);
+
+  const {
+    segments: mediaSegments,
+    activeSegment: activeMediaSegment,
+    activeMode: activeSegmentMode,
+    promptVisible: skipPromptEligible,
+    settings: skipSettings,
+    providerStatus: segmentProviderStatus,
+    providerDetail: segmentProviderDetail,
+    community: rawCommunitySubmissions,
+    adoptionScore,
+    canContribute,
+    voteWeight,
+    imdbId: segmentImdbId,
+    malId: segmentMalId,
+    target: segmentTarget,
+    refresh: refreshSegments,
+    loading: segmentsLoading,
+  } = useMediaSegments({
+    tvShowId,
+    movieId,
+    seasonNumber,
+    episodeNumber,
+    duration,
+    currentTime,
+    playbackStarted,
+    // Un invité de watch party ne pilote pas la lecture : lui proposer un saut
+    // désynchroniserait la salle.
+    enabled: !isWatchPartyGuest,
+  });
+
+  /**
+   * Alimente le déclencheur « au générique » de la proposition « À suivre ».
+   *
+   * On prend la borne de départ la plus tôt entre `outro` et `credits` : les
+   * deux désignent la même chose selon les bases, et la plus précoce est celle
+   * où l'épisode est réellement fini.
+   *
+   * Note : `mediaSegments` est déjà filtré par les réglages de saut. Couper le
+   * type « générique » là-bas prive donc aussi ce déclencheur — le panneau de
+   * réglages le signale plutôt que de laisser la bascule sans effet visible.
+   */
+  useEffect(() => {
+    let earliest: number | null = null;
+    for (const segment of mediaSegments) {
+      if (segment.type !== 'outro' && segment.type !== 'credits') continue;
+      if (earliest === null || segment.start < earliest) earliest = segment.start;
+    }
+    outroTriggerRef.current = { start: earliest, loading: segmentsLoading };
+  }, [mediaSegments, segmentsLoading]);
+
+  // Les réglages de saut sont écrits directement dans localStorage : l'écriture
+  // émet `SKIP_PREFS_CHANGE_EVENT`, que `useMediaSegments` écoute déjà. Pas
+  // d'état dupliqué ici, donc pas de risque de divergence.
+  const handleSkipSettingsChange = useCallback((patch: Partial<SkipSegmentSettings>) => {
+    skipSegmentPrefs.setSkipSettings(patch);
+  }, []);
+
+  const handleSegmentTypeChange = useCallback(
+    (kind: SegmentKind, patch: Partial<SegmentTypeSettings>) => {
+      skipSegmentPrefs.setSegmentTypeSettings(kind, patch);
+    },
+    [],
+  );
+
+  const handleSegmentColorChange = useCallback((kind: SegmentKind, hex: string) => {
+    skipSegmentPrefs.setSegmentColor(kind, hex);
+  }, []);
+
+  const handleProviderToggle = useCallback((id: ProviderId, enabled: boolean) => {
+    skipSegmentPrefs.setProviderEnabled(id, enabled);
+  }, []);
+
+  const handleProviderReorder = useCallback((order: ProviderId[]) => {
+    skipSegmentPrefs.setSkipSettings({ providerOrder: order });
+  }, []);
+
+  const handleSkipSettingsReset = useCallback(() => {
+    skipSegmentPrefs.resetSkipSettings();
+  }, []);
+
+  // ==========================================================================
+  // Contributions de la communauté : studio de repérage et vote
+  // ==========================================================================
+  const [studioOpen, setStudioOpen] = useState(false);
+  // Miroir lisible depuis les gestionnaires déclarés plus haut. Voir
+  // `studioOpenRef` pour ce qu'il suspend.
+  studioOpenRef.current = studioOpen;
+  const [votingBusy, setVotingBusy] = useState(false);
+  const [voteError, setVoteError] = useState<string | null>(null);
+  /**
+   * Résultat des votes de cette session, appliqué par-dessus la liste du
+   * serveur. Le serveur renvoie la proposition à jour dans sa réponse : la
+   * poser ici met le score à jour immédiatement, sans redemander les segments
+   * — donc sans relancer les quatre sources externes à chaque clic.
+   * `null` signifie « supprimée par ce vote ».
+   */
+  const [voteOverrides, setVoteOverrides] = useState<Record<string, CommunitySubmission | null>>({});
+  // Propositions dont l'utilisateur a fermé la carte de vote : on ne la
+  // repropose pas pour celle-là, sans couper la fonctionnalité pour autant.
+  const [dismissedVotes, setDismissedVotes] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    setStudioOpen(false);
+    setDismissedVotes(new Set());
+    setVoteOverrides({});
+    setVoteError(null);
+  }, [src, seasonNumber, episodeNumber]);
+
+  const communitySubmissions = useMemo(() => {
+    if (Object.keys(voteOverrides).length === 0) return rawCommunitySubmissions;
+    return rawCommunitySubmissions
+      .map(submission => (submission.id in voteOverrides ? voteOverrides[submission.id] : submission))
+      .filter((submission): submission is CommunitySubmission => submission !== null);
+  }, [rawCommunitySubmissions, voteOverrides]);
+
+  const seekToSeconds = useCallback((seconds: number) => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(seconds)) return;
+    const limit = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seconds;
+    const target = Math.max(0, Math.min(seconds, limit));
+    video.currentTime = target;
+    setCurrentTime(target);
+  }, []);
+
+  /**
+   * Séquences déjà connues, pour que le studio empêche d'en superposer deux.
+   *
+   * Les deux origines sont réunies : le consensus des bases (qui contient déjà
+   * les propositions adoptées, via le fournisseur `movix`) et les propositions
+   * encore en attente de voix. Le studio ignore de lui-même celles du type en
+   * cours d'édition — deux relevés d'intro qui se recouvrent, c'est ce que le
+   * vote sert à départager.
+   */
+  const studioKnownRanges = useMemo<KnownRange[]>(() => {
+    const ranges: KnownRange[] = mediaSegments.map(segment => ({
+      type: segment.type,
+      startMs: Math.round(segment.start * 1000),
+      endMs: Math.round(segment.end * 1000),
+    }));
+    for (const submission of communitySubmissions) {
+      if (submission.adopted) continue; // déjà présent via le consensus
+      ranges.push({ type: submission.type, startMs: submission.startMs, endMs: submission.endMs });
+    }
+    return ranges;
+  }, [mediaSegments, communitySubmissions]);
+
+  const handleStudioSubmit = useCallback(async (input: {
+    segmentType: SegmentKind; startMs: number; endMs: number;
+  }) => {
+    if (!segmentTarget || !(duration > 0)) return;
+    await submitCommunitySegment({
+      mediaType: segmentTarget.mediaType,
+      tmdbId: segmentTarget.tmdbId,
+      season: segmentTarget.season,
+      episode: segmentTarget.episode,
+      segmentType: input.segmentType,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      // La durée de référence est celle du flux réellement joué : c'est elle
+      // qui permettra de rejeter le relevé sur un autre encodage.
+      durationMs: Math.round(duration * 1000),
+    });
+    refreshSegments();
+  }, [segmentTarget, duration, refreshSegments]);
+
+  const handleStudioDelete = useCallback(async (submissionId: string) => {
+    await deleteCommunitySegment(submissionId);
+    refreshSegments();
+  }, [refreshSegments]);
+
+  /**
+   * Proposition non adoptée qui couvre la position courante.
+   *
+   * Une proposition adoptée n'apparaît pas ici : elle est devenue un vrai saut
+   * et c'est `SkipSegmentPrompt` qui la porte.
+   */
+  const votableSubmission = useMemo((): CommunitySubmission | null => {
+    if (!skipSettings.showCommunityProposals) return null;
+    if (!skipSettings.showMarkers && skipSettings.mode === 'off') return null;
+    if (!Number.isFinite(currentTime)) return null;
+    // Volontairement AUCUN filtre sur la séquence active : une proposition
+    // recouvre presque toujours une séquence déjà connue des bases externes
+    // (proposer une intro sur un épisode que SkipDB connaît est le cas
+    // courant), et l'écarter pour ça revenait à ne plus jamais proposer de
+    // vote. Le conflit d'affichage avec le bouton « Passer » est réglé au
+    // rendu, par `skipPromptVisible ? null : votableSubmission` : les deux
+    // cartes occupent la même place, jamais en même temps.
+    const currentMs = currentTime * 1000;
+    return communitySubmissions.find(submission =>
+      !submission.adopted
+      && !dismissedVotes.has(submission.id)
+      && currentMs >= submission.startMs
+      && currentMs < submission.endMs,
+    ) ?? null;
+  }, [
+    communitySubmissions, currentTime, dismissedVotes,
+    skipSettings.mode, skipSettings.showMarkers, skipSettings.showCommunityProposals,
+  ]);
+
+  const handleVote = useCallback(async (value: 1 | -1) => {
+    if (!votableSubmission || votingBusy) return;
+    setVoteError(null);
+    setVotingBusy(true);
+    try {
+      // Revoter la même valeur retire son vote : c'est le comportement attendu
+      // d'un bouton qui reste allumé une fois cliqué.
+      const next = votableSubmission.myVote === value ? 0 : value;
+      const result = await voteCommunitySegment(votableSubmission.id, next);
+
+      setVoteOverrides(previous => ({
+        ...previous,
+        [votableSubmission.id]: result.deleted ? null : result.submission,
+      }));
+
+      // Seule une adoption ou une suppression change ce que le lecteur doit
+      // faire : dans ces deux cas seulement, on redemande le consensus.
+      if (result.deleted || result.submission?.adopted !== votableSubmission.adopted) {
+        refreshSegments();
+      }
+    } catch (error) {
+      // Un échec silencieux est indiscernable d'un bouton mort : on affiche.
+      setVoteError(extractCommunityErrorCode(error));
+    } finally {
+      setVotingBusy(false);
+    }
+  }, [votableSubmission, votingBusy, refreshSegments]);
+
+  /**
+   * Signale la proposition affichée à la modération.
+   *
+   * Volontairement sans effet sur la liste : un signalement n'est pas un vote,
+   * il n'enlève rien tout de suite. La carte affiche sa propre confirmation, et
+   * la proposition reste visible jusqu'à ce qu'un modérateur tranche.
+   */
+  const handleReportSubmission = useCallback(async (reason: SegmentReportReason) => {
+    if (!votableSubmission) return;
+    await reportCommunitySegment(votableSubmission.id, reason);
+  }, [votableSubmission]);
+
+  const dismissVote = useCallback(() => {
+    setVoteError(null);
+    if (!votableSubmission) return;
+    setDismissedVotes((previous) => {
+      const next = new Set(previous);
+      next.add(votableSubmission.id);
+      return next;
+    });
+  }, [votableSubmission]);
+
+  const openStudio = useCallback(() => {
+    setShowSettings(false);
+    setStudioOpen(true);
+  }, []);
+
+  /** Bascule du bouton ciseaux de la barre de contrôle. */
+  const toggleStudio = useCallback(() => {
+    setShowSettings(false);
+    setStudioOpen(previous => !previous);
+  }, []);
+
+  /**
+   * Le bouton ciseaux a-t-il lieu d'être ?
+   *
+   * Trois conditions, toutes nécessaires pour que le studio serve à quelque
+   * chose : une session connectée (sinon le dépôt est refusé), un contenu
+   * identifié (sinon la proposition n'a pas de cible) et une durée connue
+   * (c'est la référence qui valide le relevé). Un invité de watch party ne
+   * pilote pas la lecture : le studio déplacerait la salle entière.
+   */
+  const studioButtonVisible = Boolean(
+    canContribute && segmentTarget && duration > 0 && !isWatchPartyGuest,
+  );
+
+  /** Identifie un segment de façon stable entre deux rendus. */
+  const segmentKey = (segment: MediaSegment) => `${segment.type}:${segment.start.toFixed(2)}`;
+
+  // Segments déjà sautés automatiquement, pour ne pas re-sauter quand
+  // l'utilisateur revient volontairement en arrière dans l'intro.
+  const autoSkippedSegmentsRef = useRef<Set<string>>(new Set());
+  // Segments dont l'utilisateur a fermé la proposition : on ne la repropose pas
+  // pour celui-là, mais on n'éteint pas la fonctionnalité pour autant.
+  const [dismissedSegments, setDismissedSegments] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    autoSkippedSegmentsRef.current.clear();
+    prefetchedSegmentsRef.current.clear();
+    setDismissedSegments(new Set());
+  }, [src, seasonNumber, episodeNumber]);
+
+  // Séquence en cours de saut, pour le voile de transition. `null` le reste du
+  // temps. On ne stocke que le type : la couleur est relue au rendu depuis les
+  // réglages, ce qui évite d'ajouter une dépendance à `performSegmentSkip`.
+  const [skippingKind, setSkippingKind] = useState<SegmentKind | null>(null);
+  const skipSeekTimerRef = useRef<number | null>(null);
+  const audioFadeFrameRef = useRef<number | null>(null);
+  // Volume d'avant le fondu, à restituer une fois l'image revenue.
+  const volumeBeforeFadeRef = useRef<number | null>(null);
+
+  /**
+   * Rampe le volume de l'élément vidéo, sans toucher à l'état React ni au
+   * volume enregistré : c'est un fondu de transition, pas un réglage.
+   *
+   * On agit sur `video.volume` et non sur le graphe Web Audio de l'égaliseur :
+   * le volume de l'élément s'applique en amont du `MediaElementAudioSourceNode`,
+   * donc le fondu fonctionne que l'amplificateur soit actif ou non.
+   */
+  const rampVideoVolume = useCallback((to: number, durationMs: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (audioFadeFrameRef.current !== null) cancelAnimationFrame(audioFadeFrameRef.current);
+
+    const from = video.volume;
+    if (durationMs <= 0 || from === to) {
+      video.volume = Math.min(1, Math.max(0, to));
+      return;
+    }
+
+    const startedAt = performance.now();
+    let lastWritten = from;
+
+    const step = (now: number) => {
+      const current = videoRef.current;
+      if (!current) {
+        audioFadeFrameRef.current = null;
+        return;
+      }
+      // Le volume a bougé sans nous : l'utilisateur a touché au curseur, aux
+      // flèches ou à la sourdine pendant le fondu. On lui laisse la main et on
+      // oublie le volume à restituer, sinon on écraserait son choix.
+      if (Math.abs(current.volume - lastWritten) > 0.001) {
+        audioFadeFrameRef.current = null;
+        volumeBeforeFadeRef.current = null;
+        return;
+      }
+
+      const progress = Math.min(1, (now - startedAt) / durationMs);
+      // Même courbe que le voile, pour que le silence et le noir arrivent
+      // ensemble plutôt qu'à quelques dizaines de millisecondes d'écart.
+      const eased = progress < 0.5
+        ? 2 * progress * progress
+        : 1 - ((-2 * progress + 2) ** 2) / 2;
+      lastWritten = Math.min(1, Math.max(0, from + (to - from) * eased));
+      current.volume = lastWritten;
+      audioFadeFrameRef.current = progress < 1 ? requestAnimationFrame(step) : null;
+    };
+    audioFadeFrameRef.current = requestAnimationFrame(step);
+  }, []);
+
+  const performSegmentSkip = useCallback((segment: MediaSegment) => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(segment.end)) return;
+    const limit = Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration - 0.25
+      : segment.end;
+    const target = Math.max(0, Math.min(segment.end, limit));
+
+    // Le voile part AVANT le seek : c'est lui qui masque la coupe, et
+    // accessoirement la mise en tampon si l'arrivée n'est pas encore chargée.
+    setSkippingKind(segment.type);
+
+    const animated = animationPrefs.transitions;
+    if (animated) {
+      // Le son descend sur la même durée que l'image. Le volume de départ
+      // n'est mémorisé qu'au premier fondu : deux sauts enchaînés ne doivent
+      // pas enregistrer 0 comme volume à restituer.
+      if (volumeBeforeFadeRef.current === null) volumeBeforeFadeRef.current = video.volume;
+      rampVideoVolume(0, SKIP_FADE_IN_MS);
+    }
+
+    const seek = () => {
+      skipSeekTimerRef.current = null;
+      // L'événement `seeked` natif déclenché ici est celui qu'écoute déjà la
+      // synchro watch party : rien de spécifique à propager en plus.
+      video.currentTime = target;
+      setCurrentTime(target);
+    };
+
+    if (skipSeekTimerRef.current !== null) window.clearTimeout(skipSeekTimerRef.current);
+    if (!animated) {
+      seek();
+      return;
+    }
+    // Le saut a lieu une fois l'écran effectivement noir : sauter pendant le
+    // fondu laisserait voir la coupe à travers le voile encore translucide.
+    skipSeekTimerRef.current = window.setTimeout(seek, SKIP_FADE_IN_MS);
+  }, [animationPrefs.transitions, rampVideoVolume]);
+
+  // Lève le voile quand l'image de destination est réellement là.
+  useEffect(() => {
+    if (!skippingKind) return;
+    const video = videoRef.current;
+    let settleTimer: number | undefined;
+
+    const reveal = () => {
+      setSkippingKind(null);
+      // Le son remonte pendant que l'image réapparaît.
+      if (volumeBeforeFadeRef.current !== null) {
+        rampVideoVolume(volumeBeforeFadeRef.current, SKIP_FADE_OUT_MS);
+        volumeBeforeFadeRef.current = null;
+      }
+    };
+
+    const settle = () => {
+      window.clearTimeout(settleTimer);
+      // `seeked` se déclenche dès que la position est atteinte, pas quand la
+      // frame est peinte : sans cette attente on redécouvre une image vide.
+      // Elle garantit aussi un temps de noir franc plutôt qu'un clignotement.
+      settleTimer = window.setTimeout(reveal, 320);
+    };
+
+    video?.addEventListener('seeked', settle);
+    video?.addEventListener('playing', settle);
+    // Filet de sécurité : un flux qui ne repart pas ne doit pas laisser
+    // l'écran noir — ni le son coupé — indéfiniment.
+    const cap = window.setTimeout(reveal, 2200);
+
+    return () => {
+      window.clearTimeout(settleTimer);
+      window.clearTimeout(cap);
+      video?.removeEventListener('seeked', settle);
+      video?.removeEventListener('playing', settle);
+    };
+  }, [skippingKind, rampVideoVolume]);
+
+  // Démontage en plein fondu : le volume doit être rendu, sinon l'utilisateur
+  // retrouve un lecteur muet sans comprendre pourquoi.
+  useEffect(() => () => {
+    if (audioFadeFrameRef.current !== null) cancelAnimationFrame(audioFadeFrameRef.current);
+    if (skipSeekTimerRef.current !== null) window.clearTimeout(skipSeekTimerRef.current);
+    const video = videoRef.current;
+    if (video && volumeBeforeFadeRef.current !== null) {
+      video.volume = volumeBeforeFadeRef.current;
+    }
+  }, []);
+
+  // Séquences dont on a déjà réchauffé la destination.
+  const prefetchedSegmentsRef = useRef<Set<string>>(new Set());
+
+  /**
+   * Réchauffe le cache HTTP à l'arrivée d'un saut.
+   *
+   * Sauter dans une zone non tamponnée oblige hls.js à aller chercher le
+   * fragment au moment même du `seek` : la lecture se fige une à deux secondes
+   * juste après avoir « passé l'intro », ce qui donne l'impression que le saut
+   * a planté. On demande donc les fragments de destination un peu à l'avance,
+   * pendant que la séquence à sauter joue encore et que la bande passante est
+   * disponible ; hls.js les retrouvera dans le cache du navigateur.
+   *
+   * Deux fragments au plus : de quoi enchaîner sans redemander, sans doubler la
+   * consommation pour autant.
+   */
+  const prefetchSegmentLanding = useCallback((segment: MediaSegment) => {
+    const levelDetails = getActiveLevelDetails();
+    if (!levelDetails) return;
+
+    const landing = segment.end;
+    const upcoming = levelDetails.fragments
+      .filter(frag => frag.start + frag.duration > landing && frag.start < landing + 12)
+      .slice(0, 2);
+
+    for (const frag of upcoming) {
+      try {
+        const url = new URL(frag.url, levelDetails.url).href;
+        // Requête volontairement silencieuse : un échec n'a aucune
+        // conséquence, hls.js refera la demande normalement le moment venu.
+        void fetch(url, { mode: 'cors', credentials: 'same-origin' }).catch(() => { });
+      } catch {
+        /* URL de fragment inexploitable : rien à précharger. */
+      }
+    }
+  }, [getActiveLevelDetails]);
+
+  // Déclenche le préchargement quand on approche d'une séquence sautée toute
+  // seule. Volontairement limité au mode automatique : c'est le seul cas où le
+  // saut est certain. En mode bouton l'utilisateur ne cliquera peut-être pas,
+  // et ces sources sont scrapées chez des hébergeurs qu'il vaut mieux ne pas
+  // solliciter pour rien.
+  useEffect(() => {
+    if (mediaSegments.length === 0 || !Number.isFinite(currentTime)) return;
+    for (const segment of mediaSegments) {
+      if (skipSegmentPrefs.resolveSegmentMode(skipSettings, segment.type) !== 'auto') continue;
+      const lead = segment.start - currentTime;
+      // Fenêtre de 12 s avant l'entrée : assez tôt pour que le fragment soit
+      // arrivé, assez tard pour ne pas précharger une fin d'épisode qu'on
+      // n'atteindra peut-être jamais.
+      if (lead < -1 || lead > 12) continue;
+      const key = segmentKey(segment);
+      if (prefetchedSegmentsRef.current.has(key)) continue;
+      prefetchedSegmentsRef.current.add(key);
+      prefetchSegmentLanding(segment);
+    }
+  }, [mediaSegments, currentTime, skipSettings, prefetchSegmentLanding]);
+
+  const skipActiveSegment = useCallback((): boolean => {
+    if (!activeMediaSegment) return false;
+    autoSkippedSegmentsRef.current.add(segmentKey(activeMediaSegment));
+    // Pas d'OSD ici : le voile de transition affiche déjà « Intro passée ».
+    performSegmentSkip(activeMediaSegment);
+    return true;
+  }, [activeMediaSegment, performSegmentSkip]);
+
+  const dismissActiveSegment = useCallback(() => {
+    if (!activeMediaSegment) return;
+    const key = segmentKey(activeMediaSegment);
+    setDismissedSegments((previous) => {
+      if (previous.has(key)) return previous;
+      const next = new Set(previous);
+      next.add(key);
+      return next;
+    });
+  }, [activeMediaSegment]);
+
+  // Mode auto : saute dès l'entrée dans le segment, une seule fois par segment.
+  useEffect(() => {
+    if (activeSegmentMode !== 'auto' || !activeMediaSegment) return;
+    const key = segmentKey(activeMediaSegment);
+    if (autoSkippedSegmentsRef.current.has(key)) return;
+    autoSkippedSegmentsRef.current.add(key);
+    performSegmentSkip(activeMediaSegment);
+  }, [activeSegmentMode, activeMediaSegment, performSegmentSkip]);
+
+  // ==========================================================================
+  // Fin d'épisode
+  //
+  // Déclaré avant les cartes de séquence : c'est la proposition « À suivre »
+  // qui décide si elles s'affichent.
+  // ==========================================================================
+  const nextEpisodePromptVisible = Boolean(
+    showNextEpisodeOverlay && nextEpisode && !hasDeclinedNextEpisode && onNextEpisode && !studioOpen,
+  );
+
+  // Fin de film : proposition de relance, puis suggestion du film suivant.
+  const nextMovieEndedVisible = Boolean(showNextMovie && nextMovie && onNextMovie);
+  const nextMoviePromptVisible = Boolean(
+    showNextMovieOverlay && nextMovie && nextMovieInfo && !showNextMovie && !hasIgnored && !studioOpen,
+  );
+
+  const upNextVisible = nextEpisodePromptVisible || nextMovieEndedVisible || nextMoviePromptVisible;
+
+  /**
+   * Bouton « Passer le générique » : masqué tant que « À suivre » est affiché.
+   *
+   * Les deux tombaient au même moment (la proposition s'ouvre justement au
+   * générique) et se disputaient la touche Entrée. Le bouton de saut revient
+   * dès qu'on referme la proposition — « Plus tard » ou la croix.
+   */
+  const skipPromptVisible =
+    skipPromptEligible
+    && !upNextVisible
+    && activeMediaSegment !== null
+    && !dismissedSegments.has(segmentKey(activeMediaSegment));
+
+  // Logos TMDB : celui de la série pour un épisode, celui du film proposé
+  // sinon. Le hook sert déjà les carrousels, il partage donc son cache de
+  // session — le panneau n'ajoute pas de requête sur un contenu déjà parcouru.
+  const { logoUrl: showLogoUrl } = useTmdbImages(
+    tvShowId ? 'tv' : undefined,
+    tvShowId ? Number(tvShowId) : undefined,
+  );
+  const { logoUrl: nextMovieLogoUrl } = useTmdbImages(
+    nextMovie ? 'movie' : undefined,
+    nextMovie?.id,
+  );
+
+  /**
+   * Ce que l'anti-spoil masque sur l'épisode suivant.
+   *
+   * `nextEpisodeInfo` n'était consulté nulle part jusqu'ici : la case existait
+   * dans les réglages et ne faisait rien. Elle replie maintenant la
+   * proposition sur son strict minimum.
+   */
+  const nextEpisodeSpoiler = useMemo<UpNextSpoiler | null>(() => {
+    if (!nextEpisode) return null;
+    const number = nextEpisode.episodeNumber;
+    return {
+      hideImage: shouldHide('episodeImages'),
+      hideTitle: shouldHide('episodeNames'),
+      hideOverview: shouldHide('episodeOverviews'),
+      hideAll: shouldHide('nextEpisodeInfo'),
+      maskedTitle: getMaskedContent(nextEpisode.name || '', 'episodeNames', undefined, number),
+      maskedOverview: getMaskedContent(nextEpisode.overview || '', 'episodeOverviews'),
+    };
+  }, [nextEpisode, shouldHide, getMaskedContent]);
+
+  const triggerNextEpisode = useCallback((): boolean => {
+    if (!onNextEpisode || !nextEpisode) return false;
+    // `!= null` : les Spéciaux sont en saison 0, un test de véracité les exclut.
+    if (nextEpisode.seasonNumber == null || nextEpisode.episodeNumber == null) return false;
+    onNextEpisode(nextEpisode.seasonNumber, nextEpisode.episodeNumber);
+    return true;
+  }, [onNextEpisode, nextEpisode]);
+
+  /**
+   * Confirme la popup affichée, par ordre de priorité. Renvoie `true` si
+   * quelque chose a effectivement été confirmé : l'appelant ne consomme la
+   * touche que dans ce cas, pour ne pas voler Entrée au reste de l'interface.
+   */
+  const confirmActivePrompt = useCallback((): boolean => {
+    if (isLocked || showSettings) return false;
+    if (skipPromptVisible) return skipActiveSegment();
+    if (nextEpisodePromptVisible) return triggerNextEpisode();
+    if (showNextMovie && nextMovie && onNextMovie) {
+      onNextMovie(nextMovie.id);
+      return true;
+    }
+    if (showNextMovieOverlay && nextMovie && nextMovieInfo && !hasIgnored) {
+      // Même action que le bouton principal de la carte : Entrée relançait la
+      // lecture du film en cours au lieu d'ouvrir celui qui est proposé.
+      navigate(`/movie/${encodeId(nextMovie.id)}`);
+      return true;
+    }
+    return false;
+  }, [
+    isLocked, showSettings, skipPromptVisible, skipActiveSegment,
+    nextEpisodePromptVisible, triggerNextEpisode,
+    showNextMovie, nextMovie, onNextMovie,
+    showNextMovieOverlay, nextMovieInfo, hasIgnored, navigate,
+  ]);
+
+  // Passe par une ref plutôt que par les dépendances du `useEffect` clavier :
+  // `confirmActivePrompt` change à chaque `timeupdate` (via `currentTime`), et
+  // réabonner un listener document 4 fois par seconde serait du gaspillage.
+  const confirmActivePromptRef = useRef<() => boolean>(() => false);
+  useEffect(() => {
+    confirmActivePromptRef.current = confirmActivePrompt;
+  });
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -7371,6 +8202,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }
 
       const key = e.key;
+
+      // Entrée — confirme la popup affichée (saut d'intro/outro, épisode
+      // suivant, film suivant). On ne consomme la touche que si une popup a
+      // répondu : sinon Entrée doit garder son comportement normal.
+      if (key === 'Enter') {
+        if (confirmActivePromptRef.current()) {
+          e.preventDefault();
+        }
+        return;
+      }
 
       // Ctrl+J — Infos du flux vidéo (style VLC)
       if (e.ctrlKey && key.toLowerCase() === 'j') {
@@ -7425,11 +8266,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               const id = `internal:${idx}`;
               const label = track.label || track.language || `Piste ${idx + 1}`;
               subEntries.push({ id, label });
-            });
-          }
-          if (rivestreamCaptions && rivestreamCaptions.length > 0) {
-            rivestreamCaptions.forEach((cap, idx) => {
-              subEntries.push({ id: `rivestream:${idx}`, label: cap.label || `Rivestream ${idx + 1}` });
             });
           }
           if (subEntries.length === 0) {
@@ -7616,17 +8452,72 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     fetchNextMovieDetails();
   }, [nextMovie]);
 
-  const handleIgnore = () => {
+  // `useCallback` : cette fonction descend dans `UpNextPanel`, qui est `memo`.
+  // Une nouvelle identité à chaque rendu ferait retomber le panneau dans le
+  // rendu du lecteur — plusieurs fois par seconde pendant la lecture.
+  const handleIgnore = useCallback(() => {
     setHasDeclinedNextEpisode(true);
     setShowNextEpisodeOverlay(false);
     if (onIgnore) {
       onIgnore();
     }
-  };
+  }, [onIgnore]);
 
   useEffect(() => {
     setHasDeclinedNextEpisode(false);
   }, [src]);
+
+  // ==========================================================================
+  // Props de la proposition « À suivre »
+  //
+  // Mémorisées une par une : `UpNextPanel` est `memo`, et le lecteur se rend à
+  // chaque `timeupdate`. Des fonctions ou des chaînes recréées à chaque rendu
+  // feraient redessiner un panneau plein écran par-dessus la vidéo quatre fois
+  // par seconde — c'est ce qui faisait saccader la lecture.
+  // ==========================================================================
+  const playNextEpisode = useCallback(() => { triggerNextEpisode(); }, [triggerNextEpisode]);
+
+  const nextEpisodeImageUrl = useMemo(() => {
+    if (nextEpisode?.still_path) return `https://image.tmdb.org/t/p/w500${nextEpisode.still_path}`;
+    // Repli sur le fond de la série : moins juste, mais mieux qu'un trou.
+    if (tvShow?.backdrop_path) return `https://image.tmdb.org/t/p/w500${tvShow.backdrop_path}`;
+    return null;
+  }, [nextEpisode?.still_path, tvShow?.backdrop_path]);
+
+  const nextEpisodeEyebrow = useMemo(() => (
+    nextEpisode
+      ? t('watch.seasonEpisodeShort', {
+        season: nextEpisode.seasonNumber,
+        episode: nextEpisode.episodeNumber,
+      })
+      : null
+  ), [nextEpisode, t]);
+
+  const nextEpisodeMeta = useMemo(() => (
+    nextEpisode?.vote_average ? `${nextEpisode.vote_average.toFixed(1)}/10` : null
+  ), [nextEpisode?.vote_average]);
+
+  const playNextMovie = useCallback(() => {
+    if (onNextMovie && nextMovie) onNextMovie(nextMovie.id);
+  }, [onNextMovie, nextMovie]);
+
+  const openNextMovieDetails = useCallback(() => {
+    if (nextMovie) navigate(`/movie/${encodeId(nextMovie.id)}`);
+  }, [navigate, nextMovie]);
+
+  const dismissEndedMovie = useCallback(() => {
+    setShowNextMovie(false);
+    setHasIgnored(true);
+  }, []);
+
+  const dismissMovieSuggestion = useCallback(() => {
+    setShowNextMovieOverlay(false);
+    setHasIgnored(true);
+  }, []);
+
+  const nextMovieImageUrl = useMemo(() => (
+    nextMovie?.poster_path ? `https://image.tmdb.org/t/p/w300${nextMovie.poster_path}` : null
+  ), [nextMovie?.poster_path]);
 
   useEffect(() => {
     // Détection des appareils tactiles
@@ -7711,7 +8602,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     // Check if source is MP4
     const isMP4 = kisskhSources.some(source => (
       source.type === 'mp4' && source.url === src
-    )) || isMP4Source(src);
+    )) || isMp4SourceResolved(src);
 
     if (isMP4) {
       // For MP4, directly set the source on the video element
@@ -7899,53 +8790,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
     let switched = false;
 
-    // 0. Si c'est une source Rivestream (avec proxy), essayer de basculer vers un autre proxy
     const currentSrc = src || '';
-    const currentProxyIndex = RIVESTREAM_PROXIES.findIndex(proxy => currentSrc.includes(proxy));
-
-    if (currentProxyIndex !== -1) {
-       // Check if we should stop purely on 403 (although this function shouldn't be called on 403, better safe)
-       // This check is hard to do here without access to the response status.
-       // The caller (onError / hls error handler) is responsible for filtering 403.
-       // However, to prevent infinite loops, we can add a retry limit per URL.
-       
-       // Using global or persistent state to track retries for this specific URL pattern
-       const urlKey = "retry_" + currentSrc.split('?')[1]?.substring(0, 50); // Use part of query param as key
-       if (urlKey) {
-           const retries = (window as any)[urlKey] || 0;
-           if (retries > 10) { // Safety break
-               console.error("🚨 Infinite loop detected in Rivestream proxy rotation. Stopping.");
-               if (onError) onError(); else setLoadingError(true);
-               return;
-           }
-           (window as any)[urlKey] = retries + 1;
-       }
-
-      console.log('🚨 Rivestream Proxy error detected, attempting to switch proxy...');
-      const nextProxyIndex = (currentProxyIndex + 1) % RIVESTREAM_PROXIES.length;
-
-      // Si on a fait le tour des proxies, on abandonne la rotation de proxy et on passe à la suite (source suivante)
-      // On utilise window.rivestreamRetryCount pour tracker les retries si besoin, ou juste on vérifie si on revient au premier
-      // Pour l'instant, faisons simple : si on est sur le dernier proxy, on considère que ça a échoué globalement pour cette source
-      // MAIS les utilisateurs veulent réessayer, donc on tourne. 
-      // Sauf si on veut éviter une boucle infinie. On peut stocker le retry count dans une ref ou state.
-      // Modif requested: "fait une liste en haut du fichier avec les deux urls en backup" -> implied rotation.
-
-      const nextProxy = RIVESTREAM_PROXIES[nextProxyIndex];
-      const currentProxy = RIVESTREAM_PROXIES[currentProxyIndex];
-
-      console.log(`🔄 Switching Rivestream proxy from ${currentProxy} to ${nextProxy}`);
-      const newUrl = currentSrc.replace(currentProxy, nextProxy);
-
-      const sourceChangeEvent = new CustomEvent('sourceChange', {
-        detail: { type: 'rivestream_hls', url: newUrl, id: 'rivestream_retry', origin: 'auto-fallback', fromSrc: currentSrc }
-      });
-      window.dispatchEvent(sourceChangeEvent);
-      switched = true;
-      // Return early to prevent other switching logic if we successfully rotated proxy
-      return;
-    }
-
 
     // 1. Essayer la prochaine source Nightflix (Darkino) si disponible
     if (!switched && darkinoSources && darkinoSources.length > 0 && currentDarkiIndex < darkinoSources.length - 1) {
@@ -8197,7 +9042,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const xRelativeToPlayer = clientX - playerRect.left;
 
     // Check if source is MP4 - if so, don't show preview
-    const isMP4 = isMP4Source(src);
+    const isMP4 = isMp4SourceResolved(src);
     if (isMP4) {
       // For MP4 sources, just show time position without preview
       setHoverState(prev => ({ ...prev, time, x: xRelativeToPlayer, showPreview: false, previewUrl: null }));
@@ -8224,34 +9069,42 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   };
 
   const fetchPreviewFor = (time: number) => {
-    // Check if source is MP4 - if so, don't show preview
-    const isMP4 = isMP4Source(src);
-    if (isMP4) {
-      console.log("Preview not available for MP4 sources");
-      return;
-    }
+    /**
+     * Toute sortie anticipée DOIT éteindre le témoin de chargement.
+     * `onCanPlay` de la vidéo d'aperçu est le seul autre endroit qui le fait,
+     * et il ne se déclenche évidemment jamais quand on n'a pas réussi à lui
+     * donner une source : le spinner tournait alors indéfiniment.
+     */
+    const giveUp = (reason: string) => {
+      console.debug(`[preview] abandon : ${reason}`);
+      setLoadingPreview(false);
+      setHoverState(prev => ({ ...prev, showPreview: false, previewUrl: null }));
+    };
 
-    if (!hlsRef.current) return;
-    const hls = hlsRef.current;
-    const levelDetails = hls.levels[hls.currentLevel]?.details;
+    if (isMp4SourceResolved(src)) return giveUp('source MP4');
+    if (!hlsRef.current) return giveUp('pas d\'instance HLS');
 
+    const levelDetails = getActiveLevelDetails();
     if (!levelDetails || levelDetails.fragments.length === 0) {
-      console.log("HLS level details not available for preview.");
-      return;
+      return giveUp('playlist du niveau indisponible');
     }
 
-    // Find the fragment for the given time
-    const fragment = levelDetails.fragments.find(frag => {
-      return time >= frag.start && time < frag.start + frag.duration;
-    });
+    const fragments = levelDetails.fragments;
+    const lastFragment = fragments[fragments.length - 1];
+    const fragment =
+      fragments.find(frag => time >= frag.start && time < frag.start + frag.duration)
+      // Survoler le tout dernier pixel de la barre tombe juste après la fin du
+      // dernier fragment : on montre celui-là plutôt que rien.
+      ?? (time >= lastFragment.start ? lastFragment : undefined);
 
-    if (!fragment) {
-      console.log(`No fragment found for time: ${time}`);
-      return;
+    if (!fragment) return giveUp(`aucun fragment pour ${time.toFixed(1)}s`);
+
+    let fragmentUrl: string;
+    try {
+      fragmentUrl = new URL(fragment.url, levelDetails.url).href;
+    } catch {
+      return giveUp('URL de fragment invalide');
     }
-
-    // Ensure the fragment URL is absolute
-    const fragmentUrl = new URL(fragment.url, levelDetails.url).href;
 
     setHoverState(prev => ({ ...prev, previewUrl: fragmentUrl, showPreview: true }));
   };
@@ -8300,7 +9153,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       const xRelativeToPlayer = clientX - playerRect.left;
 
       // Check if source is MP4 - if so, don't show preview
-      const isMP4 = isMP4Source(src);
+      const isMP4 = isMp4SourceResolved(src);
       if (isMP4) {
         // For MP4 sources, just show time position without preview
         setHoverState(prev => ({ ...prev, time, x: xRelativeToPlayer, showPreview: false }));
@@ -8448,7 +9301,23 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           });
         });
 
+        // Un fragment qui ne se charge pas doit éteindre le témoin, sinon on
+        // retombe sur le spinner perpétuel que `giveUp` vient de supprimer
+        // côté résolution.
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data?.fatal) {
+            setLoadingPreview(false);
+            setHoverState(prev => ({ ...prev, showPreview: false, previewUrl: null }));
+          }
+        });
+
+        // Dernier filet : réseau très lent, fragment qui n'arrive jamais.
+        const watchdog = window.setTimeout(() => {
+          setLoadingPreview(false);
+        }, 6000);
+
         return () => {
+          window.clearTimeout(watchdog);
           URL.revokeObjectURL(manifestUrl);
         };
       }
@@ -8560,7 +9429,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const handleCueChange = (event: Event) => {
       const track = event.target as TextTrack;
       if (track && (track.mode === 'showing' || track.mode === 'hidden')) {
-        refreshActiveCues(video, track, subtitleStyle.delay);
+        refreshActiveCues(video, track, subtitlePreferences.delay);
       }
     };
 
@@ -8580,7 +9449,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       const activeTrack = Array.from(video.textTracks).find(track =>
         track.mode === 'showing' || track.mode === 'hidden');
       if (activeTrack) {
-        refreshActiveCues(video, activeTrack, subtitleStyle.delay);
+        refreshActiveCues(video, activeTrack, subtitlePreferences.delay);
       }
     };
 
@@ -8590,7 +9459,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const activeTrack = Array.from(video.textTracks).find(track =>
       track.mode === 'showing' || track.mode === 'hidden');
     if (activeTrack) {
-      refreshActiveCues(video, activeTrack, subtitleStyle.delay);
+      refreshActiveCues(video, activeTrack, subtitlePreferences.delay);
     }
 
     return () => {
@@ -8602,7 +9471,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.removeEventListener('timeupdate', handleTimeUpdate);
       }
     };
-  }, [isCasting, preparedKisskhSubtitles, subtitleStyle.delay]);
+  }, [isCasting, preparedKisskhSubtitles, subtitlePreferences.delay]);
 
   // Add this effect to force refresh active cues when subtitle tracks change
   useEffect(() => {
@@ -8613,65 +9482,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const activeTrack = Array.from(video.textTracks).find(track =>
       track.mode === 'showing' || track.mode === 'hidden');
     if (activeTrack) {
-      refreshActiveCues(video, activeTrack, subtitleStyle.delay);
+      refreshActiveCues(video, activeTrack, subtitlePreferences.delay);
     }
-  }, [subtitles.length]);
-
-  // Add a function to format the delay for display
-  const formatDelay = (delayInSeconds: number): string => {
-    const sign = delayInSeconds >= 0 ? '+' : '';
-    return `${sign}${delayInSeconds}s`;
-  };
-
-  // Get font size class based on selected style
-  const getSubtitleFontSizeStyle = () => {
-    return {
-      fontSize: `${subtitleStyle.fontSize}rem`
-    };
-  };
-
-  // Get background opacity style based on selected value
-  const getSubtitleBackgroundStyle = () => {
-    return {
-      backgroundColor: `rgba(0, 0, 0, ${subtitleStyle.backgroundOpacity})`
-    };
-  };
-
-  // Get text color style based on selected color
-  const getSubtitleTextColorStyle = () => {
-    return {
-      color: subtitleStyle.color
-    };
-  };
-
-  // Add an effect to save subtitle style changes to localStorage
-  useEffect(() => {
-    localStorage.setItem('subtitleStyle', JSON.stringify(subtitleStyle));
-  }, [subtitleStyle]);
-
-  // Create wrapper functions for style updates to keep code cleaner
-  const updateSubtitleFontSize = (size: number) => {
-    setSubtitleStyle(prev => ({ ...prev, fontSize: Math.max(0.5, Math.min(3, size)) }));
-  };
-
-  const updateSubtitleBackgroundOpacity = (opacity: number) => {
-    setSubtitleStyle(prev => ({ ...prev, backgroundOpacity: Math.max(0, Math.min(1, opacity)) }));
-  };
-
-  const updateSubtitleColor = (color: string) => {
-    setSubtitleStyle(prev => ({ ...prev, color }));
-  };
-
-  const updateSubtitleDelay = (delayChange: number) => {
-    setSubtitleStyle(prev => ({
-      ...prev,
-      delay: Math.min(Math.max(prev.delay + delayChange, -10), 10)
-    }));
-  };
-
-  const resetSubtitleDelay = () => {
-    setSubtitleStyle(prev => ({ ...prev, delay: 0 }));
-  };
+  }, [subtitles.length, subtitlePreferences.delay]);
 
   useEffect(() => {
     // Pour désactiver les sous-titres natifs au montage et après chaque mise à jour
@@ -8709,79 +9522,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     };
   }, []);
 
-  // Auto-charger le premier sous-titre français des Rivestream captions
-  useEffect(() => {
-    const loadFirstFrenchSubtitle = async () => {
-      if (!rivestreamCaptions || rivestreamCaptions.length === 0) return;
-      if (currentSubtitle && currentSubtitle.startsWith('rivestream:')) return; // Déjà un sous-titre Rivestream chargé
-
-      const video = videoRef.current;
-      if (!video) return;
-
-      // Le premier caption devrait déjà être français grâce au tri dans WatchTv.tsx
-      const firstCaption = rivestreamCaptions[0];
-      const isFrench = firstCaption.label.toLowerCase().includes('français') ||
-        firstCaption.label.toLowerCase().includes('french');
-
-      if (!isFrench) return; // Ne charger que si c'est bien un sous-titre français
-
-      console.log('🎬 Auto-loading French Rivestream subtitle:', firstCaption.label);
-      setLoadingSubtitle(true);
-
-      try {
-        // Fetch le fichier de sous-titres via le proxy
-        const response = await fetch(firstCaption.file);
-        const srtContent = await response.text();
-
-        // Convertir SRT en VTT
-        const vttContent = 'WEBVTT\n\n' + srtContent
-          .replace(/\r\n/g, '\n')
-          .replace(/^\s*\d+\s*$/gm, '') // Supprimer les numéros de séquence
-          .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2') // Convertir virgules en points
-          .trim();
-
-        // Créer un blob URL
-        const blob = new Blob([vttContent], { type: 'text/vtt' });
-        const blobUrl = URL.createObjectURL(blob);
-
-        // Créer l'élément track
-        const trackEl = document.createElement('track');
-        trackEl.kind = 'subtitles';
-        trackEl.label = firstCaption.label;
-        trackEl.srclang = 'fr';
-        trackEl.src = blobUrl;
-        trackEl.default = false;
-
-        video.appendChild(trackEl);
-
-        // Activer le track
-        const enableTrack = () => {
-          const textTrack = Array.from(video.textTracks).find(
-            t => (t as any).label === trackEl.label
-          );
-          if (textTrack) {
-            // Désactiver tous les autres tracks
-            Array.from(video.textTracks).forEach(t => t.mode = 'disabled');
-            textTrack.mode = 'hidden';
-            setCurrentSubtitle('rivestream:0');
-            setSubtitleContainerVisible(true);
-            refreshActiveCues(video, textTrack, subtitleStyle.delay);
-            setLoadingSubtitle(false);
-            console.log('✅ French Rivestream subtitle loaded and activated:', firstCaption.label);
-          }
-        };
-
-        trackEl.addEventListener('load', enableTrack);
-        setTimeout(enableTrack, 200);
-      } catch (error) {
-        console.error('❌ Error auto-loading French Rivestream subtitle:', error);
-        setLoadingSubtitle(false);
-      }
-    };
-
-    loadFirstFrenchSubtitle();
-  }, [rivestreamCaptions]); // Se déclenche quand rivestreamCaptions change
-
   // Fonction pour appliquer le format d'affichage
   const getVideoObjectFitClass = () => {
     switch (videoAspectRatio) {
@@ -8798,28 +9538,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       default:
         return 'object-cover';
     }
-  };
-
-  // Update subtitle style
-  useEffect(() => {
-    if (currentSubtitle && videoRef.current && videoRef.current.textTracks) {
-      updateSubtitleStyle(videoRef.current.textTracks, subtitleStyle);
-    }
-  }, [currentSubtitle, subtitleStyle, videoRef]);
-
-  // Function to apply subtitle styling to text tracks
-  const updateSubtitleStyle = (_textTracks: TextTrackList, style: SubtitleStyle) => {
-    // Save style preferences to localStorage
-    localStorage.setItem('subtitleStyle', JSON.stringify(style));
-
-    // Apply styles to native text tracks if needed
-    // Most styling is handled via CSS classes in the custom subtitle renderer
-
-    // If using browser's native text track rendering, we would apply styles here
-    // But since we're using a custom renderer (the div with activeSubtitleCues),
-    // the actual styling is applied through the CSS classes in the JSX
-
-    // The delay is applied when processing cues in refreshActiveCues function
   };
 
   // Update playback speed when it changes
@@ -9017,13 +9735,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                           <div className="mb-2 flex items-stretch gap-2">
                             <button
                               onClick={() => handleSourceChange(source.type, source.id, source.url)}
-                              disabled={(source.type === 'rivestream_hls' && loadingRivestream) || (source.type === 'kisskh_main' && loadingKisskh)}
+                              disabled={source.type === 'kisskh_main' && loadingKisskh}
                               className={`w-full flex-1 px-4 py-3 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isActive ? 'bg-gray-800 border-l-4 border-red-600 pl-3' : 'bg-gray-900/60 text-white'
-                                } ${onlyQualityMenu && embedType && embedUrl && source.type === embedType && source.url === embedUrl ? 'ring-2 ring-red-500 bg-gray-800/80' : ''} ${(source.type === 'rivestream_hls' && loadingRivestream) ? 'opacity-70 cursor-not-allowed' : ''
+                                } ${onlyQualityMenu && embedType && embedUrl && source.type === embedType && source.url === embedUrl ? 'ring-2 ring-red-500 bg-gray-800/80' : ''} ${''
                                 }`}
                             >
                               <div className="min-w-0 flex flex-1 flex-col">
-                                <span className={`${isActive ? 'text-red-600 font-medium' : 'text-white'} ${(source.type === 'rivestream_hls' && loadingRivestream) ? 'animate-pulse' : ''
+                                <span className={`${isActive ? 'text-red-600 font-medium' : 'text-white'} ${''
                                   }`}>
                                   {source.label}
                                   {topLevelForPin && __pinnedSourceId === topLevelForPin && (
@@ -9033,7 +9751,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                 {group.type === 'hls' && (source.mediaType === 'mp4' || source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                               </div>
                               <div className="ml-3 flex items-center gap-2">
-                                {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
+                                {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
                                   <ChevronRight className={`w-4 h-4 transition-transform ${(source.type === 'darkino_main' && showDarkinoMenu) ||
                                     (source.type === 'omega_main' && showOmegaMenu) ||
                                     (source.type === 'multi_main' && showCoflixMenu) ||
@@ -9042,7 +9760,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                     (source.type === 'j1f_main' && showJ1fMenu) ||
                                     (source.type === 'swiftflow_main' && showSwiftflowMenu) ||
                                     (source.type === 'nexus_main' && showNexusMenu) ||
-                                    (source.type === 'rivestream_main' && showRivestreamMenu) ||
                                     (source.type === 'bravo_main' && showBravoMenu) ||
                                     (source.type === 'viper_main' && showViperMenu) ||
                                     (source.type === 'vox_main' && showVoxMenu)
@@ -9341,6 +10058,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                   className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                 >
                                   {[
+                                    { id: '111movies', label: '111Movies' },
                                     { id: 'peachify', label: 'Peachify' },
                                     { id: 'vostfr', label: 'Videasy' },
                                     { id: 'vidlink', label: 'Vidlink' },
@@ -9351,13 +10069,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                     // (épisode spécial / Spéciaux TMDB) tombe dans le fallback '#' qui fait
                                     // charger la page courante en boucle dans l'iframe.
                                     const sourceUrl = movieId ?
-                                      vostfrSource.id === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
+                                      vostfrSource.id === '111movies' ? `https://111movies.net/movie/${movieId}` :
+                                        vostfrSource.id === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
                                         vostfrSource.id === 'vidlink' ? `https://vidlink.pro/movie/${movieId}` :
                                           vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
                                             vostfrSource.id === 'vostfr' ? `https://player.videasy.net/movie/${movieId}` :
                                               `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
                                       (tvShowId != null && seasonNumber != null && episodeNumber != null) ?
-                                        vostfrSource.id === 'peachify' ? `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626` :
+                                        vostfrSource.id === '111movies' ? `https://111movies.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
+                                          vostfrSource.id === 'peachify' ? `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626` :
                                           vostfrSource.id === 'vidlink' ? `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
                                             vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}` :
                                               vostfrSource.id === 'vostfr' ? `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
@@ -9432,7 +10152,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                           {/* Sources de la catégorie */}
                                           {categorySources.map((fstreamSource, index) => {
                                             const globalIndex = fstreamSources.findIndex(s => s.url === fstreamSource.url);
-                                            const isFstreamActive = onlyQualityMenu && embedType === 'fstream' && getOriginalUrl(embedUrl || '') === fstreamSource.url;
+                                            const isFstreamActive = onlyQualityMenu && embedType === 'fstream' && (embedUrl || '') === fstreamSource.url;
                                             const fstreamHosterId = __detectHosterFromUrl(fstreamSource.url, fstreamSource.label);
                                             return (
                                               <div key={`fstream_${cat.key}_${index}`} className="mb-1 ml-4 flex items-stretch gap-2">
@@ -9739,105 +10459,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                               )}
                             </AnimatePresence>
                           )}
-                          {/* Sous-menu Rivestream */}
-                          {source.type === 'rivestream_main' && (
-                            <AnimatePresence>
-                              {showRivestreamMenu && (
-                                <motion.div
-                                  initial={{ opacity: 0, scale: 0.95, transformOrigin: "top" }}
-                                  animate={{ opacity: 1, scale: 1 }}
-                                  exit={{ opacity: 0, scale: 0.95 }}
-                                  transition={{ duration: 0.2, ease: "easeOut" }}
-                                  className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
-                                >
-                                  {rivestreamSources && rivestreamSources.length > 0 ? (() => {
-                                    // Organiser les sources par catégorie (service)
-                                    const sourcesByCategory = rivestreamSources.reduce((acc, source) => {
-                                      const category = source.category || 'Other';
-                                      if (!acc[category]) acc[category] = [];
-                                      acc[category].push(source);
-                                      return acc;
-                                    }, {} as Record<string, typeof rivestreamSources>);
-
-                                    // Définir l'ordre et les emojis des catégories
-                                    const categoryOrder = [
-                                      { key: 'flowcast', emoji: '🌊' },
-                                      { key: 'asiacloud', emoji: '☁️' },
-                                      { key: 'hindicast', flagCode: 'IN' },
-                                      { key: 'aqua', emoji: '💧' },
-                                      { key: 'humpy', emoji: '🎬' },
-                                      { key: 'primevids', emoji: '⭐' },
-                                      { key: 'shadow', emoji: '🌑' },
-                                      { key: 'animez', emoji: '🎭' },
-                                      { key: 'yggdrasil', emoji: '🌳' },
-                                      { key: 'putafilme', emoji: '🎞️' },
-                                      { key: 'ophim', emoji: '🎥' }
-                                    ];
-
-                                    const result = categoryOrder.map((cat) => {
-                                      const categorySources = sourcesByCategory[cat.key];
-                                      if (!categorySources || categorySources.length === 0) return null;
-
-                                      return (
-                                        <div key={`rivestream_category_${cat.key}`} className="mb-3">
-                                          {/* En-tête de catégorie */}
-                                          <div className="flex items-center gap-2 mb-2 px-2">
-                                            <span className="text-lg">{'flagCode' in cat && cat.flagCode ? <ReactCountryFlag countryCode={cat.flagCode as string} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /> : cat.emoji}</span>
-                                            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-                                              {cat.key} ({categorySources.length})
-                                            </span>
-                                          </div>
-                                          {/* Sources de la catégorie */}
-                                          {categorySources.map((rivestreamSource, index) => {
-                                            const globalIndex = rivestreamSources.findIndex(s => s.url === rivestreamSource.url);
-                                            const isRivestreamActive = src === rivestreamSource.url;
-                                            const rivestreamHosterId = __detectHosterFromUrl(rivestreamSource.url, rivestreamSource.label || rivestreamSource.service);
-                                            return (
-                                              <motion.div
-                                                key={`rivestream_${cat.key}_${index}`}
-                                                initial={{ opacity: 0, x: -20 }}
-                                                animate={{ opacity: 1, x: 0 }}
-                                                transition={{ duration: 0.2, delay: index * 0.03 }}
-                                                className="mb-1 ml-4 flex items-stretch gap-2"
-                                              >
-                                                <button
-                                                  onClick={() => handleSourceChange('rivestream', `rivestream_${globalIndex}`, rivestreamSource.url)}
-                                                  className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isRivestreamActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
-                                                >
-                                                  <div className="min-w-0 flex flex-1 flex-col">
-                                                    <span className={isRivestreamActive ? 'text-red-600 font-medium' : 'text-white'}>
-                                                      {rivestreamSource.label}
-                                                      {rivestreamHosterId && rivestreamHosterId !== 'unknown' && __pinnedHosterId === rivestreamHosterId && (
-                                                        <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
-                                                      )}
-                                                    </span>
-                                                    {renderSourceQualityMeta(rivestreamSource.url, isRivestreamActive, rivestreamSource.quality, rivestreamSource.label)}
-                                                  </div>
-                                                  <div className="ml-3 flex items-center gap-2">
-                                                    <span className="text-xs text-gray-400">{rivestreamSource.service}</span>
-                                                    {isRivestreamActive && <span className="text-xs px-2 py-0.5 bg-red-600 text-white rounded-full">{t('watch.active')}</span>}
-                                                  </div>
-                                                </button>
-                                                {__renderHosterPin(rivestreamHosterId)}
-                                                {renderCopySourceButton(rivestreamSource.url)}
-                                              </motion.div>
-                                            );
-                                          })}
-                                        </div>
-                                      );
-                                    }).filter(Boolean);
-
-                                    return result;
-                                  })() : (
-                                    <div className="px-4 py-2 text-sm text-gray-400">
-                                      {t('watch.noSources')}
-                                    </div>
-                                  )}
-                                </motion.div>
-                              )}
-                            </AnimatePresence>
-                          )}
-
                           {/* Sous-menu Viper (embed section) */}
                           {source.type === 'viper_main' && (
                             <AnimatePresence>
@@ -9996,7 +10617,30 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const isPinchingRef = useRef(false);
   const lastPinchDistanceRef = useRef<number | null>(null);
   const pinchCenterRef = useRef({ x: 0, y: 0 });
-  const videoWrapperRef = useRef<HTMLDivElement | null>(null);
+
+  const subtitlePlacement = calculateSubtitlePlacement(subtitlePreferences, {
+    width: subtitleViewport.width,
+    height: subtitleViewport.height,
+    blockWidth: subtitleViewport.blockWidth,
+    blockHeight: subtitleViewport.blockHeight,
+    controlsInset: subtitleControlsInset,
+  });
+  const subtitleEdgeStyles = getSubtitleEdgeStyles(
+    subtitlePreferences.edgeStyle,
+    subtitlePreferences.edgeColor,
+    subtitlePreferences.edgeSizePx,
+    subtitlePlacement.scale,
+  );
+  const subtitleCueStyle: React.CSSProperties = {
+    fontSize: subtitlePlacement.fontSizePx,
+    fontFamily: SUBTITLE_FONT_FAMILIES[subtitlePreferences.fontFamily],
+    fontWeight: subtitlePreferences.fontWeight,
+    color: subtitlePreferences.color,
+    ...subtitleEdgeStyles,
+    backgroundColor: subtitlePreferences.backgroundEnabled
+      ? `rgba(0, 0, 0, ${subtitlePreferences.backgroundOpacity})`
+      : 'transparent',
+  };
 
   // Apply transform directly to DOM for smooth animation (YouTube-like)
   const applyZoomTransform = useCallback((scale: number, translateX: number, translateY: number) => {
@@ -10438,6 +11082,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   };
 
   const shouldHideCursor =
+    isMousePointer &&
     !isCasting &&
     isFullscreen &&
     isPlaying &&
@@ -10455,7 +11100,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   return (
     <div
       ref={containerRef}
-      className={`relative group w-full h-full bg-black rounded-xl overflow-hidden ${isLoading ? 'aspect-[16/9]' : ''} video-container ${className} ${isFullscreenAnimating ? 'fullscreen-animating' : ''} select-none ${shouldHideCursor || isLocked ? 'cursor-none' : ''}`}
+      {...{ [HLS_PLAYER_ROOT_ATTRIBUTE]: '' }}
+      className={`relative group w-full h-full bg-black rounded-xl overflow-hidden ${isLoading ? 'aspect-[16/9]' : ''} video-container ${className} ${isFullscreenAnimating ? 'fullscreen-animating' : ''} ${isPageFullscreen ? PLAYER_FULLSCREEN_FILL_CLASS : ''} select-none ${shouldHideCursor || isLocked ? 'cursor-none' : ''}`}
       onPointerMove={handleMouseMove}
       onMouseMove={handleMouseMove}
       onMouseLeave={() => isPlaying && !showCastMenu && setShowControls(false)}
@@ -10992,10 +11638,20 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
       {/* Custom subtitle renderer with dynamic styling */}
       {subtitleContainerVisible && (
-        <div className={`absolute ${showControls ? 'bottom-24' : 'bottom-10'} transition-all duration-300 left-0 right-0 flex flex-col items-center justify-center pointer-events-none`}>
+        <div
+          ref={subtitleCuePositionRef}
+          className="pointer-events-none absolute z-30 transition-[bottom,left] duration-200 ease-out"
+          style={{
+            left: subtitlePlacement.leftPx,
+            bottom: subtitlePlacement.bottomPx,
+            transform: 'translateX(-50%)',
+            maxWidth: getSubtitleSafeWidthCss(100),
+          }}
+        >
           <div
-            className="px-4 py-2 rounded text-center max-w-[90%] subtitle-container"
-            style={getSubtitleBackgroundStyle()}
+            ref={subtitleCueBlockRef}
+            className="subtitle-container max-w-full whitespace-pre-line rounded px-4 py-2 text-center"
+            style={subtitleCueStyle}
           >
             {activeSubtitleCues.map((cue, index) => {
               const displayText = (translationLang && translatedCueTexts.get(cue.text)) || cue.text;
@@ -11003,8 +11659,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               return (
                 <div
                   key={index}
-                  className="font-medium"
-                  style={{ ...getSubtitleFontSizeStyle(), ...getSubtitleTextColorStyle() }}
                   dangerouslySetInnerHTML={{ __html: formatSubtitleTextToSafeHtml(displayText) }}
                 />
               );
@@ -11306,6 +11960,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 {...{ referrerPolicy: "strict-origin-when-cross-origin" } as React.VideoHTMLAttributes<HTMLVideoElement>}
                 onCanPlay={() => setLoadingPreview(false)}
                 onWaiting={() => setLoadingPreview(true)}
+                // Un fragment illisible (codec inattendu, 403 du hoster) doit
+                // rendre la main plutôt que laisser tourner le témoin.
+                onError={() => setLoadingPreview(false)}
               />
             )}
             {loadingPreview && (
@@ -11503,7 +12160,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       </motion.div>
       {controls && !isCasting && (
         <motion.div
-          className="absolute bottom-0 left-0 right-0 p-4 control-bar"
+          ref={controlBarRef}
+          className="absolute bottom-0 left-0 right-0 z-40 p-4 control-bar"
           data-player-controls=""
           initial={{ opacity: 0, y: 20 }}
           animate={{
@@ -11534,6 +12192,51 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               className="absolute h-full bg-red-600 rounded-full"
               style={{ width: `${(currentTime / duration) * 100}%` }}
             />
+            {/* Séquences repérées (intro, résumé, outro, crédits, aperçu).
+                Dessinées APRÈS la barre lue
+                pour rester visibles une fois dépassés, et `pointer-events-none`
+                pour ne pas voler le clic de recherche à la barre. */}
+            {skipSettings.showMarkers && duration > 0 && mediaSegments.map((segment, segmentIndex) => (
+              <div
+                key={`${segment.type}-${segment.start}-${segmentIndex}`}
+                className="absolute h-full pointer-events-none rounded-full"
+                style={{
+                  left: `${Math.min(100, Math.max(0, (segment.start / duration) * 100))}%`,
+                  // Plancher de 0.4% : un segment très court sur un long
+                  // épisode donnerait sinon une bande invisible.
+                  width: `${Math.max(0.4, Math.min(100, ((segment.end - segment.start) / duration) * 100))}%`,
+                  backgroundColor: skipSettings.colors[segment.type],
+                }}
+                title={t(SEGMENT_LABEL_KEY[segment.type])}
+              />
+            ))}
+            {/* Propositions pas encore adoptées : contour seul, pour qu'on les
+                distingue au premier coup d'œil d'une séquence qui, elle,
+                déclenchera vraiment un saut.
+
+                Rien à dessiner quand on leur fait confiance : elles sont alors
+                déjà tracées en plein par la boucle au-dessus, et le pointillé
+                les doublerait. */}
+            {skipSettings.showMarkers && skipSettings.showCommunityProposals
+              && !skipSettings.trustPendingProposals && duration > 0 && communitySubmissions
+              .filter(submission => !submission.adopted)
+              .map(submission => (
+                <div
+                  key={`proposal-${submission.id}`}
+                  className="absolute h-full pointer-events-none rounded-full border border-dashed"
+                  style={{
+                    left: `${Math.min(100, Math.max(0, (submission.startMs / 1000 / duration) * 100))}%`,
+                    width: `${Math.max(0.4, Math.min(100, ((submission.endMs - submission.startMs) / 1000 / duration) * 100))}%`,
+                    borderColor: skipSettings.colors[submission.type],
+                    backgroundColor: `${skipSettings.colors[submission.type]}22`,
+                  }}
+                  title={t('watch.proposalMarkerTitle', {
+                    name: t(SEGMENT_LABEL_KEY[submission.type]),
+                    score: submission.score,
+                    needed: adoptionScore,
+                  })}
+                />
+              ))}
             <div
               className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-red-600 rounded-full -ml-2"
               style={{ left: `${(currentTime / duration) * 100}%` }}
@@ -11615,6 +12318,35 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             </div>
 
             <div className="flex items-center gap-2 md:gap-4">
+              {/* Studio de repérage : accès direct depuis la barre, sans passer
+                  par Paramètres › Progression. Masqué quand la contribution est
+                  impossible (session déconnectée, contenu non identifié, durée
+                  inconnue) plutôt qu'affiché puis refusé. */}
+              {studioButtonVisible && (
+                <div className="relative flex items-center h-[24px]">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); toggleStudio(); }}
+                    className="text-white hover:text-red-600 transition-colors flex items-center justify-center"
+                    aria-label={t('watch.studioOpen')}
+                    title={t('watch.studioOpen')}
+                  >
+                    <motion.div
+                      animate={{
+                        scale: studioOpen ? 0.85 : 1,
+                        color: studioOpen ? '#dc2626' : '#ffffff'
+                      }}
+                      whileHover={{ scale: 1.1 }}
+                      whileTap={{ scale: 0.9 }}
+                      transition={{
+                        duration: 0.2,
+                        ease: "easeInOut"
+                      }}
+                    >
+                      <Scissors size={isMobile ? 20 : 24} />
+                    </motion.div>
+                  </button>
+                </div>
+              )}
               <div className="relative flex items-center h-[24px]">
                 <button
                   onClick={toggleWatchParty}
@@ -12000,49 +12732,128 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         </motion.div>
       )}
 
-      {showNextEpisodeOverlay && nextEpisode && !hasDeclinedNextEpisode && (
-        <NextEpisodePrompt
-          showPrompt={showNextEpisodePrompt}
-          nextEpisode={nextEpisode}
-          tvShow={tvShow}
-          onPlay={() => {
-            setShowNextEpisodePrompt(false);
-            // `!= null` pour autoriser les Spéciaux (S0) — sinon le bouton "Lire" du
-            // popup "épisode suivant" ne fait rien quand le suivant est dans la saison 0.
-            if (onNextEpisode && nextEpisode && nextEpisode.seasonNumber != null && nextEpisode.episodeNumber != null) {
-              onNextEpisode(nextEpisode.seasonNumber, nextEpisode.episodeNumber);
-            }
-          }}
-          onIgnore={handleIgnore}
-          shouldHide={shouldHide}
-          getMaskedContent={getMaskedContent}
+      <SkipTransitionOverlay
+        kind={skippingKind}
+        color={skipSettings.colors[skippingKind ?? 'intro']}
+        animated={animationPrefs.transitions}
+        blurEnabled={animationPrefs.blurEffects}
+      />
+
+      <AnimatePresence>
+        {studioOpen && (
+          <SegmentStudio
+            open={studioOpen}
+            duration={duration}
+            currentTime={currentTime}
+            colors={skipSettings.colors}
+            submissions={communitySubmissions}
+            knownRanges={studioKnownRanges}
+            autoNextSuspended={Boolean(nextEpisode && onNextEpisode && autoNextEpisodeEnabled)}
+            adoptionScore={adoptionScore}
+            canContribute={canContribute}
+            mediaType={segmentTarget?.mediaType ?? (tvShowId ? 'tv' : 'movie')}
+            season={segmentTarget?.season ?? null}
+            episode={segmentTarget?.episode ?? null}
+            imdbId={segmentImdbId}
+            malId={segmentMalId}
+            constraintsRef={containerRef}
+            onSeek={seekToSeconds}
+            onSubmit={handleStudioSubmit}
+            onDelete={handleStudioDelete}
+            onClose={() => setStudioOpen(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      <SegmentVotePrompt
+        submission={skipPromptVisible ? null : votableSubmission}
+        color={skipSettings.colors[votableSubmission?.type ?? 'intro']}
+        adoptionScore={adoptionScore}
+        canVote={canContribute}
+        voteWeight={voteWeight}
+        controlsVisible={showControls}
+        busy={votingBusy}
+        errorCode={voteError}
+        onVote={handleVote}
+        onReport={handleReportSubmission}
+        onDismiss={dismissVote}
+      />
+
+      <SkipSegmentPrompt
+        visible={skipPromptVisible}
+        kind={activeMediaSegment?.type ?? 'intro'}
+        color={skipSettings.colors[activeMediaSegment?.type ?? 'intro']}
+        remainingSeconds={activeMediaSegment ? activeMediaSegment.end - currentTime : 0}
+        controlsVisible={showControls}
+        showKeyboardHint={!isMobile}
+        onSkip={skipActiveSegment}
+        onDismiss={dismissActiveSegment}
+      />
+
+      {nextEpisodePromptVisible && nextEpisode && (
+        <UpNextPanel
+          visible
+          display={nextPrefs.display}
+          autoplaySeconds={nextPrefs.autoplaySeconds}
+          showKeyboardHint={!isMobile}
+          eyebrow={nextEpisodeEyebrow}
+          title={nextEpisode.name || ''}
+          overview={nextEpisode.overview}
+          imageUrl={nextEpisodeImageUrl}
+          logoUrl={showLogoUrl}
+          showName={tvShow?.name}
+          meta={nextEpisodeMeta}
+          spoiler={nextEpisodeSpoiler}
+          primaryLabel={t('watch.playback')}
+          secondaryLabel={t('watch.later')}
+          onPrimary={playNextEpisode}
+          onSecondary={handleIgnore}
+          onDismiss={handleIgnore}
         />
       )}
 
-      {showNextMovie && nextMovie && onNextMovie && (
-        <NextMovieOverlay
-          movie={nextMovie}
-          onPlay={() => {
-            if (onNextMovie) {
-              onNextMovie(nextMovie.id);
-            }
-          }}
-          onIgnore={() => {
-            setShowNextMovie(false);
-            setHasIgnored(true);
-          }}
+      {nextMovieEndedVisible && nextMovie && (
+        <UpNextPanel
+          visible
+          display={nextPrefs.display}
+          autoplaySeconds={nextPrefs.autoplaySeconds}
+          showKeyboardHint={!isMobile}
+          eyebrow={nextMovie.release_date ? nextMovie.release_date.split('-')[0] : null}
+          title={nextMovie.title}
+          overview={nextMovie.overview}
+          imageUrl={nextMovieImageUrl}
+          logoUrl={nextMovieLogoUrl}
+          showName={nextMovie.title}
+          meta={nextMovie.vote_average ? `${nextMovie.vote_average.toFixed(1)}/10` : null}
+          primaryLabel={t('watch.playback')}
+          secondaryLabel={t('watch.rewatch')}
+          // Les deux actions étaient inversées : « Lecture » ouvrait la fiche
+          // du film suivant et « Revoir » le lançait, au lieu de relire celui
+          // qui vient de finir. Chaque bouton fait maintenant ce qu'il annonce.
+          onPrimary={playNextMovie}
+          onSecondary={handleReplay}
+          onDismiss={dismissEndedMovie}
         />
       )}
 
-      {showNextMovieOverlay && nextMovie && nextMovieInfo && !showNextMovie && !hasIgnored && (
-        <NextUpPrompt
-          movie={nextMovie}
-          movieInfo={nextMovieInfo}
-          onPlay={handleReplay}
-          onIgnore={() => {
-            setShowNextMovieOverlay(false);
-            setHasIgnored(true);
-          }}
+      {nextMoviePromptVisible && nextMovie && nextMovieInfo && (
+        <UpNextPanel
+          visible
+          display={nextPrefs.display}
+          autoplaySeconds={nextPrefs.autoplaySeconds}
+          showKeyboardHint={!isMobile}
+          eyebrow={nextMovieInfo.releaseDate ? nextMovieInfo.releaseDate.split('-')[0] : null}
+          title={nextMovie.title}
+          overview={nextMovieInfo.overview}
+          imageUrl={nextMovieImageUrl}
+          logoUrl={nextMovieLogoUrl}
+          showName={nextMovie.title}
+          meta={`${nextMovieInfo.rating.toFixed(1)}/10`}
+          primaryLabel={t('watch.playback')}
+          secondaryLabel={t('watch.later')}
+          onPrimary={openNextMovieDetails}
+          onSecondary={dismissMovieSuggestion}
+          onDismiss={dismissMovieSuggestion}
         />
       )}
       {/* Settings Panel - Moved outside the main controls conditional */}
@@ -12082,7 +12893,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             embedUrl,
             onlyQualityMenu,
             embedType,
-            loadingRivestream,
             handleSourceChange,
             renderSourceQualityMeta,
             renderCopySourceButton,
@@ -12096,7 +12906,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             showJ1fMenu,
             showSwiftflowMenu,
             showNexusMenu,
-            showRivestreamMenu,
             showBravoMenu,
             showViperMenu,
             showVoxMenu,
@@ -12107,9 +12916,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             wiflixSources,
             j1fSources,
             swiftflowSources,
-            rivestreamSources,
-            rivestreamCaptions,
-            getOriginalUrl,
             capitalizeFirstLetter,
             getCoflixPreferredUrl,
             getLanguageName,
@@ -12120,11 +12926,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             episodeNumber,
             seasonNumber,
             movieId,
-            selectedExternalLang,
-            externalLanguages,
-            externalLangsLoading,
-            handleExternalLanguageSelect,
+            externalTracks,
             externalLoading,
+            externalProviderErrors,
+            preferredSubtitleLang,
             translateSubsTo,
             setTranslateSubsTo,
             translationProgress,
@@ -12138,27 +12943,37 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             loadExternalSubtitle,
             setLoadingSubtitle,
             selectedExternalSub,
-            externalSubs,
             setCurrentSubtitle,
             setSubtitleContainerVisible,
             refreshActiveCues,
-            subtitleStyle,
-            updateSubtitleFontSize,
-            updateSubtitleBackgroundOpacity,
-            updateSubtitleColor,
-            formatDelay,
-            resetSubtitleDelay,
-            updateSubtitleDelay,
+            subtitlePreferences,
+            patchSubtitlePreferences,
+            previewSubtitlePreferences,
+            commitSubtitlePreferences,
+            resetSubtitleAppearance,
             playbackSpeed,
             handlePlaybackSpeedChange,
             saveProgressEnabled,
             setSaveProgressEnabled,
             autoNextEpisodeEnabled,
             setAutoNextEpisodeEnabled,
-            nextContentThresholdMode,
-            setNextContentThresholdMode,
-            nextContentThresholdValue,
-            setNextContentThresholdValue,
+            keepFullscreenOnEpisodeChange,
+            setKeepFullscreenOnEpisodeChange,
+            resumePlaybackOnEpisodeChange,
+            setResumePlaybackOnEpisodeChange,
+            nextPrefs,
+            onNextPrefsChange: updateNextPrefs,
+            skipSettings,
+            segmentProviderStatus,
+            segmentProviderDetail,
+            onSkipSettingsChange: handleSkipSettingsChange,
+            onSegmentTypeChange: handleSegmentTypeChange,
+            onSegmentColorChange: handleSegmentColorChange,
+            onProviderToggle: handleProviderToggle,
+            onProviderReorder: handleProviderReorder,
+            onSkipSettingsReset: handleSkipSettingsReset,
+            onOpenSegmentStudio: (tvShowId || movieId) ? openStudio : undefined,
+            communitySubmissionCount: communitySubmissions.length,
             resetCurrentProgress,
             audioEnhancerMode,
             handleAudioEnhancerChange,
@@ -12601,279 +13416,5 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     </div>
   );
 });
-
-const NextMovieOverlay: React.FC<{
-  movie: NonNullable<HLSPlayerProps['nextMovie']>;
-  onPlay: () => void;
-  onIgnore: () => void;
-}> = ({ movie, onPlay, onIgnore }) => {
-  const navigate = useNavigate();
-  const { t } = useTranslation();
-  const isMobile = window.innerWidth < 768;
-  const isLandscape = window.innerWidth > window.innerHeight;
-
-  // Adapter les dimensions pour le mode paysage sur mobile
-  const getPositionClasses = () => {
-    if (isMobile) {
-      if (isLandscape) {
-        // Mode paysage sur mobile
-        return {
-          container: 'left-auto right-8 bottom-4 w-[240px] h-32',
-          image: 'w-14'
-        };
-      } else {
-        // Mode portrait sur mobile
-        return {
-          container: 'left-0 right-0 w-[96%] mx-auto mb-2 h-40',
-          image: 'w-20'
-        };
-      }
-    } else {
-      // Desktop
-      return {
-        container: 'right-0 m-4 w-1/3 h-48',
-        image: 'w-32'
-      };
-    }
-  };
-
-  const positionClasses = getPositionClasses();
-
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className={`absolute ${positionClasses.container} bg-black/80 rounded-lg overflow-hidden`}
-    >
-      <div className="flex h-full">
-        <img
-          src={`https://image.tmdb.org/t/p/w300${movie.poster_path}`}
-          alt={movie.title}
-          className={`h-full ${positionClasses.image} object-cover`}
-        />
-        <div className="flex-1 p-4 flex flex-col justify-between">
-          <div>
-            <div className="flex justify-between items-start">
-              <h3 className={`${isMobile ? 'text-base' : 'text-lg'} font-bold mb-1`}>{t('watch.upNext')}</h3>
-              <button
-                onClick={onIgnore}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                ✕
-              </button>
-            </div>
-            <p className={`${isMobile ? 'text-xs' : 'text-sm'} font-medium`}>{movie.title}</p>
-            <p className={`${isMobile ? 'text-xs' : 'text-xs text-gray-400'} ${isLandscape && isMobile ? 'hidden' : ''}`}>{movie.overview}</p>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={() => navigate(`/movie/${encodeId(movie.id)}`)}
-              className={`px-4 py-1 bg-white text-black ${isMobile ? 'text-xs' : 'text-sm'} font-medium rounded hover:bg-gray-200 transition-colors`}
-            >
-              {t('watch.playback')}
-            </button>
-            <button
-              onClick={onPlay}
-              className={`px-4 py-1 bg-gray-600/50 text-white ${isMobile ? 'text-xs' : 'text-sm'} font-medium rounded hover:bg-gray-600 transition-colors`}
-            >
-              {t('watch.rewatch')}
-            </button>
-          </div>
-        </div>
-      </div>
-    </motion.div>
-  );
-};
-
-const NextUpPrompt: React.FC<{
-  movie: NonNullable<HLSPlayerProps['nextMovie']>;
-  movieInfo: MovieInfo;
-  onPlay: () => void;
-  onIgnore: () => void;
-}> = ({ movie, movieInfo, onIgnore }) => {
-  const navigate = useNavigate();
-  const { t } = useTranslation();
-  const isMobile = window.innerWidth < 768;
-  const isLandscape = window.innerWidth > window.innerHeight;
-
-  // Restore responsive bottom-right positioning
-  const getPositionClasses = () => {
-    const isFullscreen = !!document.fullscreenElement;
-    if (isMobile) {
-      if (isLandscape) {
-        // Mobile Landscape: Bottom right, slightly smaller
-        return {
-          container: `${isFullscreen ? 'bottom-16' : 'bottom-4'} right-4 w-64 h-36`,
-          image: 'w-16'
-        };
-      } else {
-        // Mobile Portrait: Bottom center, almost full width
-        return {
-          container: `${isFullscreen ? 'bottom-16' : 'bottom-2'} left-2 right-2 w-auto h-40`,
-          image: 'w-20'
-        };
-      }
-    } else {
-      // Desktop: Bottom right, larger
-      return {
-        container: `${isFullscreen ? 'bottom-20' : 'bottom-4'} right-4 w-96 h-48`,
-        image: 'w-32'
-      };
-    }
-  };
-
-  const positionClasses = getPositionClasses();
-
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className={`absolute ${positionClasses.container} bg-black/80 rounded-lg overflow-hidden z-50`}
-    >
-      <div className="flex h-full">
-        <img
-          src={`https://image.tmdb.org/t/p/w300${movie.poster_path}`}
-          alt={movie.title}
-          className={`h-full ${positionClasses.image} object-cover`}
-        />
-        <div className="flex-1 p-4 flex flex-col justify-between">
-          <div>
-            <div className="flex justify-between items-start">
-              <h3 className={`${isMobile ? 'text-base' : 'text-lg'} font-bold mb-1`}>{t('watch.upNext')}</h3>
-              <button
-                onClick={onIgnore}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                ✕
-              </button>
-            </div>
-            <p className={`${isMobile ? 'text-xs' : 'text-sm'} font-medium`}>{movie.title}</p>
-            <p className={`${isMobile ? 'text-xs' : 'text-xs text-gray-400'} ${isLandscape && isMobile ? 'hidden' : ''}`}>
-              {movieInfo.releaseDate.split('-')[0]} • {movieInfo.rating.toFixed(1)}/10
-            </p>
-            <p className={`${isLandscape && isMobile ? 'hidden' : 'text-xs line-clamp-1'} ${!isMobile ? 'text-gray-400 line-clamp-2' : ''} mt-1`}>
-              {movieInfo.overview}
-            </p>
-          </div>
-          <div className="flex gap-2 mt-1">
-            <button
-              onClick={() => navigate(`/movie/${encodeId(movie.id)}`)}
-              className={`px-4 py-1 bg-white text-black ${isMobile ? 'text-xs' : 'text-sm'} font-medium rounded hover:bg-gray-200 transition-colors`}
-            >
-              {t('watch.playback')}
-            </button>
-            <button
-              onClick={onIgnore}
-              className={`px-4 py-1 bg-gray-600/50 text-white ${isMobile ? 'text-xs' : 'text-sm'} font-medium rounded hover:bg-gray-600 transition-colors`}
-            >
-              {t('watch.later')}
-            </button>
-          </div>
-        </div>
-      </div>
-    </motion.div>
-  );
-};
-
-const NextEpisodePrompt: React.FC<NextEpisodePromptProps> = ({ nextEpisode, tvShow, onPlay, onIgnore, shouldHide, getMaskedContent }) => {
-  const { t } = useTranslation();
-  const handlePlay = () => {
-    onPlay();
-  };
-  const isMobile = window.innerWidth < 768;
-  const isLandscape = window.innerWidth > window.innerHeight;
-
-  // Utilise la même logique de positionnement que NextUpPrompt
-  const getPositionClasses = () => {
-    const isFullscreen = !!document.fullscreenElement;
-    if (isMobile) {
-      if (isLandscape) {
-        // Mobile paysage : bas droite, plus petit
-        return {
-          container: `${isFullscreen ? 'bottom-16' : 'bottom-4'} right-4 w-64 h-36`,
-          image: 'w-16'
-        };
-      } else {
-        // Mobile portrait : bas centre, presque toute la largeur
-        return {
-          container: `${isFullscreen ? 'bottom-16' : 'bottom-2'} left-2 right-2 w-auto h-40`,
-          image: 'w-20'
-        };
-      }
-    } else {
-      // Desktop : bas droite, plus grand
-      return {
-        container: `${isFullscreen ? 'bottom-20' : 'bottom-4'} right-4 w-96 h-48`,
-        image: 'w-32'
-      };
-    }
-  };
-
-  const positionClasses = getPositionClasses();
-
-  if (!nextEpisode) return null;
-
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className={`absolute bottom-0 ${positionClasses.container} bg-black/80 rounded-lg overflow-hidden`}
-    >
-      <div className="flex h-full">
-        {tvShow?.backdrop_path && (
-          shouldHide('episodeImages') ? (
-            <div className={`h-full ${positionClasses.image} bg-gray-600 flex items-center justify-center`}>
-              <span className="text-gray-400 text-xs">{t('watch.hiddenImage')}</span>
-            </div>
-          ) : (
-            <img
-              src={`https://image.tmdb.org/t/p/w500${tvShow.backdrop_path}`}
-              className={`h-full ${positionClasses.image} object-cover`}
-              alt={tvShow.name}
-            />
-          )
-        )}
-        <div className="flex-1 p-4 flex flex-col justify-between">
-          <div>
-            <div className="flex justify-between items-start">
-              <h3 className={`${isMobile ? 'text-base' : 'text-lg'} font-bold mb-1`}>{t('watch.upNext')}</h3>
-              <button
-                onClick={onIgnore}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                ✕
-              </button>
-            </div>
-            <p className={`${isMobile ? 'text-xs' : 'text-sm'} font-medium`}>
-              {shouldHide('episodeNames')
-                ? getMaskedContent((nextEpisode.name || nextEpisode.title || ''), 'episodeNames', undefined, nextEpisode.episodeNumber || nextEpisode.episode_number)
-                : `${nextEpisode.episodeNumber || nextEpisode.episode_number}. ${nextEpisode.name || nextEpisode.title || ''}`}
-            </p>
-
-            <p className={`${isLandscape && isMobile ? 'hidden' : 'text-xs line-clamp-1'} ${!isMobile ? 'text-gray-400 line-clamp-2' : ''} mt-1`}>
-              {shouldHide('episodeOverviews')
-                ? getMaskedContent(nextEpisode.overview || '', 'episodeOverviews', undefined, nextEpisode.episodeNumber || nextEpisode.episode_number)
-                : (nextEpisode.overview || '')}
-            </p>
-          </div>
-          <div className="flex gap-2 mt-1">
-            <button
-              onClick={handlePlay}
-              className={`px-4 py-1 bg-white text-black ${isMobile ? 'text-xs' : 'text-sm'} font-medium rounded hover:bg-gray-200 transition-colors`}
-            >
-              {t('watch.playback')}
-            </button>
-            <button
-              onClick={onIgnore}
-              className={`px-4 py-1 bg-gray-600/50 text-white ${isMobile ? 'text-xs' : 'text-sm'} font-medium rounded hover:bg-gray-600 transition-colors`}
-            >
-              {t('watch.later')}
-            </button>
-          </div>
-        </div>
-      </div>
-    </motion.div>
-  );
-};
 
 export default memo(HLSPlayer); // Envelopper avec React.memo

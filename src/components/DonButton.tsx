@@ -3,6 +3,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { Heart, X } from "lucide-react";
+import { getOverlayPortalRoot } from "../utils/overlayPortal";
 
 const DonButton: React.FC = () => {
   const { t } = useTranslation();
@@ -159,7 +160,7 @@ const DonButton: React.FC = () => {
                   <p className="text-sm text-gray-400 mb-2">{t('donate.recoverVipAfterDonation')}</p>
                   <div className="space-y-2">
                     <p className="text-sm">
-                      📱 <span className="font-medium">Discord:</span> mysticsaba
+                      📱 <span className="font-medium">Discord:</span> mysticsaba_alt
                     </p>
                     <p className="text-sm">
                       📱 <span className="font-medium">Telegram:</span>{" "}
@@ -204,7 +205,7 @@ const DonButton: React.FC = () => {
   );
 
   // Utiliser createPortal pour rendre le modal au niveau du body
-  return createPortal(modalContent, document.body);
+  return createPortal(modalContent, getOverlayPortalRoot());
 };
 
 export default DonButton;

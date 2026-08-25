@@ -105,6 +105,14 @@ internal class CronetMediaProxyUpstream(
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeRequestHeaders(target.headers))
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeLocalRequestHeaders(localRequestHeaders))
         mergedHeaders.putIfAbsent("Sec-Ch-Ua", MediaProxyPolicy.PLAYBACK_SEC_CH_UA)
+        mergedHeaders.putIfAbsent(
+            "Sec-Ch-Ua-Mobile",
+            MediaProxyPolicy.PLAYBACK_SEC_CH_UA_MOBILE,
+        )
+        mergedHeaders.putIfAbsent(
+            "Sec-Ch-Ua-Platform",
+            MediaProxyPolicy.PLAYBACK_SEC_CH_UA_PLATFORM,
+        )
         mergedHeaders.putIfAbsent("Sec-Fetch-Site", "cross-site")
         mergedHeaders.putIfAbsent("Sec-Fetch-Mode", "cors")
         mergedHeaders.putIfAbsent("Sec-Fetch-Dest", "empty")
@@ -133,7 +141,7 @@ internal class CronetMediaProxyUpstream(
             }
         }
 
-        return runCronet(activeEngine, target, mergedHeaders)
+        return runCronet(activeEngine, target, mergedHeaders, localRequestHeaders)
             ?: fallback.execute(target, localRequestHeaders)
     }
 
@@ -146,6 +154,7 @@ internal class CronetMediaProxyUpstream(
         engine: CronetEngine,
         target: MediaProxyTarget,
         headers: Map<String, String>,
+        localRequestHeaders: Map<String, String>,
     ): MediaProxyUpstreamResponse? {
         val callbackExecutor: Executor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "MovixCronetProxy").apply { isDaemon = true }
@@ -185,6 +194,18 @@ internal class CronetMediaProxyUpstream(
             val name = entry.key
             responseHeaders.merge(name, entry.value) { a, b -> "$a, $b" }
         }
+
+        // Corps non relevé ici : il arrive en flux et le lire le consommerait
+        // pour le lecteur. Ce sont les en-têtes émis qui départagent un 403.
+        MediaProxyJournal.record(
+            phase = "media/cronet",
+            method = target.method,
+            url = info.url ?: target.upstreamUrl,
+            requestHeaders = headers,
+            statusCode = info.httpStatusCode,
+            responseHeaders = responseHeaders,
+            localRequestHeaders = localRequestHeaders,
+        )
 
         return MediaProxyUpstreamResponse(
             statusCode = info.httpStatusCode,

@@ -346,7 +346,7 @@ function listByTitle({ type, titleId, season, episode } = {}) {
 const FAILED_MARKER_TTL_DEFAULT_MS = 2 * 60 * 60 * 1000; // 2h
 const FAILED_MARKER_TTL_BY_CODE = {
   sqlite_miss: 0,                        // 0 — always recheck sqlite (covers post-deploy snapshot additions like links_small)
-  live_no_directdl: 2 * 60 * 60 * 1000,  // 2h — hydracker has no raw link, persistent
+  live_no_directdl: 2 * 60 * 60 * 1000,  // 2h — hydracker returned no usable URL, persistent
   live_hydracker_error: 5 * 60 * 1000,   // 5min — transient upstream blip
 };
 // Keep the legacy export name for backwards compatibility with consumers

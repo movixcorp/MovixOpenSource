@@ -4,7 +4,7 @@ import { Search, Loader2, Film, Tv2, Play, Crown, ArrowLeft, X } from 'lucide-re
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { isUserVip } from '../../utils/authUtils';
-import { MAIN_API, buildProxyUrl } from '../../config/runtime';
+import { MAIN_API } from '../../config/runtime';
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
 
@@ -12,6 +12,8 @@ interface FtvProgram {
   title: string;
   description: string;
   url: string;
+  // Jeton signé émis par l'API : c'est lui qu'on transporte, pas l'URL.
+  url_token?: string | null;
   thumbnail: string | null;
   type: string;
   channel: string | null;
@@ -24,6 +26,7 @@ interface FtvVideo {
   titleLeading: string;
   description: string;
   url: string;
+  url_token?: string | null;
   thumbnail: string | null;
   type: string;
   channel: string | null;
@@ -130,14 +133,14 @@ const FranceTVBrowse: React.FC = () => {
     doSearch(query);
   };
 
-  const navigateToInfo = (url: string) => {
-    const encoded = btoa(encodeURIComponent(url));
-    navigate(`/ftv/info/${encoded}`);
+  // On navigue avec le jeton signé émis par l'API, jamais avec l'URL : le
+  // navigateur transporte une adresse qu'il ne peut ni lire ni remplacer.
+  const navigateToInfo = (token?: string | null) => {
+    if (token) navigate(`/ftv/info/${token}`);
   };
 
-  const navigateToPlayer = (url: string) => {
-    const encoded = btoa(encodeURIComponent(url));
-    navigate(`/ftv/watch/${encoded}`);
+  const navigateToPlayer = (token?: string | null) => {
+    if (token) navigate(`/ftv/watch/${token}`);
   };
 
   // ─── Search & results screen ──────────────────────────────────────────────
@@ -259,13 +262,13 @@ const FranceTVBrowse: React.FC = () => {
                       transition={{ delay: i * 0.03 }}
                     >
                       <button
-                        onClick={() => navigateToInfo(prog.url)}
+                        onClick={() => navigateToInfo(prog.url_token)}
                         className="group w-full text-left cursor-pointer"
                       >
                         <div className="relative aspect-video rounded-xl overflow-hidden bg-zinc-800 mb-2">
                           {prog.thumbnail ? (
                             <img
-                              src={buildProxyUrl(prog.thumbnail)}
+                              src={prog.thumbnail}
                               alt={prog.title}
                               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                               loading="lazy"
@@ -316,13 +319,13 @@ const FranceTVBrowse: React.FC = () => {
                       transition={{ delay: i * 0.03 }}
                     >
                       <button
-                        onClick={() => navigateToPlayer(video.url)}
+                        onClick={() => navigateToPlayer(video.url_token)}
                         className="group w-full text-left cursor-pointer"
                       >
                         <div className="relative aspect-video rounded-xl overflow-hidden bg-zinc-800 mb-2">
                           {video.thumbnail ? (
                             <img
-                              src={buildProxyUrl(video.thumbnail)}
+                              src={video.thumbnail}
                               alt={video.title}
                               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                               loading="lazy"

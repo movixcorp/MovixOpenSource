@@ -6,6 +6,7 @@ import { X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { cn } from "@/lib/utils";
+import { getOverlayPortalRoot } from "@/utils/overlayPortal";
 
 const Dialog = DialogPrimitive.Root;
 const DialogTrigger = DialogPrimitive.Trigger;
@@ -36,7 +37,7 @@ const DialogContent = React.forwardRef<
     const { t } = useTranslation();
 
     return (
-        <DialogPortal>
+        <DialogPortal container={getOverlayPortalRoot()}>
             <DialogOverlay />
             <DialogPrimitive.Content
                 ref={ref}

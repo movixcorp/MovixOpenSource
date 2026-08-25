@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getFrembedBase } from '../utils/frembedConfig';
 import { useParams, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
@@ -10,13 +9,12 @@ import AddToListButton from '../components/AddToListButton';
 import DetailsSkeleton from '../components/skeletons/DetailsSkeleton';
 
 import ShareButtons from '../components/ShareButtons';
-import HLSPlayer from '../components/HLSPlayer';
 import { useAdFreePopup } from '../context/AdFreePopupContext';
-import AdFreePlayerAds from '../components/AdFreePlayerAds';
 import EmblaCarousel from '../components/EmblaCarousel';
 import { encodeId, getTmdbId } from '../utils/idEncoder';
 import CommentsSection from '../components/CommentsSection';
-import LikeDislikeButton from '../components/LikeDislikeButton';
+import LikeDislikeButton, { calculateLikeDislikeRating, type LikeDislikeStats } from '../components/LikeDislikeButton';
+import MovixRatingInfoModal from '../components/MovixRatingInfoModal';
 import { useWrappedTracker } from '../hooks/useWrappedTracker';
 import { buildSiteUrl } from '../config/runtime';
 import LazySection from '../components/LazySection';
@@ -25,6 +23,12 @@ import { getTmdbLanguage } from '../i18n';
 import i18n from '../i18n';
 import { useProfile } from '../context/ProfileContext';
 import { getClassificationLabel as getClassificationLabelUtil, isContentAllowed } from '../utils/certificationUtils';
+import CharactersSection from '../components/CharactersSection';
+import DetailExtraMetadata from '../components/DetailExtraMetadata';
+import { isLikelyAnime } from '../utils/animeSignals';
+import { loadDetailCharacters, type DetailCharacters } from '../services/detailCharacters';
+import { normalizeAlternateTitles, normalizeKeywords, type AlternateTitle } from '../utils/tmdbMetadata';
+import { rememberMedia } from '../utils/mediaSearchIndex';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -59,57 +63,6 @@ interface FrembedResponse {
       link: string;
     }>;
   };
-}
-
-interface CoflixResponse {
-  tmdb_details: {
-    id: number;
-    title: string;
-    original_title: string;
-    release_date: string;
-    poster_path: string;
-    backdrop_path: string;
-    overview: string;
-    vote_average: number;
-  };
-  iframe_src: string;
-  player_links: Array<{
-    decoded_url: string;
-    quality: string;
-    language: string;
-  }>;
-}
-
-interface OmegaMovieResponse {
-  player_links: Array<{
-    player: string;
-    link: string;
-    is_hd: boolean;
-  }>;
-  version: string;
-}
-
-interface AdFreeMovieResult {
-  title: string;
-  year: number;
-  overview: string;
-  iframeSrc: string;
-  tmdb: {
-    id: number;
-    title: string;
-    poster_path: string;
-    vote_average: number;
-    match_score: number;
-  };
-}
-
-interface NightflixSource {
-  src: string;
-  m3u8: string;
-  quality?: string;
-  language?: string;
-  sub?: string;
-  label?: string;
 }
 
 interface CastMember {
@@ -158,6 +111,11 @@ interface MovieExtended extends Movie {
   budget?: number;
   revenue?: number;
   status?: string;
+  original_language?: string;
+  original_title?: string;
+  /** Arrivent par `append_to_response`, d'où les deux formes propres à TMDB. */
+  keywords?: { keywords?: Array<{ id: number; name: string }> };
+  alternative_titles?: { titles?: Array<{ iso_3166_1?: string; title?: string; type?: string }> };
 }
 
 interface TMDBImage {
@@ -862,130 +820,6 @@ const ImagesSection = ({ movieId, images, loading }: { movieId: string; images: 
   );
 };
 
-const checkMovieAvailability = async (movieId: string) => {
-  try {
-    const customLinks: string[] = [];
-    const mp4Links: { url: string; label?: string; language?: string; isVip?: boolean }[] = [];
-    const uniqueUrls = new Set<string>();
-
-    try {
-      const response = await axios.get(`${MAIN_API}/api/links/movie/${movieId}`);
-      if (response.data?.success && response.data?.data?.links) {
-        const rawLinks = response.data.data.links;
-        console.log('Raw API links:', rawLinks);
-
-        rawLinks.forEach((item: any) => {
-          if (typeof item === 'string') {
-            if (item.toLowerCase().endsWith('.mp4') && !uniqueUrls.has(item)) {
-              uniqueUrls.add(item);
-              mp4Links.push({
-                url: item,
-                label: '1080p+',
-                language: 'Français',
-                isVip: false
-              });
-            } else if (!customLinks.includes(item)) {
-              customLinks.push(item);
-            }
-          } else if (typeof item === 'object' && item !== null && typeof item.url === 'string') {
-            if (item.url.toLowerCase().endsWith('.mp4') && !uniqueUrls.has(item.url)) {
-              uniqueUrls.add(item.url);
-              mp4Links.push({
-                url: item.url,
-                label: item.label || '1080p+',
-                language: item.language || 'Français',
-                isVip: item.isVip
-              });
-            } else if (!customLinks.includes(item.url)) {
-              customLinks.push(item.url);
-            }
-          }
-        });
-      }
-    } catch (apiError) {
-      console.error('Error fetching custom movie links from API:', apiError);
-    }
-
-    // Vérifier la disponibilité sur Frembed
-    const frembedResponse = await axios.get(`${MAIN_API}/movies/check/${movieId}`);
-    const isFrembedAvailable = frembedResponse.data.status === 200 && frembedResponse.data.result.Total === 1;
-
-    // Toujours disponible car on peut proposer VO/VOSTFR
-    return {
-      isAvailable: true,
-      customLinks: [],
-      frembedAvailable: isFrembedAvailable,
-      mp4Links: []
-    };
-  } catch (error) {
-    console.error('Error checking availability:', error);
-    // Toujours disponible car on peut proposer VO/VOSTFR même en cas d'erreur
-    return {
-      isAvailable: true,
-      customLinks: [],
-      frembedAvailable: false,
-      mp4Links: []
-    };
-  }
-};
-
-// Vérification de la disponibilité Darkino
-const checkDarkinoAvailability = async (
-  movieTitle: string,
-  _releaseDate: string,
-  movieId: string,
-  updateRetryMessage?: (message: string) => void, // Ajout du callback
-  retryCount = 0
-) => {
-  const retryMessages = [
-    "Finalisation de la recherche...",
-    "Préparation de la source alternative...",
-    "Vérification des accès...",
-    "Optimisation de la connexion..."
-  ];
-
-  try {
-    const searchResponse = await axios.get(`${MAIN_API}/api/search`, {
-      params: {
-        title: movieTitle
-      }
-    });
-    if (!searchResponse.data.results) {
-      return false;
-    }
-
-    const matchingMovie = searchResponse.data.results.find((result: any) => {
-      return (result.have_streaming === 1 || result.have_streaming === 0) &&
-        result.type !== 'series' &&
-        result.tmdb_id &&
-        String(result.tmdb_id) === String(movieId);
-    });
-
-    if (matchingMovie) {
-      const downloadResponse = await axios.get(`${MAIN_API}/api/films/download/${matchingMovie.id}`);
-      const sources: NightflixSource[] = Array.isArray(downloadResponse.data?.sources)
-        ? downloadResponse.data.sources.filter((source: NightflixSource) => typeof source?.m3u8 === 'string' && source.m3u8.trim() !== '')
-        : [];
-      return sources.length > 0
-        ? { available: true, sources, darkinoId: String(matchingMovie.id) }
-        : false;
-    }
-    return false;
-  } catch (error) {
-    console.error('Erreur lors de la vérification Darkino:', error);
-    if (retryCount < 3) {
-      // Appeler le callback pour mettre à jour le message AVANT d'attendre
-      if (updateRetryMessage) {
-        updateRetryMessage(retryMessages[retryCount % retryMessages.length]);
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
-      // Passer le callback à l'appel récursif
-      return checkDarkinoAvailability(movieTitle, _releaseDate, movieId, updateRetryMessage, retryCount + 1);
-    }
-    return false;
-  }
-};
-
 // Définir une interface NextMovieType pour le film suivant
 interface NextMovieType {
   id: number;
@@ -996,949 +830,6 @@ interface NextMovieType {
   poster_path: string;
   runtime: number;
 }
-
-// Utiliser cette interface dans le composant VideoPlayer
-const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?: string | null }) => {
-  const { t } = useTranslation();
-  const [videoSource, setVideoSource] = useState<string | null>(null);
-  const [customSources, setCustomSources] = useState<string[]>([]);
-  // Change l'état initial pour ne pas sélectionner de lecteur par défaut et corrige le type
-  type PlayerSourceType = 'primary' | 'peachify' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'adfree' | 'multi' | 'omega' | 'darkino' | 'mp4' | number;
-  const [selectedSource, setSelectedSource] = useState<PlayerSourceType | null>(null);
-  const [frembedAvailable, setFrembedAvailable] = useState(true);
-  const [adFreeSource, setAdFreeSource] = useState<string | null>(null);
-  const [loadingAdFree, setLoadingAdFree] = useState(true);
-  const [movieTitle, setMovieTitle] = useState<string>('');
-  const [coflixData, setCoflixData] = useState<CoflixResponse | null>(null);
-  const [selectedPlayerLink, setSelectedPlayerLink] = useState<number>(0);
-  const [loadingCoflix, setLoadingCoflix] = useState(true);
-  const [showVostfrOptions, setShowVostfrOptions] = useState(false);
-
-  // Store scroll position for fullscreen handling
-  const [savedScrollPosition, setSavedScrollPosition] = useState<number>(0);
-
-  // Omega states
-  const [omegaData, setOmegaData] = useState<OmegaMovieResponse | null>(null);
-  const [loadingOmega, setLoadingOmega] = useState(true);
-  const [selectedOmegaPlayer, setSelectedOmegaPlayer] = useState<number>(0);
-
-  // Darkino states
-  const [darkinoAvailable, setDarkinoAvailable] = useState(false);
-  const [loadingDarkino, setLoadingDarkino] = useState(true);
-  const [darkinoSources, setDarkinoSources] = useState<any[]>([]);
-  const [darkinoId, setDarkinoId] = useState<string | null>(null);
-  const [selectedDarkinoSource, setSelectedDarkinoSource] = useState<number>(0);
-  const [loadingError, setLoadingError] = useState<boolean>(false);
-  const [watchProgress, setWatchProgress] = useState<number>(0);
-  const [vipRetryMessage, setVipRetryMessage] = useState<string | null>(null); // État pour le message de retry
-
-  // MP4 sources states
-  const [mp4Sources, setMp4Sources] = useState<{ url: string; label?: string; language?: string; isVip?: boolean }[]>([]);
-  const [selectedMp4Source, setSelectedMp4Source] = useState<number>(0);
-
-  // State for iframe poster logic
-  const [showIframe, setShowIframe] = useState(true);
-
-  // Référence pour tracker la source actuelle de lecture
-  const currentSourceRef = useRef<string>('darkino');
-
-  // Modifier l'état du film suivant pour utiliser la nouvelle interface
-  const [nextMovie, setNextMovie] = useState<NextMovieType | null>(null);
-  const [loadingNextMovie, setLoadingNextMovie] = useState<boolean>(false);
-  const navigate = useNavigate();
-
-  // Add state for M3U8 loading timeout
-  const [m3u8Timeout, setM3u8Timeout] = useState<number>(3000); // Default 3000ms
-
-  const {
-    showAdFreePopup,
-    adType,
-    playerToShow,
-    shouldLoadIframe,
-    isSpecialPlayer,
-    is_vip,
-    showPopupForPlayer,
-    handlePopupClose,
-    handlePopupAccept,
-    resetVipStatus
-  } = useAdFreePopup();
-
-  const requestedSourceRef = useRef<typeof selectedSource | null>(null);
-
-  // Helper pour savoir si la source sélectionnée est VIP (inclure darkino)
-  const isVipSource = (src: typeof selectedSource) => {
-    if (src === 'darkino' || src === 'adfree' || src === 'mp4') return true;
-    if (src === 'multi' && coflixData?.player_links?.[selectedPlayerLink]?.decoded_url?.includes('lecteur6.com')) return true;
-    if (src === 'omega' && omegaData?.player_links?.[selectedOmegaPlayer]?.player &&
-      (omegaData.player_links[selectedOmegaPlayer].player.toLowerCase() === 'supervideo' ||
-        omegaData.player_links[selectedOmegaPlayer].player.toLowerCase() === 'dropload')) return true;
-    return false;
-  };
-
-  // Gestion du click sur un bouton lecteur
-  const handleSelectSource = (src: typeof selectedSource) => {
-    // Si un lecteur est déjà sélectionné, changer directement sans popup
-    if (selectedSource !== null) {
-      setSelectedSource(src);
-      setShowVostfrOptions(false);
-      return;
-    }
-
-    // Show popup only for first player selection
-    requestedSourceRef.current = src;
-
-    // Prepare additional info for the showPopupForPlayer function
-    const additionalInfo = {
-      coflixData: {
-        player_links: coflixData?.player_links || []
-      },
-      omegaData: {
-        player_links: omegaData?.player_links || []
-      }
-    };
-
-    showPopupForPlayer(
-      typeof src === 'string' ? src : 'custom',
-      additionalInfo
-    );
-    return;
-  };
-
-  // Quand la pub est validée, activer le lecteur demandé
-  useEffect(() => {
-    if (!showAdFreePopup && shouldLoadIframe && requestedSourceRef.current !== null) {
-      setSelectedSource(requestedSourceRef.current);
-      setShowVostfrOptions(false);
-      scrollToPlayer();
-      requestedSourceRef.current = null;
-    }
-  }, [showAdFreePopup, shouldLoadIframe]);
-
-  // Ajouter une fonction pour aller au film suivant
-  const handleNextMovie = async (movieId: number) => {
-    navigate(`/movie/${encodeId(movieId)}`);
-  };
-
-  // Corriger la fonction fetchNextMovie pour utiliser la bonne interface
-  const fetchNextMovie = useCallback(async () => {
-    if (!movieId) return;
-
-    try {
-      setLoadingNextMovie(true);
-      const response = await axios.get(
-        `https://api.themoviedb.org/3/movie/${movieId}/recommendations`,
-        {
-          params: {
-            api_key: TMDB_API_KEY,
-            language: getTmdbLanguage(),
-            page: 1
-          }
-        }
-      );
-
-      if (response.data.results && response.data.results.length > 0) {
-        // Ne plus vérifier la disponibilité, prendre directement le premier film recommandé
-        const firstRecommendation = response.data.results[0];
-        setNextMovie({
-          id: firstRecommendation.id,
-          title: firstRecommendation.title,
-          overview: firstRecommendation.overview,
-          release_date: firstRecommendation.release_date,
-          vote_average: firstRecommendation.vote_average,
-          poster_path: firstRecommendation.poster_path,
-          runtime: 0 // Valeur par défaut
-        });
-      }
-    } catch (error) {
-      console.error('Error fetching next movie:', error);
-    } finally {
-      setLoadingNextMovie(false);
-    }
-  }, [movieId]);
-
-  // Appeler fetchNextMovie lors du chargement des sources
-  useEffect(() => {
-    fetchNextMovie();
-  }, [fetchNextMovie]);
-
-  // Ajouter une fonction pour scroller jusqu'au player
-  const scrollToPlayer = () => {
-    // Ajouter un petit délai pour s'assurer que la mise à jour du DOM est terminée
-    setTimeout(() => {
-      const playerElement = document.getElementById('video-player-container'); // Target the container instead
-      if (playerElement) {
-        playerElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-    }, 100);
-  };
-
-  // Function to try the next VIP source when one fails
-  const tryNextDarkinoSource = async () => {
-    if (selectedDarkinoSource < darkinoSources.length - 1) {
-      setLoadingError(false);
-      setSelectedDarkinoSource(prev => prev + 1);
-      return true;
-    }
-    setLoadingError(true);
-    return false;
-  };
-
-  // Function to handle errors with the HLS player
-  const handleHlsError = async () => {
-    console.log('HLS error occurred, trying next source');
-    await tryNextDarkinoSource();
-  };
-
-  // Update the timeout useEffect to use the state variable
-  useEffect(() => {
-    if (selectedSource === 'darkino' && darkinoSources.length > 0) {
-      const loadingTimeoutId = setTimeout(() => {
-        const videoElement = document.querySelector('video');
-        if (videoElement) {
-          if (videoElement.readyState < videoElement.HAVE_METADATA) {
-            console.log(`M3u8 loading timeout after ${m3u8Timeout}ms, trying next source`);
-            handleHlsError();
-          }
-        }
-      }, m3u8Timeout); // Use state variable here
-
-      return () => clearTimeout(loadingTimeoutId);
-    }
-  }, [selectedDarkinoSource, selectedSource, darkinoSources, m3u8Timeout]); // Add m3u8Timeout dependency
-
-  // Helper function to transform coflix.upn display name to movix
-  const getDisplayName = (quality: string) => {
-    if (!quality) return '';
-
-    let displayName = quality;
-
-    // Replace coflix.upn with movix
-    if (displayName.includes('coflix.upn')) {
-      displayName = displayName.replace('coflix.upn', 'movix');
-    }
-
-    // Format "PAS DE PUBLICITE" to title case
-    if (displayName.includes('PAS DE PUBLICITE')) {
-      // Split the string, keeping the parts before and after "PAS DE PUBLICITE"
-      const [mainPart, pubPart] = displayName.split('PAS DE PUBLICITE').map(part => part.trim());
-
-      // Format the "PAS DE PUBLICITE" text to title case
-      const formattedPubText = 'Pas De Publicite';
-
-      // Recombine with proper spacing
-      displayName = mainPart;
-      if (pubPart) {
-        displayName += ` ${formattedPubText} ${pubPart}`;
-      } else {
-        displayName += ` ${formattedPubText}`;
-      }
-
-      // Trim any extra spaces
-      displayName = displayName.trim();
-    }
-
-    return displayName;
-  };
-
-  // Fonction pour mettre à jour le message pendant les retries VIP
-  const updateVipRetryMessage = (message: string) => {
-    setVipRetryMessage(message);
-  };
-
-  // Réinitialiser le message quand le chargement VIP se termine
-  useEffect(() => {
-    if (!loadingDarkino) {
-      setVipRetryMessage(null);
-    }
-  }, [loadingDarkino]);
-
-  const fetchVideoSources = async () => {
-    setVipRetryMessage(null); // Réinitialiser au début de la récupération
-    try {
-      // Récupérer les détails du film pour le titre (nécessaire pour la recherche sans pub et Darkino)
-      const tmdbResponse = await axios.get(`https://api.themoviedb.org/3/movie/${movieId}`, {
-        params: { api_key: TMDB_API_KEY, language: getTmdbLanguage() },
-      }).catch(error => {
-        console.error('Error fetching TMDB data:', error);
-        return { data: { title: '', release_date: '' } };
-      });
-
-      setMovieTitle(tmdbResponse.data.title);
-
-      // Initialize loading states for all sources
-      setLoadingDarkino(true);
-      setLoadingCoflix(true);
-      setLoadingOmega(true);
-      setLoadingAdFree(true);
-
-      // =========== INITIATE ALL ASYNCHRONOUS SOURCE CHECKS IN PARALLEL ===========
-      const darkinoPromise = checkDarkinoAvailability(
-        tmdbResponse.data.title,
-        tmdbResponse.data.release_date,
-        movieId,
-        updateVipRetryMessage
-      ).catch(error => {
-        console.error('Error checking Darkino availability:', error);
-        return false;
-      }).finally(() => setLoadingDarkino(false));
-
-      const availabilityPromise = checkMovieAvailability(movieId)
-        .catch(error => {
-          console.error('Error checking Firebase/Frembed availability:', error);
-          return { customLinks: [], mp4Links: [], frembedAvailable: false };
-        });
-
-      const frembedPromise = axios.get(`${MAIN_API}/movies/check/${movieId}`)
-        .then(response => {
-          const isAvailable = response.data.status === 200 && response.data.result.Total === 1;
-          return { isFrembedAvailable: isAvailable };
-        })
-        .catch(error => {
-          console.error('Error checking Frembed availability:', error);
-          return { isFrembedAvailable: false };
-        });
-
-      const adFreePromise = (
-        tmdbResponse.data.title
-          ? fetchAdFreeSource(tmdbResponse.data.title)
-          : Promise.resolve(null)
-      ).catch(error => {
-        console.error('Error fetching ad-free sources:', error);
-        return null;
-      }).finally(() => setLoadingAdFree(false));
-
-      const coflixPromise = axios.get(`${MAIN_API}/api/tmdb/movie/${movieId}`)
-        .then(response => response.data)
-        .catch(error => {
-          console.error('Error fetching Coflix sources:', error);
-          return null;
-        }).finally(() => setLoadingCoflix(false));
-
-      const omegaPromise = (async () => {
-        try {
-          const imdbResponse = await axios.get(`https://api.themoviedb.org/3/movie/${movieId}/external_ids`, {
-            params: { api_key: TMDB_API_KEY },
-          });
-
-          if (imdbResponse.data && imdbResponse.data.imdb_id) {
-            const imdbId = imdbResponse.data.imdb_id;
-            const omegaResponse = await axios.get(`${MAIN_API}/api/imdb/movie/${imdbId}`);
-            if (omegaResponse.data) {
-              return omegaResponse.data;
-            }
-          }
-          return null;
-        } catch (error) {
-          console.error('Error fetching Omega sources:', error);
-          return null;
-        }
-      })().finally(() => setLoadingOmega(false));
-
-      // =========== AWAIT ALL SOURCE CHECKS TO COMPLETE ===========
-      const [
-        darkinoResult,
-        availabilityResult,
-        frembedResult,
-        adFreeResult, // This is primarily to ensure it completes, state is set in fetchAdFreeSource
-        coflixResult,
-        omegaResult
-      ] = await Promise.all([
-        darkinoPromise,
-        availabilityPromise,
-        frembedPromise,
-        adFreePromise,
-        coflixPromise,
-        omegaPromise
-      ]);
-
-      // =========== PROCESS DARKINO RESULTS ===========
-      if (darkinoResult && typeof darkinoResult === 'object' && darkinoResult.available) {
-        setDarkinoAvailable(true);
-        setDarkinoSources(darkinoResult.sources);
-        setDarkinoId(darkinoResult.darkinoId);
-      } else {
-        setDarkinoAvailable(false);
-        setDarkinoSources([]);
-        setDarkinoId(null);
-      }
-
-      // =========== PROCESS FIREBASE/FREMBED RESULTS ===========
-      const customLinks = availabilityResult.customLinks || [];
-      const fetchedMp4Sources = availabilityResult.mp4Links || [];
-      setMp4Sources(fetchedMp4Sources);
-      setCustomSources(customLinks);
-
-      // =========== PROCESS FREMBED RESULTS ===========
-      const isFrembedAvailable = frembedResult.isFrembedAvailable;
-      setFrembedAvailable(isFrembedAvailable);
-      setVideoSource(`${getFrembedBase()}/api/film.php?id=${movieId}`);
-
-      // =========== PROCESS COFLIX RESULTS ===========
-      if (coflixResult) {
-        setCoflixData(coflixResult);
-      }
-
-      // =========== PROCESS OMEGA RESULTS ===========
-      if (omegaResult) {
-        setOmegaData(omegaResult);
-      }
-
-      // Note: adFreeSource state is set within fetchAdFreeSource function
-
-    } catch (error) {
-      console.error('Error fetching video sources:', error);
-      setFrembedAvailable(false);
-      setVideoSource(`${getFrembedBase()}/api/film.php?id=${movieId}`);
-      setLoadingAdFree(false);
-      setLoadingCoflix(false);
-      setLoadingOmega(false);
-      setLoadingDarkino(false);
-    }
-  };
-
-  const fetchAdFreeSource = async (title: string) => {
-    setLoadingAdFree(true);
-    try {
-      const encodedTitle = encodeURIComponent(title);
-      const response = await axios.get(`${MAIN_API}/search/p/${encodedTitle}`);
-
-      if (response.data && response.data.results && response.data.results.length > 0) {
-        const bestMatch = response.data.results.find((result: AdFreeMovieResult) =>
-          result.tmdb && result.tmdb.id === parseInt(movieId)
-        );
-
-        if (bestMatch && bestMatch.iframeSrc) {
-          setAdFreeSource(bestMatch.iframeSrc);
-        } else {
-          setAdFreeSource(null);
-        }
-      } else {
-        setAdFreeSource(null);
-      }
-    } catch (error) {
-      console.error('Error fetching ad-free source:', error);
-      setAdFreeSource(null);
-    } finally {
-      setLoadingAdFree(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchVideoSources();
-  }, [movieId]);
-
-  // Progress tracking functionality removed
-
-  // Progress saving functionality removed
-
-  // Position saving functionality removed
-
-  // Resume playback functionality removed
-
-  // Add event listener for fullscreen changes to maintain scroll position on iOS
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      const isFullscreen = document.fullscreenElement ||
-        (document as any).webkitFullscreenElement ||
-        (document as any).mozFullScreenElement ||
-        (document as any).msFullscreenElement;
-
-      if (isFullscreen) {
-        setSavedScrollPosition(window.scrollY);
-      } else {
-        setTimeout(() => {
-          window.scrollTo({
-            top: savedScrollPosition,
-            behavior: 'auto'
-          });
-        }, 100);
-      }
-    };
-
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
-    document.addEventListener('mozfullscreenchange', handleFullscreenChange);
-    document.addEventListener('MSFullscreenChange', handleFullscreenChange);
-
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
-      document.removeEventListener('mozfullscreenchange', handleFullscreenChange);
-      document.removeEventListener('MSFullscreenChange', handleFullscreenChange);
-    };
-  }, [savedScrollPosition]);
-
-  if (!videoSource && customSources.length === 0 && !adFreeSource && !coflixData && !loadingAdFree && !loadingCoflix && !loadingOmega) {
-    return (
-      <div className="flex items-center justify-center h-[500px] bg-gray-800 rounded-lg">
-        <p className="text-gray-400">{t('details.movieNotAvailable')}</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="w-full max-w-7xl mx-auto mb-20" id="video-player-container"> {/* Added ID here */}
-      {/* Popup pub VIP */}
-      {showAdFreePopup && (
-        <AdFreePlayerAds
-          onClose={handlePopupClose}
-          onAccept={handlePopupAccept}
-          adType={adType}
-        />
-      )}
-      {/* Message blocage si pub non vue */}
-      {isVipSource(selectedSource) && !shouldLoadIframe && !showAdFreePopup && !is_vip && (
-        <div className="flex items-center justify-center h-[400px] bg-gray-900 rounded-lg text-center">
-          <p className="text-lg text-blue-200 font-semibold">{t('details.adRequired')}</p>
-        </div>
-      )}
-      {!frembedAvailable &&
-        !(darkinoAvailable) &&
-        !(coflixData && coflixData.player_links && coflixData.player_links.length > 0) &&
-        !(omegaData && omegaData.player_links && omegaData.player_links.length > 0) &&
-        !adFreeSource &&
-        !loadingDarkino && !loadingCoflix && !loadingOmega && !loadingAdFree && (
-          <div className="bg-yellow-800/30 border border-yellow-600 p-4 rounded-lg mb-6">
-            <p className="text-yellow-200 text-sm">
-              {t('details.episodeNotOnMainSource')}
-              {t('details.contactDiscord')}
-            </p>
-          </div>
-        )}
-
-      <div className="flex justify-center gap-4 mb-4 flex-wrap">
-        <button
-          onClick={() => handleSelectSource('darkino')}
-          disabled={loadingDarkino || !darkinoAvailable}
-          className={`px-4 py-2 rounded flex items-center gap-2 ${selectedSource === 'darkino'
-            ? 'bg-orange-600 text-white'
-            : loadingDarkino
-              ? 'bg-orange-700/50 text-white cursor-not-allowed'
-              : darkinoAvailable
-                ? 'bg-orange-700/70 hover:bg-orange-600/90 text-white'
-                : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
-            }`}
-        >
-          {loadingDarkino ? (
-            <>
-              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              {vipRetryMessage || t('details.searchingNightflix')}
-            </>
-          ) : darkinoAvailable ? (
-            <>
-              <span className="inline-block w-2 h-2 bg-orange-400 rounded-full"></span>
-              {t('details.playerNightflix')}
-            </>
-          ) : !loadingDarkino && movieTitle ? (
-            <>
-              <span className="inline-block w-2 h-2 bg-gray-400 rounded-full"></span>
-              {t('details.nightflixNotAvailable')}
-            </>
-          ) : null}
-        </button>
-
-        {frembedAvailable && (
-          <button
-            onClick={() => handleSelectSource('primary')}
-            className={`px-4 py-2 rounded ${selectedSource === 'primary'
-              ? 'bg-red-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600'
-              }`}
-          >
-            {t('details.playerVF')}
-          </button>
-        )}
-
-        <div className="relative">
-          <button
-            onClick={() => setShowVostfrOptions(!showVostfrOptions)}
-            className={`px-4 py-2 rounded flex items-center gap-2 ${(selectedSource === 'peachify' || selectedSource === 'vostfr' || selectedSource === 'videasy' || selectedSource === 'vidsrccc' || selectedSource === 'vidsrcsu' || selectedSource === 'vidsrcwtf1' || selectedSource === 'vidsrcwtf5')
-              ? 'bg-red-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600'
-              }`}
-          >
-            {t('details.playersVOSTFR')}
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              className={`w-4 h-4 transition-transform ${showVostfrOptions ? 'rotate-180' : ''}`}
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-
-          {showVostfrOptions && (
-            <div className="absolute z-50 top-full left-0 mt-1 bg-gray-800 rounded-lg shadow-lg overflow-hidden min-w-[200px]">
-              <button onClick={() => handleSelectSource('peachify')} className={`w-full px-4 py-2 text-left ${selectedSource === 'peachify' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Peachify</button>
-              <button onClick={() => handleSelectSource('vostfr')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vostfr' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.wtf 3</button>
-              <button onClick={() => handleSelectSource('videasy')} className={`w-full px-4 py-2 text-left ${selectedSource === 'videasy' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidlink</button>
-              <button onClick={() => handleSelectSource('vidsrccc')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrccc' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.io</button>
-              <button onClick={() => handleSelectSource('vidsrcsu')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcsu' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.su</button>
-              <button onClick={() => handleSelectSource('vidsrcwtf1')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf1' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.wtf 1</button>
-              <button onClick={() => handleSelectSource('vidsrcwtf5')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf5' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.wtf 5</button>
-            </div>
-          )}
-        </div>
-
-        <button
-          onClick={() => handleSelectSource('multi')}
-          disabled={loadingCoflix || !(coflixData && coflixData.player_links && coflixData.player_links.length > 0)}
-          className={`px-4 py-2 rounded flex items-center gap-2 ${selectedSource === 'multi'
-            ? 'bg-blue-600 text-white'
-            : loadingCoflix
-              ? 'bg-blue-700/50 text-white cursor-not-allowed'
-              : (coflixData && coflixData.player_links && coflixData.player_links.length > 0)
-                ? 'bg-blue-700/70 hover:bg-blue-600/90 text-white'
-                : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
-            }`}
-        >
-          {loadingCoflix ? (
-            <>
-              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              {t('details.playerMulti')}
-            </>
-          ) : (
-            <>{t('details.playerMulti')}</>
-          )}
-        </button>
-
-        <button
-          onClick={() => handleSelectSource('omega')}
-          disabled={loadingOmega || !(omegaData && omegaData.player_links && omegaData.player_links.length > 0)}
-          className={`px-4 py-2 rounded flex items-center gap-2 ${selectedSource === 'omega'
-            ? 'bg-purple-600 text-white'
-            : loadingOmega
-              ? 'bg-purple-700/50 text-white cursor-not-allowed'
-              : (omegaData && omegaData.player_links && omegaData.player_links.length > 0)
-                ? 'bg-purple-700/70 hover:bg-purple-600/90 text-white'
-                : 'bg-gray-700/50 text-gray-400 cursor-not-allowed'
-            }`}
-        >
-          {loadingOmega ? (
-            <>
-              <svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              {t('details.playerOmega')}
-            </>
-          ) : (
-            <>
-              {t('details.playerOmega')}
-              <span className="text-xs bg-green-600 text-white px-1 py-0.5 rounded">{t('details.noAds')}</span>
-            </>
-          )}
-        </button>
-
-
-        {customSources.map((src, index) => {
-          const srcLower = src.toLowerCase();
-          const isSeek = srcLower.includes('embedseek.') || srcLower.includes('seekplayer.') || srcLower.includes('seeks.cloud') || srcLower.includes('seekplays.');
-          return (
-          <button
-            key={index}
-            onClick={() => handleSelectSource(index)}
-            className={`px-4 py-2 rounded ${selectedSource === index
-              ? 'bg-red-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600'
-              }`}
-          >
-            {isSeek ? `SeekStreaming ${index + 1}` : t('details.playerNumber', { number:
-              (frembedAvailable ? 1 : 0) +
-              (adFreeSource ? 1 : 0) +
-              2 + index
-            })}
-          </button>
-          );
-        })}
-      </div>
-
-      {/* Removed the duplicate VIP source section here */}
-
-      {selectedSource === 'multi' && coflixData && coflixData.player_links && coflixData.player_links.length > 0 && (
-        <div className="mb-4 bg-gray-900 p-4 rounded-lg">
-          <h3 className="text-lg font-medium mb-3">{t('details.sourcesAvailable')}</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-            {coflixData.player_links.map((link, index) => (
-              <button
-                key={index}
-                onClick={() => {
-                  setSelectedPlayerLink(index);
-                  scrollToPlayer();
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedPlayerLink === index
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium">{getDisplayName(link.quality)}</div>
-                <div className="text-xs opacity-75">{link.language}</div>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {selectedSource === 'omega' && omegaData && omegaData.player_links && omegaData.player_links.length > 0 && (
-        <div className="mb-4 bg-gray-900 p-4 rounded-lg">
-          <h3 className="text-lg font-medium mb-3">{t('details.sourcesOmega')} - {omegaData.version}</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-            {omegaData.player_links.map((playerInfo, index) => (
-              <button
-                key={index}
-                onClick={() => {
-                  setSelectedOmegaPlayer(index);
-                  scrollToPlayer();
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedOmegaPlayer === index
-                  ? 'bg-purple-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium">
-                  {playerInfo.player}
-                  {(playerInfo.player.toLowerCase() === "supervideo" || playerInfo.player.toLowerCase() === "dropload") &&
-                    <span className="ml-2 text-xs bg-green-600 text-white px-1 py-0.5 rounded">{t('details.noAds')}</span>
-                  }
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {(selectedSource === 'darkino' || selectedSource === 'mp4') && (darkinoAvailable || mp4Sources.length > 0) && (
-        <div className="mb-4 bg-gray-900 p-4 rounded-lg">
-          <h3 className="text-lg font-medium mb-3">{t('details.sourcesNightflix')}</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-            {/* MP4 Sources */}
-            {mp4Sources.map((source, index) => (
-              <button
-                key={`mp4-source-${index}`}
-                onClick={() => {
-                  setSelectedSource('mp4');
-                  setSelectedMp4Source(index);
-                  setLoadingError(false);
-                  scrollToPlayer();
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedSource === 'mp4' && selectedMp4Source === index
-                  ? 'bg-orange-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium flex items-center justify-between">
-                  <span>{t('details.sourceMp4', { number: index + 1 })}</span>
-                </div>
-                <div className="text-xs opacity-75 flex items-center">
-                  <span className="text-green-400 font-semibold">{source.label}</span>
-                  <span className="mx-1">•</span>
-                  <span>{source.language || t('details.langFrench')}</span>
-                </div>
-              </button>
-            ))}
-
-            {/* Darkino Sources */}
-            {darkinoSources.map((source, index) => (
-              <button
-                key={`vip-source-${index}`}
-                onClick={() => {
-                  setSelectedSource('darkino');
-                  setSelectedDarkinoSource(index);
-                  setLoadingError(false);
-                  scrollToPlayer();
-                }}
-                className={`px-4 py-2 rounded text-left ${selectedSource === 'darkino' && selectedDarkinoSource === index
-                  ? 'bg-orange-600 text-white'
-                  : 'bg-gray-800 hover:bg-gray-700'
-                  }`}
-              >
-                <div className="font-medium">{source.label || source.quality || t('details.sourceLabel', { number: index + 1 })}</div>
-                <div className="text-xs opacity-75">{source.language || t('details.langFrench')} - {t('details.m3u8Label')}</div>
-              </button>
-            ))}
-          </div>
-
-          {/* Add M3U8 Timeout Control Section Here */}
-          <div className="mt-4 pt-4 border-t border-gray-700">
-            <label htmlFor="m3u8TimeoutInput" className="block text-sm font-medium text-gray-300 mb-2">
-              {t('details.timeoutNightflix')}
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="range"
-                id="m3u8TimeoutInput"
-                min="500"
-                max="10000"
-                step="500"
-                value={m3u8Timeout}
-                onChange={(e) => setM3u8Timeout(parseInt(e.target.value, 10))}
-                className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
-              />
-              <span className="text-sm text-gray-400 font-mono bg-gray-800 px-2 py-1 rounded">
-                {m3u8Timeout}ms
-              </span>
-              <button
-                onClick={() => setM3u8Timeout(3000)} // Reset to default
-                className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded"
-              >
-                {t('common.reset')}
-              </button>
-            </div>
-            <p className="text-xs text-gray-500 mt-1">
-              {t('details.timeoutDescription')}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {selectedSource === 'darkino' ? (
-        // Removed the loadingError ternary. HLSPlayer handles its own loading state.
-        // onError prop automatically tries the next source.
-        <div className="relative w-full h-[calc(100vh-180px)] rounded-lg overflow-hidden bg-black">
-          <HLSPlayer
-            key={`darkino-${selectedDarkinoSource}-${movieId}`} // Added movieId to key for re-mounting on movie change
-            src={darkinoSources[selectedDarkinoSource]?.m3u8 || darkinoSources[0]?.m3u8 || ""}
-            className="w-full h-full rounded-lg"
-            autoPlay={true}
-            onEnded={() => {
-              // If there's an error or when playback ends, try next source
-              if (selectedDarkinoSource < darkinoSources.length - 1) {
-                tryNextDarkinoSource();
-              }
-            }}
-            onError={handleHlsError} // Added onError prop
-            nextMovie={nextMovie as any} // Utiliser un cast temporaire
-            onNextMovie={handleNextMovie}
-            // Use backdropPath for HLS poster
-            poster={backdropPath ? `https://image.tmdb.org/t/p/original${backdropPath}` : undefined}
-            movieId={movieId}
-            controls={true}
-          />
-
-          {/* Ajouter un script pour s'assurer que la vidéo remplit tout l'espace */}
-          <script dangerouslySetInnerHTML={{
-            __html: `
-              document.addEventListener('DOMContentLoaded', function() {
-                const updateVideoStyle = function() {
-                  const videoContainer = document.querySelector('.hls-player-container');
-                  const videoElement = document.querySelector('.hls-player-container video');
-                  
-                  if (videoContainer) {
-                    videoContainer.style.width = '100%';
-                    videoContainer.style.height = '100%';
-                    videoContainer.style.maxHeight = 'none';
-                    videoContainer.style.padding = '0';
-                  }
-                  
-                  if (videoElement) {
-                    videoElement.style.width = '100%';
-                    videoElement.style.height = '100%';
-                    videoElement.style.objectFit = 'cover';
-                    videoElement.style.maxHeight = 'none';
-                  }
-                };
-                
-                updateVideoStyle();
-                
-                // Observer les changements dans le DOM pour appliquer les styles après le chargement complet
-                const observer = new MutationObserver(updateVideoStyle);
-                observer.observe(document.body, { childList: true, subtree: true });
-                
-                // Nettoyer l'observer après 5 secondes
-                setTimeout(() => observer.disconnect(), 5000);
-              });
-            `
-          }} />
-        </div>
-      ) : selectedSource === 'mp4' ? (
-        // MP4 Player using HLSPlayer for consistent UI
-        <div className="relative w-full h-[calc(100vh-180px)] rounded-lg overflow-hidden bg-black">
-          <HLSPlayer
-            key={`mp4-${selectedMp4Source}-${movieId}`}
-            src={mp4Sources[selectedMp4Source]?.url || ""}
-            className="w-full h-full rounded-lg"
-            autoPlay={true}
-            onEnded={() => {
-              // If there's an error or when playback ends, try next source
-              if (selectedMp4Source < mp4Sources.length - 1) {
-                // Move to next source
-                setSelectedMp4Source(prevIndex => prevIndex + 1);
-              }
-            }}
-            onError={() => {
-              // Try next MP4 source if available
-              if (selectedMp4Source < mp4Sources.length - 1) {
-                setSelectedMp4Source(prevIndex => prevIndex + 1);
-              }
-            }}
-            nextMovie={nextMovie as any}
-            onNextMovie={handleNextMovie}
-            poster={backdropPath ? `https://image.tmdb.org/t/p/original${backdropPath}` : undefined}
-            movieId={movieId}
-            controls={true}
-          />
-        </div>
-      ) : (
-        // Iframe player with poster logic
-        <div className="relative w-full h-[300px] sm:h-[400px] md:h-[500px] lg:h-[600px] xl:h-[700px] rounded-lg overflow-hidden bg-black">
-          <iframe
-            id="video-player-iframe"
-            sandbox={
-              // Only apply sandbox to "PAS DE PUBLICITE" players
-              ((selectedSource === 'multi' &&
-                coflixData?.player_links[selectedPlayerLink]?.quality?.includes("PAS DE PUBLICITE") &&
-                // Exclude specific players even if they have "PAS DE PUBLICITE"
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("lulustream") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("filemoon") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("supervideo") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("dropload") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("voe.sx") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("vidmoly") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("vidguard") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("do7go") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("uqload") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("veed") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("wish") &&
-                !coflixData?.player_links[selectedPlayerLink]?.decoded_url?.includes("lecteur6.com")
-              ) ||
-                (selectedSource === 'adfree' && adFreeSource))
-                ? "allow-scripts allow-same-origin allow-presentation"
-                : undefined // No sandbox for other players
-            }
-            src={
-              selectedSource === 'primary' ? `${getFrembedBase()}/api/film.php?id=${movieId}` :
-                selectedSource === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
-                selectedSource === 'vostfr' ? `https://vidsrc.wtf/api/3/movie/?id=${movieId}` :
-                  selectedSource === 'videasy' ? `https://vidlink.pro/movie/${movieId}?primaryColor=0278fd&secondaryColor=a2a2a2&iconColor=eefdec&icons=default&player=default&title=true&poster=true&autoplay=true&nextbutton=false` :
-                    selectedSource === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
-                      selectedSource === 'vidsrcsu' ? `https://vidsrc.su/embed/movie/${movieId}` :
-                        selectedSource === 'vidsrcwtf1' ? `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
-                          selectedSource === 'vidsrcwtf5' ? `https://vidsrc.wtf/api/5/movie/?id=${movieId}` :
-                            selectedSource === 'adfree' ? adFreeSource || "" :
-                              selectedSource === 'multi' ? coflixData?.player_links?.[selectedPlayerLink]?.decoded_url || "" :
-                                selectedSource === 'omega' ? omegaData?.player_links?.[selectedOmegaPlayer]?.link || "" :
-                                  typeof selectedSource === 'number' ? customSources[selectedSource] : ""
-            }
-            className="w-full h-full"
-            allowFullScreen
-          />
-        </div>
-      )
-      }
-    </div>
-  );
-};
-
-// Ajout de l'export pour le composant VideoPlayer si nécessaire
-// export { VideoPlayer };
 
 const MovieDetails = (): JSX.Element => {
   const { t } = useTranslation();
@@ -1955,14 +846,29 @@ const MovieDetails = (): JSX.Element => {
   });
 
   const [movie, setMovie] = useState<MovieExtended | null>(null);
+  const [movixVoteStats, setMovixVoteStats] = useState<LikeDislikeStats>({ likes: 0, dislikes: 0 });
+  const [showMovixRatingInfo, setShowMovixRatingInfo] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [trailerVideoId, setTrailerVideoId] = useState<string | null>(null);
   const [cast, setCast] = useState<CastMember[]>([]);
+  // Le générique complet, pour la galerie de personnages : `cast` reste tronqué
+  // à vingt pour l'onglet Distribution, qui n'a pas la même vocation.
+  const [fullCast, setFullCast] = useState<CastMember[]>([]);
   const [crew, setCrew] = useState<GroupedCrewMember[]>([]);
+  const [characters, setCharacters] = useState<DetailCharacters | null>(null);
+  const [charactersLoading, setCharactersLoading] = useState(false);
+  const [alternateTitles, setAlternateTitles] = useState<AlternateTitle[]>([]);
+  const [keywords, setKeywords] = useState<string[]>([]);
   const [backdropImage, setBackdropImage] = useState<string | null>(null);
   const [showTrailerPopup, setShowTrailerPopup] = useState(false);
   const [isClosingTrailer, setIsClosingTrailer] = useState(false);
+
+  useEffect(() => {
+    setMovixVoteStats({ likes: 0, dislikes: 0 });
+  }, [id]);
+
+  const movixRating = calculateLikeDislikeRating(movixVoteStats);
 
   const handleCloseTrailer = () => {
     setIsClosingTrailer(true);
@@ -1982,7 +888,7 @@ const MovieDetails = (): JSX.Element => {
 
   // Mode cinéma toujours activé
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'details' | 'collection' | 'videos' | 'images' | 'cast' | 'crew'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'details' | 'collection' | 'videos' | 'images' | 'cast' | 'characters' | 'crew'>('overview');
   // Add new state for financial stats mode
   const [financialStatsMode, setFinancialStatsMode] = useState<'simple' | 'advanced'>('simple');
 
@@ -2068,22 +974,98 @@ const MovieDetails = (): JSX.Element => {
     resetVipStatus();
   }, [id, resetVipStatus]);
 
+  /**
+   * Les personnages de la fiche. AniList est tentée quand le film a le profil
+   * d'un anime — un long-métrage japonais animé y est mieux décrit que par un
+   * générique — et le générique TMDB prend le relais sinon, ou si AniList ne
+   * connaît pas l'œuvre.
+   */
+  useEffect(() => {
+    if (!movie) return;
+    let stale = false;
+    setCharactersLoading(true);
+
+    void loadDetailCharacters({
+      looksLikeAnime: isLikelyAnime(
+        {
+          original_language: movie.original_language,
+          production_companies: movie.production_companies,
+          genres: movie.genres,
+        },
+        { results: movie.keywords?.keywords ?? [] },
+      ),
+      anilistTitles: [movie.original_title, movie.title].filter((title): title is string => Boolean(title)),
+      cast: fullCast,
+    })
+      .then((result) => { if (!stale) setCharacters(result); })
+      .catch(() => { if (!stale) setCharacters(null); })
+      .finally(() => { if (!stale) setCharactersLoading(false); });
+
+    return () => { stale = true; };
+  }, [movie, fullCast]);
+
 
   // Declare fetchMovieDetails type before using it
+  /**
+   * Ce que la fiche vient de récupérer alimente le catalogue local de
+   * recherche. Titres alternatifs, mots-clés, thèmes et noms de personnages
+   * sont exactement ce que `search/multi` ne sait pas trouver : les garder
+   * rend la fiche retrouvable par ces mots-là (voir `utils/mediaSearchIndex`).
+   */
+  useEffect(() => {
+    if (!movie || !id) return;
+    rememberMedia({
+      mediaType: 'movie',
+      id: Number(id),
+      title: movie.title,
+      posterPath: movie.poster_path,
+      backdropPath: movie.backdrop_path,
+      date: movie.release_date,
+      voteAverage: movie.vote_average,
+      genreIds: movie.genres?.map((genre) => genre.id),
+      overview: movie.overview,
+      terms: [
+        movie.original_title,
+        ...alternateTitles.map((entry) => entry.title),
+        ...keywords,
+        ...(characters?.themes ?? []),
+        ...(characters?.groups.flatMap((group) => group.characters.map((item) => item.name)) ?? []),
+      ].filter((term): term is string => Boolean(term)),
+    });
+  }, [movie, id, alternateTitles, keywords, characters]);
+
+  /** L'onglet n'a de raison d'être que s'il a quelque chose dedans. */
+  /**
+   * L'onglet n'existe que pour ce qu'AniList apporte. Sur une œuvre qu'elle ne
+   * connaît pas — un film, une série qui n'est pas un anime — les personnages
+   * ne viennent que du générique TMDB, et l'onglet Distribution dit déjà la
+   * même chose dans l'autre sens. Les cartes restent construites : elles
+   * nourrissent le catalogue de recherche, qui lui gagne à connaître les noms
+   * de rôles (voir `utils/mediaSearchIndex.ts`).
+   */
+  const hasCharactersTab = characters?.source === 'anilist' && characters.total > 0;
+
   const fetchMovieDetails = useCallback(async (): Promise<MovieExtended | undefined> => {
     if (!id) return undefined;
     try {
       setLoading(true);
+      // `append_to_response` plutôt que deux requêtes de plus : mots-clés et
+      // titres alternatifs voyagent avec la fiche, sans aller-retour en sus.
       const response = await axios.get(
-        `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_API_KEY}&language=${getTmdbLanguage()}`
+        `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_API_KEY}&language=${getTmdbLanguage()}&append_to_response=keywords,alternative_titles`
       );
       setMovie(response.data);
+      setKeywords(normalizeKeywords(response.data?.keywords, getTmdbLanguage()));
+      setAlternateTitles(normalizeAlternateTitles(response.data?.alternative_titles, [
+        response.data?.title, response.data?.original_title,
+      ]));
 
       // Also fetch credits
       const creditsResponse = await axios.get(
         `https://api.themoviedb.org/3/movie/${id}/credits?api_key=${TMDB_API_KEY}&language=${getTmdbLanguage()}`
       );
       setCast(creditsResponse.data.cast.slice(0, 20));
+      setFullCast(creditsResponse.data.cast || []);
       setCrew(groupCrewMembers(creditsResponse.data.crew));
 
       const releaseDatesResponse = await axios.get(
@@ -3119,6 +2101,30 @@ const MovieDetails = (): JSX.Element => {
                   )}
                 </motion.button>
 
+                {/* Réservé à ce qu'AniList apporte : sur du live-action,
+                    l'onglet Équipe et celui de Distribution disent déjà tout,
+                    et un onglet de plus ne ferait que répéter. */}
+                {hasCharactersTab && (
+                  <motion.button
+                    onClick={() => setActiveTab('characters')}
+                    className={`px-6 py-3 font-medium text-sm flex-shrink-0 relative ${activeTab === 'characters'
+                      ? 'text-white'
+                      : 'text-gray-400 hover:text-white'
+                      }`}
+                    whileHover={{ backgroundColor: "rgba(255,255,255,0.05)" }}
+                    whileTap={{ backgroundColor: "rgba(255,255,255,0.1)" }}
+                  >
+                    {t('details.charactersTab')}
+                    {activeTab === 'characters' && (
+                      <motion.div
+                        className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600"
+                        layoutId="activeTab"
+                        transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                      />
+                    )}
+                  </motion.button>
+                )}
+
                 {/* N'afficher l'onglet Collection que si le film appartient à une collection */}
                 {movie?.belongs_to_collection && (
                   <motion.button
@@ -3198,6 +2204,7 @@ const MovieDetails = (): JSX.Element => {
                       <LikeDislikeButton
                         contentType="movie"
                         contentId={id || ''}
+                        onStatsChange={setMovixVoteStats}
                       />
                     </div>
 
@@ -3237,13 +2244,36 @@ const MovieDetails = (): JSX.Element => {
                       <p className="text-gray-300">{movie.runtime} {t('details.minutesLabel')}</p>
                     </div>
 
-                    {/* Note */}
-                    <div>
-                      <h3 className="text-lg font-semibold mb-2">{t('details.ratingLabel')}</h3>
-                      <div className="flex items-center gap-2">
-                        <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-                        <p className="text-gray-300 text-lg font-bold">{movie.vote_average != null ? movie.vote_average.toFixed(1) : 'N/A'}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                    {/* Notes */}
+                    <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <h3 className="text-lg font-semibold mb-2">{t('details.ratingLabel')}</h3>
+                        <div className="flex items-center gap-2">
+                          <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
+                          <p className="text-gray-300 text-lg font-bold">{movie.vote_average != null ? movie.vote_average.toFixed(1) : 'N/A'}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                        </div>
                       </div>
+
+                      {movixRating != null && (
+                        <div>
+                          <h3 className="mb-2 flex items-center gap-2 text-lg font-semibold">
+                            {t('details.movixRatingLabel')}
+                            <button
+                              type="button"
+                              onClick={() => setShowMovixRatingInfo(true)}
+                              aria-label={t('details.movixRatingInfoButtonLabel')}
+                              title={t('details.movixRatingInfoButtonLabel')}
+                              className="rounded-full text-gray-400 transition-colors hover:text-white focus:outline-none focus:ring-2 focus:ring-red-500/70"
+                            >
+                              <Info className="h-4 w-4" />
+                            </button>
+                          </h3>
+                          <div className="flex items-center gap-2">
+                            <Star className="w-5 h-5 text-red-500 fill-red-500" />
+                            <p className="text-gray-300 text-lg font-bold">{movixRating.toFixed(1)}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* Classification par âge */}
@@ -3299,6 +2329,7 @@ const MovieDetails = (): JSX.Element => {
                         </motion.div>
                       ))}
                     </div>
+
                   </motion.div>
 
                 </motion.div>
@@ -3349,6 +2380,16 @@ const MovieDetails = (): JSX.Element => {
                       </motion.div>
                     ))}
                   </div>
+                </motion.div>
+              ) : activeTab === 'characters' ? (
+                <motion.div
+                  key="characters"
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  <CharactersSection data={characters} loading={charactersLoading} />
                 </motion.div>
               ) : activeTab === 'crew' ? (
                 <motion.div
@@ -3811,6 +2852,14 @@ const MovieDetails = (): JSX.Element => {
                       )}
                     </div>
                   </motion.div>
+                  {/* En fin d'onglet Détails : thèmes, titres alternatifs et
+                      mots-clés relèvent de la fiche technique, pas de la
+                      galerie de personnages. */}
+                  <DetailExtraMetadata
+                    themes={characters?.themes ?? []}
+                    alternateTitles={alternateTitles}
+                    keywords={keywords}
+                  />
                 </motion.div>
               ) : activeTab === 'videos' ? (
                 <motion.div
@@ -4541,6 +3590,11 @@ const MovieDetails = (): JSX.Element => {
             )}
           </AnimatePresence>
         )}
+
+        <MovixRatingInfoModal
+          isOpen={showMovixRatingInfo}
+          onClose={() => setShowMovixRatingInfo(false)}
+        />
 
 
       </motion.div>

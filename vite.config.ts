@@ -108,7 +108,10 @@ export default defineConfig({
   ],
   server: {
     host: true,
-    port: 3000,
+    // 3000 par défaut. `PORT` permet d'ouvrir un second serveur de dev en
+    // parallèle du premier (deux sessions d'agent, deux branches) sans se
+    // disputer le port.
+    port: Number(process.env.PORT) || 3000,
     hmr: true,
     watch: {
       // Polling utile sur WSL/Docker/FS réseau où inotify/FSEvents ne remontent
@@ -138,9 +141,7 @@ export default defineConfig({
         '**/extension/**',
         '**/PreMid/**',
         '**/cloudflareproxy/**',
-        '**/RivestreamCloudflareProxy/**',
         '**/functions/**',
-        '**/baddomain/**',
         '**/docs/**',
         '**/wasm/**',
         '**/userscript/**',

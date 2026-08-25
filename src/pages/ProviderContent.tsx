@@ -12,6 +12,7 @@ import ContentRowSkeleton from '../components/skeletons/ContentRowSkeleton';
 import LazySection from '../components/LazySection';
 import { getTmdbLanguage } from '../i18n';
 import { getMinimumCarouselCategoryItems, makeExclusiveCategories } from '../utils/exclusiveCategories';
+import AgeRestrictedMedia from '../components/AgeRestrictedMedia';
 
 // Nombre de sections à charger immédiatement
 const IMMEDIATE_LOAD_COUNT = 2;
@@ -1172,6 +1173,7 @@ const ProviderContent: React.FC = () => {
                   ) : searchResults.length > 0 ? (
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
                       {searchResults.map(item => (
+                        <AgeRestrictedMedia key={`${item.id}-${item.media_type}`} item={item}>
                         <Link
                           key={`${item.id}-${item.media_type}`}
                           to={`/${item.media_type}/${item.id}`}
@@ -1205,6 +1207,7 @@ const ProviderContent: React.FC = () => {
                             </div>
                           </div>
                         </Link>
+                        </AgeRestrictedMedia>
                       ))}
                     </div>
                   ) : (

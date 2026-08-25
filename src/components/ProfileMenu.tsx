@@ -8,6 +8,7 @@ import { discordAuth } from '../services/discordAuth';
 import { useVipModal } from '../context/VipModalContext';
 import ProfileSwitcher from './ProfileSwitcher';
 import { isUserVip } from '../utils/authUtils';
+import { checkVipStatus } from '../utils/vipUtils';
 import { useProfile } from '../context/ProfileContext';
 import { broadcastAuthChange, clearStoredAuthSession } from '../utils/accountAuth';
 
@@ -41,6 +42,8 @@ const ProfileMenu: React.FC = () => {
   }
 
   useEffect(() => {
+    let mounted = true;
+
     const checkAuth = () => {
       const auth = localStorage.getItem('auth');
       const discordAuth = localStorage.getItem('discord_auth');
@@ -56,9 +59,18 @@ const ProfileMenu: React.FC = () => {
 
     checkAuth();
     window.addEventListener('storage', checkAuth);
+    window.addEventListener('vipStatusChanged', checkAuth);
+
+    if (localStorage.getItem('access_code')) {
+      void checkVipStatus().then(() => {
+        if (mounted) checkAuth();
+      });
+    }
 
     return () => {
+      mounted = false;
       window.removeEventListener('storage', checkAuth);
+      window.removeEventListener('vipStatusChanged', checkAuth);
     };
   }, []);
 

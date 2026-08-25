@@ -103,6 +103,22 @@ async function validateBackingAccount(userType, userId) {
   return hasStoredAccountIdentity(userType, userData);
 }
 
+// Erreurs "infrastructure" (MySQL down/restart, pool saturé) — à distinguer
+// d'une vraie réponse de la DB. Ne doivent JAMAIS produire un 401 (le front
+// déconnecte l'utilisateur sur 401).
+const DB_UNAVAILABLE_CODES = new Set([
+  'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'EHOSTUNREACH', 'ENOTFOUND',
+  'PROTOCOL_CONNECTION_LOST', 'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR', 'POOL_CLOSED',
+  'ER_CON_COUNT_ERROR', 'ER_SERVER_SHUTDOWN', 'ER_TOO_MANY_USER_CONNECTIONS'
+]);
+
+function isDbUnavailableError(error) {
+  if (!error) return false;
+  if (DB_UNAVAILABLE_CODES.has(error.code)) return true;
+  // mysql2 queueLimit atteint : Error sans code, message "Queue limit reached."
+  return typeof error.message === 'string' && error.message.includes('Queue limit reached');
+}
+
 function purgeSessionRecord(sessionId, userId, userType) {
   try {
     const pool = getDbPool();
@@ -137,6 +153,10 @@ async function getAuthIfValid(req) {
 
     // Vérification de session via MySQL avec 3 tentatives
     let hasSession = false;
+    // true dès qu'une requête aboutit (même avec 0 ligne) : on a une vraie
+    // réponse de la DB. false si toutes les tentatives ont échoué (MySQL
+    // down/restart, queue limit) → réponse indéterminée.
+    let dbAnswered = false;
     const pool = getDbPool();
 
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -145,15 +165,15 @@ async function getAuthIfValid(req) {
           console.warn('[AUTH] MySQL pool not ready, attempt', attempt);
           if (attempt < 3) {
             await new Promise(resolve => setTimeout(resolve, 500));
-            continue;
           }
-          return null;
+          continue;
         }
 
         const [rows] = await pool.execute(
           'SELECT id FROM user_sessions WHERE id = ? AND user_id = ? AND user_type = ?',
           [sessionId, userId, userType]
         );
+        dbAnswered = true;
         hasSession = rows.length > 0;
 
         if (hasSession) {
@@ -173,8 +193,17 @@ async function getAuthIfValid(req) {
     }
 
     if (!hasSession) {
-      console.warn(`[AUTH] Session manquante après 3 tentatives pour userType=${userType}, userId=${userId}, sessionId=${sessionId}`);
-      return null;
+      if (!dbAnswered) {
+        // MySQL n'a jamais répondu (restart, queue limit…) : fail-open sur le
+        // JWT (signature déjà vérifiée) plutôt que 401 — un 401 déconnecte
+        // l'utilisateur côté front. Seul le contrôle de révocation de session
+        // est sauté, le temps de l'indisponibilité. Le compte est encore
+        // validé sur disque juste en dessous (validateBackingAccount).
+        console.warn(`[AUTH] MySQL indisponible, fail-open JWT pour userType=${userType}, userId=${userId}, sessionId=${sessionId}`);
+      } else {
+        console.warn(`[AUTH] Session manquante après 3 tentatives pour userType=${userType}, userId=${userId}, sessionId=${sessionId}`);
+        return null;
+      }
     }
 
     const hasBackingAccount = await validateBackingAccount(userType, userId);
@@ -262,7 +291,49 @@ async function isAdmin(req, res, next) {
     next();
   } catch (error) {
     console.error('❌ Admin verification error:', error);
+    if (isDbUnavailableError(error)) {
+      return res.status(503).json({ success: false, error: 'Service temporairement indisponible - Base de données injoignable' });
+    }
     return res.status(500).json({ success: false, error: 'Erreur lors de la vérification admin' });
+  }
+}
+
+/**
+ * `true` si la requête est portée par un admin authentifié.
+ *
+ * Ce n'est pas un middleware : il ne répond rien et ne coupe pas la chaîne. Il
+ * sert là où être admin *assouplit* un contrôle sans le conditionner — la
+ * dispense de Turnstile, par exemple.
+ *
+ * La décision se prend sur le JWT vérifié côté serveur et la table `admins`,
+ * jamais sur une affirmation du client : un visiteur qui se déclarerait admin
+ * repasse par le contrôle ordinaire. En cas de doute — base injoignable, jeton
+ * illisible — on refuse la dispense plutôt que de l'accorder à l'aveugle.
+ *
+ * Les uploaders (`role = 'uploader'`) n'en bénéficient pas, comme pour
+ * `isAdmin`.
+ */
+async function isAdminRequest(req) {
+  try {
+    const auth = await getAuthIfValid(req);
+    if (!auth) return false;
+
+    const pool = getDbPool();
+    if (!pool) return false;
+
+    const { userId, userType } = auth;
+    const [rows] = await pool.execute(
+      'SELECT role FROM admins WHERE user_id = ? AND auth_type = ?',
+      [userId, userType === 'bip39' ? 'bip-39' : userType]
+    );
+
+    if (rows.length === 0) return false;
+
+    // `role` absent : lignes legacy créées avant l'ajout de la colonne.
+    return (rows[0].role || 'admin') === 'admin';
+  } catch (error) {
+    console.error('❌ Admin request check error:', error.message);
+    return false;
   }
 }
 
@@ -307,6 +378,9 @@ async function isUploaderOrAdmin(req, res, next) {
     next();
   } catch (error) {
     console.error('❌ Admin/Uploader verification error:', error);
+    if (isDbUnavailableError(error)) {
+      return res.status(503).json({ success: false, error: 'Service temporairement indisponible - Base de données injoignable' });
+    }
     return res.status(500).json({ success: false, error: 'Erreur lors de la vérification des droits' });
   }
 }
@@ -315,6 +389,7 @@ module.exports = {
   JWT_SECRET,
   issueJwt,
   isAdmin,
+  isAdminRequest,
   isUploaderOrAdmin,
   getAuthIfValid,
   updateSessionAccess

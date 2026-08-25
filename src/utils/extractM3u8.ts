@@ -1,9 +1,7 @@
 // Utility functions to extract m3u8 URLs from supervideo and dropload players
 import { isUserVip } from './authUtils';
-import { getVipHeaders } from './vipUtils';
-import { PROXIES_EMBED_API, buildProxyUrl } from '../config/runtime';
 import { isM3u8ExtractorEnabled } from './extractionPrefs';
-import { detectHoster } from './hosterRegistry';
+import { detectHoster, toCanonicalHosterDomain } from './hosterRegistry';
 import { getSourcePriorityPrefs } from './sourcePriorityPrefs';
 import { sortHostersByPriority } from './sourceAutoSelect';
 import type { PriorityCategory, TopLevelSourceId, LanguageId } from '../types/sourcePriority';
@@ -16,6 +14,78 @@ import {
 
 // Cache pour stocker les URLs qui ont échoué pour éviter les re-tentatives
 const failedUrlsCache = new Set<string>();
+
+/**
+ * Registre des m3u8 déjà résolues par le serveur, indexées par lien embed.
+ *
+ * Le navigateur n'envoie plus AUCUNE URL au backend pour la faire extraire :
+ * l'endpoint qui acceptait un `?url=` a été supprimé. Les m3u8 arrivent
+ * exclusivement dans les réponses des routes catalogue, où l'URL vient du
+ * catalogue scrapé par le serveur — jamais d'un paramètre client. Il n'y a
+ * donc plus de cible contrôlable par l'utilisateur, nulle part.
+ *
+ * Reste le chemin extension : elle extrait localement, dans le navigateur,
+ * sans solliciter nos serveurs — hors périmètre de cette surface.
+ */
+const serverResolvedM3u8 = new Map<string, string>();
+
+// Champs portant le lien embed selon le catalogue (cf. utils/embedExtraction.js).
+const EMBED_URL_FIELDS = ['url', 'link', 'decoded_url'] as const;
+const REGISTRY_MAX_DEPTH = 8;
+
+/**
+ * Parcourt une réponse catalogue et mémorise chaque couple
+ * « lien embed -> m3u8 résolue ».
+ *
+ * À appeler une fois par réponse catalogue ; la forme exacte importe peu, le
+ * parcours est récursif et tolère les trois arborescences en usage
+ * (`players`, `episodes[n].languages`, tableaux plats).
+ */
+export function registerServerResolvedSources(payload: unknown, depth = 0): void {
+  if (!payload || typeof payload !== 'object' || depth > REGISTRY_MAX_DEPTH) return;
+
+  if (Array.isArray(payload)) {
+    payload.forEach((item) => registerServerResolvedSources(item, depth + 1));
+    return;
+  }
+
+  const record = payload as Record<string, unknown>;
+  const resolved = record.m3u8Url;
+  if (typeof resolved === 'string' && resolved) {
+    for (const field of EMBED_URL_FIELDS) {
+      const embed = record[field];
+      if (typeof embed === 'string' && embed) serverResolvedM3u8.set(embed, resolved);
+    }
+  }
+
+  // Anime-Sama liste ses lecteurs en chaînes brutes : ses m3u8 arrivent dans
+  // une table parallèle « lien -> m3u8 » plutôt que sur l'objet lecteur.
+  const byPlayer = record.m3u8ByPlayer;
+  if (byPlayer && typeof byPlayer === 'object' && !Array.isArray(byPlayer)) {
+    for (const [embed, m3u8] of Object.entries(byPlayer as Record<string, unknown>)) {
+      if (typeof m3u8 === 'string' && m3u8) serverResolvedM3u8.set(embed, m3u8);
+    }
+  }
+
+  Object.values(record).forEach((value) => registerServerResolvedSources(value, depth + 1));
+}
+
+/** m3u8 résolue par le serveur pour ce lien embed, si elle existe. */
+function takeServerResolved(...embedUrls: string[]): string | null {
+  for (const embedUrl of embedUrls) {
+    const resolved = embedUrl && serverResolvedM3u8.get(embedUrl);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+/** Réponse d'échec uniforme quand ni le serveur ni l'extension n'ont résolu. */
+function notResolved(hoster: string): M3u8Result {
+  return {
+    success: false,
+    error: `Source ${hoster} non résolue par le serveur (installez l'extension pour l'extraction locale)`,
+  };
+}
 
 /**
  * Helper interne : détection d'hoster via le registre + prefs utilisateur.
@@ -143,8 +213,6 @@ async function tryExtensionFirst(type: string, url: string, serverFallback: () =
 // panneau de contrôle — laissés hardcodés).
 const SUPERVIDEO_EXTRACTIONS_ENABLED = false;
 const DROPLOAD_EXTRACTIONS_ENABLED = false;
-const ONEUPLOAD_EXTRACTIONS_ENABLED = false;
-const DARKIBOX_EXTRACTIONS_ENABLED = true;
 
 // Les extracteurs ci-dessous sont pilotés par les préférences utilisateur via
 // `isM3u8ExtractorEnabled`. Les appelants externes (WatchMovie, WatchTv)
@@ -157,6 +225,9 @@ export const isVidmolyExtractionEnabled = () => isM3u8ExtractorEnabled('vidmoly'
 export const isSibnetExtractionEnabled = () => isM3u8ExtractorEnabled('sibnet');
 export const isDoodStreamExtractionEnabled = () => isM3u8ExtractorEnabled('doodstream');
 export const isSeekStreamingExtractionEnabled = () => isM3u8ExtractorEnabled('seekstreaming');
+export const isLuluStreamExtractionEnabled = () => isM3u8ExtractorEnabled('lulustream');
+export const isVeevExtractionEnabled = () => isM3u8ExtractorEnabled('veev');
+export const isVidaraExtractionEnabled = () => isM3u8ExtractorEnabled('vidara');
 
 export interface PlayerInfo {
   player: string;
@@ -183,8 +254,9 @@ export interface M3u8Result {
 // préférence utilisateur. La signature reste union de literals + `string`
 // fallback pour ne pas casser le narrowing des usages existants.
 export type BuiltinEmbedType =
-  | 'supervideo' | 'dropload' | 'voe' | 'uqload' | 'darkibox' | 'vidzy' | 'vidmoly'
-  | 'fsvid' | 'sibnet' | 'doodstream' | 'seekstreaming';
+  | 'supervideo' | 'dropload' | 'voe' | 'uqload' | 'vidzy' | 'vidmoly'
+  | 'fsvid' | 'sibnet' | 'doodstream' | 'seekstreaming'
+  | 'lulustream' | 'veev' | 'vidara';
 
 export interface EmbedDetectionResult {
   type: BuiltinEmbedType | string;
@@ -207,12 +279,13 @@ export type ExtractionCallback = (progress: ExtractionProgress) => void;
 /**
  * Extract m3u8 URL from supervideo or dropload embed
  * @param player Player information object
- * @param MAIN_API Main API base URL
+ * @param _MAIN_API Conservé pour compatibilité d'appel — plus aucune requête
+ *                  n'est émise d'ici, la m3u8 vient du catalogue résolu serveur.
  * @returns Promise<M3u8Result | null>
  */
 export async function extractM3u8FromEmbed(
   player: PlayerInfo,
-  MAIN_API: string
+  _MAIN_API: string
 ): Promise<M3u8Result | null> {
   // Vérifier le type d'extraction spécifique
   if (player.player && player.player.toLowerCase().includes('supervideo') && !SUPERVIDEO_EXTRACTIONS_ENABLED) {
@@ -242,46 +315,20 @@ export async function extractM3u8FromEmbed(
     };
   }
 
-  let apiUrl: string | null = null;
-
-  if (player.player && player.player.toLowerCase().includes('supervideo')) {
-    apiUrl = `${MAIN_API}/api/extract-supervideo?url=${encodeURIComponent(url)}`;
-  } else if (player.player && player.player.toLowerCase().includes('dropload')) {
-    apiUrl = `${MAIN_API}/api/extract-dropload?url=${encodeURIComponent(url)}`;
-  }
-
-  if (!apiUrl) return null;
+  const hoster = player.player?.toLowerCase() || '';
+  if (!hoster.includes('supervideo') && !hoster.includes('dropload')) return null;
 
   try {
-    const response = await fetch(apiUrl);
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+    // Comme les autres hébergeurs, la m3u8 vient du catalogue résolu côté
+    // serveur. Les anciens endpoints `/api/extract-supervideo` et
+    // `/api/extract-dropload` prenaient une URL en paramètre — ils n'existent
+    // plus dans mainapi et ne sont plus appelés.
+    const resolved = takeServerResolved(url);
+    if (resolved) {
+      return { m3u8Url: resolved, success: true };
     }
 
-    const data = await response.json();
-
-    // Handle supervideo response format
-    if (data.hlsUrl) {
-      return {
-        hlsUrl: data.hlsUrl,
-        success: true
-      };
-    }
-
-    // Handle dropload response format
-    if (data.m3u8Url) {
-      return {
-        m3u8Url: data.m3u8Url,
-        success: true
-      };
-    }
-
-    // Ajouter l'URL au cache des échecs
-    failedUrlsCache.add(url);
-    return {
-      success: false,
-      error: 'No m3u8 URL found in response'
-    };
+    return notResolved(hoster.includes('supervideo') ? 'Supervideo' : 'Dropload');
 
   } catch (error) {
     console.error('Error extracting m3u8:', error);
@@ -294,15 +341,6 @@ export async function extractM3u8FromEmbed(
   }
 }
 
-
-/**
- * Détecter si une URL est un embed OneUpload
- * @param url URL à vérifier
- * @returns boolean
- */
-export function isOneUploadEmbed(url: string): boolean {
-  return detectHosterFromPrefs(url) === 'oneupload';
-}
 
 /**
  * Détecter si une URL est un embed VOE
@@ -359,47 +397,8 @@ export async function extractVoeM3u8(
 }
 
 async function extractVoeM3u8Server(voeUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return { success: false, error: 'Accès VOE réservé aux utilisateurs VIP ou connectés' };
-  }
-
-  if (failedUrlsCache.has(voeUrl)) {
-    return { success: false, error: 'URL VOE précédemment échouée', fromCache: true };
-  }
-
-  try {
-    const encodedUrl = btoa(voeUrl);
-    const response = await fetch(`${PROXIES_EMBED_API}/api/voe/m3u8?url=${encodedUrl}`, { headers: getVipHeaders() });
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (data.source) {
-      return {
-        hlsUrl: data.source,
-        success: true
-      };
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(voeUrl);
-    return {
-      success: false,
-      error: 'Aucune source HLS trouvée dans la réponse VOE'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction VOE:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(voeUrl);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue VOE'
-    };
-  }
+  const resolved = takeServerResolved(voeUrl);
+  return resolved ? { hlsUrl: resolved, success: true } : notResolved('VOE');
 }
 
 /**
@@ -419,7 +418,7 @@ export async function extractUqloadFile(
   if (!uqloadUrl) return null;
 
   // Normaliser tous TLDs uqload.* → uqload.is avant transmission (extension/serveur)
-  const normalizedUrl = uqloadUrl.replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is');
+  const normalizedUrl = toCanonicalHosterDomain(uqloadUrl, 'uqload');
 
   // Try extension first (no VIP needed)
   if (hasNexusExtractors()) {
@@ -430,160 +429,15 @@ export async function extractUqloadFile(
 }
 
 async function extractUqloadFileServer(uqloadUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return {
-      success: false,
-      error: 'Accès UQLOAD réservé aux utilisateurs VIP ou connectés'
-    };
-  }
-
   if (!uqloadUrl) return null;
 
-  // Vérifier si cette URL a déjà échoué
-  if (failedUrlsCache.has(uqloadUrl)) {
-    return {
-      success: false,
-      error: 'URL UQLOAD précédemment échouée - pas de nouvelle tentative',
-      fromCache: true
-    };
-  }
-
-  try {
-    // Normaliser le domaine UQLOAD vers uqload.is (tous TLDs)
-    const normalizedUrl = uqloadUrl.replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is');
-    console.log(`[UQLOAD] Normalized URL: ${normalizedUrl}`);
-
-    // Utiliser le serveur Python pour l'extraction UQLOAD
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-uqload?url=${encodeURIComponent(normalizedUrl)}`, { headers: getVipHeaders() });
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    // Handle both possible response formats
-    const fileUrl = data.data?.url || data.url;
-    if (fileUrl) {
-      return {
-        m3u8Url: fileUrl,
-        success: true
-      };
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(uqloadUrl);
-    return {
-      success: false,
-      error: 'Aucun fichier trouvé dans la réponse UQLOAD'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction UQLOAD:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(uqloadUrl);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue UQLOAD'
-    };
-  }
-}
-
-/**
- * Extraire les sources depuis un embed Darkibox
- * @param darkiboxUrl URL Darkibox
- * @param _MAIN_API API principale (non utilisée pour Darkibox)
- * @returns Promise<M3u8Result | null>
- */
-export async function extractDarkiboxSources(
-  darkiboxUrl: string,
-  _MAIN_API: string
-): Promise<M3u8Result | null> {
-  // Vérifier si les extractions Darkibox sont activées
-  if (!DARKIBOX_EXTRACTIONS_ENABLED) {
-    return {
-      success: false,
-      error: 'Extractions Darkibox désactivées'
-    };
-  }
-
-  if (!darkiboxUrl) return null;
-
-  // Vérifier si cette URL a déjà échoué
-  if (failedUrlsCache.has(darkiboxUrl)) {
-    return {
-      success: false,
-      error: 'URL Darkibox précédemment échouée - pas de nouvelle tentative',
-      fromCache: true
-    };
-  }
-
-  try {
-    // Extraction du HTML Darkibox via proxy CORS avec timeout de 3s
-    const encodedDarkiboxUrl = encodeURIComponent(darkiboxUrl);
-    const corsProxyUrl = buildProxyUrl(encodedDarkiboxUrl);
-
-    // Créer un AbortController pour le timeout
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), 3000); // 3 secondes
-
-    const response = await fetch(corsProxyUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      },
-      signal: abortController.signal
-    });
-
-    // Nettoyer le timeout si la requête réussit
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const htmlContent = await response.text();
-
-    // Extract sources from the HTML using regex
-    const sourcesMatch = htmlContent.match(/sources:\s*\[([\s\S]*?)\]/);
-    if (sourcesMatch) {
-      const sourcesContent = sourcesMatch[1];
-      const srcMatch = sourcesContent.match(/src:\s*"([^"]+)"/);
-      if (srcMatch) {
-        const m3u8Url = srcMatch[1];
-        if (m3u8Url && m3u8Url.includes('.m3u8')) {
-          return {
-            hlsUrl: m3u8Url,
-            success: true
-          };
-        }
-      }
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(darkiboxUrl);
-    return {
-      success: false,
-      error: 'Aucune source HLS trouvée dans le HTML Darkibox'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction Darkibox:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(darkiboxUrl);
-
-    // Gestion spécifique du timeout
-    if (error instanceof Error && error.name === 'AbortError') {
-      return {
-        success: false,
-        error: 'Timeout: La requête Darkibox a pris plus de 3 secondes'
-      };
-    }
-
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue Darkibox'
-    };
-  }
+  // Le catalogue indexe l'URL telle qu'il l'a scrapée ; l'appelant a pu la
+  // normaliser vers uqload.is au passage. On tente donc les deux écritures.
+  const resolved = takeServerResolved(
+    uqloadUrl,
+    uqloadUrl.replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is'),
+  );
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('UQLOAD');
 }
 
 /**
@@ -611,58 +465,9 @@ export async function extractVidzyM3u8(
 }
 
 async function extractVidzyM3u8Server(vidzyUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return {
-      success: false,
-      error: 'Accès Vidzy réservé aux utilisateurs VIP ou connectés'
-    };
-  }
-
   if (!vidzyUrl) return null;
-
-  // Vérifier si cette URL a déjà échoué
-  if (failedUrlsCache.has(vidzyUrl)) {
-    return {
-      success: false,
-      error: 'URL Vidzy précédemment échouée - pas de nouvelle tentative',
-      fromCache: true
-    };
-  }
-
-  try {
-    // Utiliser le serveur Python pour l'extraction Vidzy
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-vidzy?url=${vidzyUrl}`, { headers: getVipHeaders() });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (data.m3u8Url) {
-      return {
-        m3u8Url: data.m3u8Url,
-        success: true
-      };
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(vidzyUrl);
-    return {
-      success: false,
-      error: 'Aucune URL M3U8 trouvée dans la réponse API'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction Vidzy:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(vidzyUrl);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue Vidzy'
-    };
-  }
+  const resolved = takeServerResolved(vidzyUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('Vidzy');
 }
 
 /**
@@ -694,40 +499,9 @@ async function extractFsvidM3u8Server(fsvidUrl: string): Promise<M3u8Result | nu
     return { success: false, error: 'Extractions Fsvid désactivées' };
   }
 
-  const isVip = isUserVip();
-  if (!isVip) {
-    return { success: false, error: 'Accès Fsvid réservé aux utilisateurs VIP' };
-  }
-
   if (!fsvidUrl) return null;
-
-  if (failedUrlsCache.has(fsvidUrl)) {
-    return { success: false, error: 'URL Fsvid précédemment échouée', fromCache: true };
-  }
-
-  try {
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-fsvid?url=${encodeURIComponent(fsvidUrl)}`, { headers: getVipHeaders() });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    const streamUrl = data.m3u8Url || data.url || data.link || data.file || data.source;
-
-    if (streamUrl) {
-      return { m3u8Url: streamUrl, success: true };
-    }
-
-    failedUrlsCache.add(fsvidUrl);
-    return { success: false, error: 'Aucune URL M3U8 trouvée dans la réponse API' };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction Fsvid:', error);
-    failedUrlsCache.add(fsvidUrl);
-    return { success: false, error: error instanceof Error ? error.message : 'Erreur inconnue Fsvid' };
-  }
+  const resolved = takeServerResolved(fsvidUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('Fsvid');
 }
 
 /**
@@ -746,56 +520,23 @@ export async function extractVidmolyM3u8(
 
   if (!vidmolyUrl) return null;
 
+  // Normaliser vers le domaine canonique de Vidmoly avant transmission
+  // (extension ou serveur), comme le fait déjà extractUqloadFile pour uqload :
+  // le serveur d'extraction envoie Origin et Referer sur ce domaine, et les
+  // agrégateurs servent le lecteur sur le TLD du moment.
+  const normalizedUrl = toCanonicalHosterDomain(vidmolyUrl, 'vidmoly');
+
   // Try extension first (no VIP needed)
   if (hasNexusExtractors()) {
-    return tryExtensionFirst('vidmoly', vidmolyUrl, () => extractVidmolyM3u8Server(vidmolyUrl));
+    return tryExtensionFirst('vidmoly', normalizedUrl, () => extractVidmolyM3u8Server(normalizedUrl));
   }
 
-  return extractVidmolyM3u8Server(vidmolyUrl);
+  return extractVidmolyM3u8Server(normalizedUrl);
 }
 
 async function extractVidmolyM3u8Server(vidmolyUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return { success: false, error: 'Accès Vidmoly réservé aux utilisateurs VIP ou connectés' };
-  }
-
-  if (failedUrlsCache.has(vidmolyUrl)) {
-    return { success: false, error: 'URL Vidmoly précédemment échouée', fromCache: true };
-  }
-
-  try {
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-vidmoly?url=${vidmolyUrl}`, { headers: getVipHeaders() });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (data.sourceUrl) {
-      return {
-        m3u8Url: data.sourceUrl,
-        success: true
-      };
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(vidmolyUrl);
-    return {
-      success: false,
-      error: 'Aucune URL M3U8 trouvée dans la réponse API'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction Vidmoly:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(vidmolyUrl);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue Vidmoly'
-    };
-  }
+  const resolved = takeServerResolved(vidmolyUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('Vidmoly');
 }
 
 /**
@@ -823,166 +564,10 @@ export async function extractSibnetM3u8(
 }
 
 async function extractSibnetM3u8Server(sibnetUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return { success: false, error: 'Accès Sibnet réservé aux utilisateurs VIP ou connectés' };
-  }
-
-  if (failedUrlsCache.has(sibnetUrl)) {
-    return { success: false, error: 'URL Sibnet précédemment échouée', fromCache: true };
-  }
-
-  try {
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-sibnet?url=${encodeURIComponent(sibnetUrl)}`, { headers: getVipHeaders() });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (data.sourceUrl) {
-      return {
-        m3u8Url: data.sourceUrl,
-        success: true
-      };
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(sibnetUrl);
-    return {
-      success: false,
-      error: 'Aucune URL M3U8 trouvée dans la réponse API'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction Sibnet:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(sibnetUrl);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue Sibnet'
-    };
-  }
+  const resolved = takeServerResolved(sibnetUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('Sibnet');
 }
 
-
-export async function extractOneUploadSources(
-  oneuploadUrl: string
-): Promise<M3u8Result | null> {
-  // Vérifier si les extractions OneUpload sont activées
-  if (!ONEUPLOAD_EXTRACTIONS_ENABLED) {
-    return {
-      success: false,
-      error: 'Extractions OneUpload désactivées'
-    };
-  }
-
-  if (!oneuploadUrl) return null;
-
-  // Vérifier si cette URL a déjà échoué
-  if (failedUrlsCache.has(oneuploadUrl)) {
-    return {
-      success: false,
-      error: 'URL OneUpload précédemment échouée - pas de nouvelle tentative',
-      fromCache: true
-    };
-  }
-
-  try {
-    // Utiliser le proxy CORS spécifié
-    const corsProxyUrl = buildProxyUrl(oneuploadUrl);
-
-    // Créer un AbortController pour le timeout
-    const abortController = new AbortController();
-    const timeoutId = setTimeout(() => abortController.abort(), 2000); // 2 secondes
-
-    const response = await fetch(corsProxyUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': 'https://oneupload.net/'
-      },
-      signal: abortController.signal
-    });
-
-    // Nettoyer le timeout si la requête réussit
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const htmlContent = await response.text();
-
-    // Extraire les sources depuis le HTML OneUpload
-    // Rechercher les patterns typiques de OneUpload pour les sources vidéo
-    const patterns = [
-      /file:\s*["']([^"']+\.m3u8[^"']*)/i,
-      /source:\s*["']([^"']+\.m3u8[^"']*)/i,
-      /src:\s*["']([^"']+\.m3u8[^"']*)/i,
-      /"file":\s*"([^"]+\.m3u8[^"]*)"/i,
-      /"source":\s*"([^"]+\.m3u8[^"]*)"/i
-    ];
-
-    for (const pattern of patterns) {
-      const match = htmlContent.match(pattern);
-      if (match && match[1]) {
-        const m3u8Url = match[1];
-        console.log('OneUpload M3U8 trouvé:', m3u8Url);
-        return {
-          hlsUrl: m3u8Url,
-          success: true
-        };
-      }
-    }
-
-    // Si aucun M3U8 trouvé, chercher des sources MP4
-    const mp4Patterns = [
-      /file:\s*["']([^"']+\.mp4[^"']*)/i,
-      /source:\s*["']([^"']+\.mp4[^"']*)/i,
-      /src:\s*["']([^"']+\.mp4[^"']*)/i,
-      /"file":\s*"([^"]+\.mp4[^"]*)"/i,
-      /"source":\s*"([^"]+\.mp4[^"]*)"/i
-    ];
-
-    for (const pattern of mp4Patterns) {
-      const match = htmlContent.match(pattern);
-      if (match && match[1]) {
-        const mp4Url = match[1];
-        console.log('OneUpload MP4 trouvé:', mp4Url);
-        return {
-          m3u8Url: mp4Url, // Utiliser m3u8Url pour les fichiers MP4 aussi
-          success: true
-        };
-      }
-    }
-
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(oneuploadUrl);
-    return {
-      success: false,
-      error: 'Aucune source vidéo trouvée dans le HTML OneUpload'
-    };
-
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction OneUpload:', error);
-    // Ajouter au cache des échecs
-    failedUrlsCache.add(oneuploadUrl);
-
-    // Gestion spécifique du timeout
-    if (error instanceof Error && error.name === 'AbortError') {
-      return {
-        success: false,
-        error: 'Timeout: La requête OneUpload a pris plus de 2 secondes'
-      };
-    }
-
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Erreur inconnue OneUpload'
-    };
-  }
-}
 
 /**
  * Détecte automatiquement les types d'embeds supportés dans une liste d'URLs ou de PlayerInfo
@@ -1060,16 +645,6 @@ export function detectSupportedEmbeds(
       });
     }
 
-    // Détection Darkibox
-    if (urlLower.includes('darkibox') && DARKIBOX_EXTRACTIONS_ENABLED) {
-      detectedEmbeds.push({
-        type: 'darkibox',
-        url,
-        enabled: DARKIBOX_EXTRACTIONS_ENABLED,
-        priority: 4
-      });
-    }
-
     // Détection Vidzy (VIP ou extension)
     if (urlLower.includes('vidzy') && isVidzyExtractionEnabled() && canAccess) {
       detectedEmbeds.push({
@@ -1107,6 +682,36 @@ export function detectSupportedEmbeds(
         url,
         enabled: isDoodStreamExtractionEnabled(),
         priority: 2
+      });
+    }
+
+    // Détection LuluStream (VIP ou extension)
+    if (detectedHoster === 'lulustream' && isLuluStreamExtractionEnabled() && canAccess) {
+      detectedEmbeds.push({
+        type: 'lulustream',
+        url,
+        enabled: isLuluStreamExtractionEnabled(),
+        priority: 2
+      });
+    }
+
+    // Détection Veev (VIP ou extension)
+    if (detectedHoster === 'veev' && isVeevExtractionEnabled() && canAccess) {
+      detectedEmbeds.push({
+        type: 'veev',
+        url,
+        enabled: isVeevExtractionEnabled(),
+        priority: 2
+      });
+    }
+
+    // Détection Vidara (VIP ou extension)
+    if (detectedHoster === 'vidara' && isVidaraExtractionEnabled() && canAccess) {
+      detectedEmbeds.push({
+        type: 'vidara',
+        url,
+        enabled: isVidaraExtractionEnabled(),
+        priority: 1
       });
     }
 
@@ -1271,10 +876,6 @@ export async function extractM3u8OnDetection(
             result = await extractUqloadFile(embed.url, MAIN_API);
             break;
 
-          case 'darkibox':
-            result = await extractDarkiboxSources(embed.url, MAIN_API);
-            break;
-
           case 'vidzy':
             result = await extractVidzyM3u8(embed.url, MAIN_API);
             break;
@@ -1293,6 +894,18 @@ export async function extractM3u8OnDetection(
 
           case 'doodstream':
             result = await extractDoodStreamFile(embed.url);
+            break;
+
+          case 'lulustream':
+            result = await extractLuluStreamM3u8(embed.url);
+            break;
+
+          case 'veev':
+            result = await extractVeevFile(embed.url);
+            break;
+
+          case 'vidara':
+            result = await extractVidaraM3u8(embed.url);
             break;
 
           case 'seekstreaming':
@@ -1438,48 +1051,114 @@ export async function extractDoodStreamFile(
 }
 
 async function extractDoodStreamFileServer(doodUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return { success: false, error: 'Accès DoodStream réservé aux utilisateurs VIP ou connectés' };
+  const resolved = takeServerResolved(doodUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('DoodStream');
+}
+
+/**
+ * Détecter si une URL est un embed LuluStream (luluvdo, streamhihi…)
+ */
+export function isLuluStreamEmbed(url: string): boolean {
+  return detectHosterFromPrefs(url) === 'lulustream';
+}
+
+/**
+ * Détecter si une URL est un embed Veev (veev.to, poophq, doods.to)
+ */
+export function isVeevEmbed(url: string): boolean {
+  return detectHosterFromPrefs(url) === 'veev';
+}
+
+/**
+ * Détecter si une URL est un embed Vidara
+ */
+export function isVidaraEmbed(url: string): boolean {
+  return detectHosterFromPrefs(url) === 'vidara';
+}
+
+/**
+ * Extraire l'URL M3U8 depuis LuluStream
+ * @param luluUrl URL LuluStream
+ * @returns Promise<M3u8Result | null>
+ */
+export async function extractLuluStreamM3u8(
+  luluUrl: string
+): Promise<M3u8Result | null> {
+  if (!isLuluStreamExtractionEnabled()) {
+    return { success: false, error: 'Extractions LuluStream désactivées' };
   }
 
-  if (failedUrlsCache.has(doodUrl)) {
-    return { success: false, error: 'URL DoodStream précédemment échouée', fromCache: true };
+  if (!luluUrl) return null;
+
+  if (hasNexusExtractors()) {
+    return tryExtensionFirst('lulustream', luluUrl, () => extractLuluStreamM3u8Server(luluUrl));
   }
 
-  try {
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-doodstream?url=${encodeURIComponent(doodUrl)}`, { headers: getVipHeaders() });
-    if (!response.ok) {
-      if (response.status === 410) {
-        try {
-          const deleted = await response.json();
-          if (deleted?.reason === 'deleted') {
-            return {
-              success: false,
-              error: deleted.error || 'DoodStream: File was deleted',
-              reason: 'deleted',
-            };
-          }
-        } catch {
-          // Keep the generic HTTP error for malformed server responses.
-        }
-      }
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
+  return extractLuluStreamM3u8Server(luluUrl);
+}
 
-    const data = await response.json();
+async function extractLuluStreamM3u8Server(luluUrl: string): Promise<M3u8Result | null> {
+  const resolved = takeServerResolved(luluUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('LuluStream');
+}
 
-    if (data.url) {
-      return { m3u8Url: data.url, success: true };
-    }
-
-    failedUrlsCache.add(doodUrl);
-    return { success: false, error: 'Aucune URL trouvée dans la réponse DoodStream' };
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction DoodStream:', error);
-    failedUrlsCache.add(doodUrl);
-    return { success: false, error: error instanceof Error ? error.message : 'Erreur inconnue DoodStream' };
+/**
+ * Extraire l'URL vidéo depuis Veev
+ * @param veevUrl URL Veev
+ * @returns Promise<M3u8Result | null>
+ */
+export async function extractVeevFile(
+  veevUrl: string
+): Promise<M3u8Result | null> {
+  if (!isVeevExtractionEnabled()) {
+    return { success: false, error: 'Extractions Veev désactivées' };
   }
+
+  if (!veevUrl) return null;
+
+  if (hasNexusExtractors()) {
+    return tryExtensionFirst('veev', veevUrl, () => extractVeevFileServer(veevUrl));
+  }
+
+  return extractVeevFileServer(veevUrl);
+}
+
+async function extractVeevFileServer(veevUrl: string): Promise<M3u8Result | null> {
+  const resolved = takeServerResolved(veevUrl);
+  return resolved ? { m3u8Url: resolved, success: true } : notResolved('Veev');
+}
+
+/**
+ * Extraire l'URL HLS depuis Vidara.
+ *
+ * Le jeton du manifeste Vidara encode l'IP qui a appelé son API : l'extraction
+ * et la lecture doivent partir de la même adresse. Le chemin extension
+ * (extraction locale, lecture locale) et le chemin serveur (extraction et proxy
+ * côté serveur) respectent chacun cette contrainte, mais on ne peut pas les
+ * mélanger — d'où l'absence de repli serveur quand l'extension a répondu.
+ *
+ * @param vidaraUrl URL Vidara (https://vidara.to/e/<filecode>)
+ * @returns Promise<M3u8Result | null>
+ */
+export async function extractVidaraM3u8(
+  vidaraUrl: string
+): Promise<M3u8Result | null> {
+  if (!isVidaraExtractionEnabled()) {
+    return { success: false, error: 'Extractions Vidara désactivées' };
+  }
+
+  if (!vidaraUrl) return null;
+
+  if (hasNexusExtractors()) {
+    return tryExtensionFirst('vidara', vidaraUrl, () => extractVidaraM3u8Server(vidaraUrl));
+  }
+
+  return extractVidaraM3u8Server(vidaraUrl);
+}
+
+async function extractVidaraM3u8Server(vidaraUrl: string): Promise<M3u8Result | null> {
+  const resolved = takeServerResolved(vidaraUrl);
+  return resolved ? { hlsUrl: resolved, success: true } : notResolved('Vidara');
 }
 
 /**
@@ -1505,39 +1184,10 @@ export async function extractSeekStreamingM3u8(
 }
 
 async function extractSeekStreamingM3u8Server(seekUrl: string): Promise<M3u8Result | null> {
-  const isVip = isUserVip();
-  if (!isVip) {
-    return { success: false, error: 'Accès SeekStreaming réservé aux utilisateurs VIP ou connectés' };
-  }
-
-  if (failedUrlsCache.has(seekUrl)) {
-    return { success: false, error: 'URL SeekStreaming précédemment échouée', fromCache: true };
-  }
-
-  try {
-    const encodedUrl = seekUrl.replace(/#/g, '%23');
-    const response = await fetch(`${PROXIES_EMBED_API}/api/extract-seekstreaming?url=${encodeURIComponent(encodedUrl)}`, { headers: getVipHeaders() });
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const hlsCandidates = normalizeSeekStreamingCandidates(data);
-    if (hlsCandidates.length > 0) {
-      return {
-        hlsUrl: hlsCandidates[0].url,
-        hlsCandidates,
-        success: true,
-      };
-    }
-
-    failedUrlsCache.add(seekUrl);
-    return { success: false, error: 'Aucune source trouvée dans la réponse SeekStreaming' };
-  } catch (error) {
-    console.error('Erreur lors de l\'extraction SeekStreaming:', error);
-    failedUrlsCache.add(seekUrl);
-    return { success: false, error: error instanceof Error ? error.message : 'Erreur inconnue SeekStreaming' };
-  }
+  const resolved = takeServerResolved(seekUrl, seekUrl.replace(/#/g, '%23'));
+  return resolved
+    ? { hlsUrl: resolved, hlsCandidates: normalizeSeekStreamingCandidates({ hlsUrl: resolved }), success: true }
+    : notResolved('SeekStreaming');
 }
 
 /**
@@ -1606,10 +1256,6 @@ export async function extractM3u8RealTime(
             result = await extractUqloadFile(embed.url, MAIN_API);
             break;
 
-          case 'darkibox':
-            result = await extractDarkiboxSources(embed.url, MAIN_API);
-            break;
-
           case 'vidzy':
             result = await extractVidzyM3u8(embed.url, MAIN_API);
             break;
@@ -1624,6 +1270,18 @@ export async function extractM3u8RealTime(
 
           case 'doodstream':
             result = await extractDoodStreamFile(embed.url);
+            break;
+
+          case 'lulustream':
+            result = await extractLuluStreamM3u8(embed.url);
+            break;
+
+          case 'veev':
+            result = await extractVeevFile(embed.url);
+            break;
+
+          case 'vidara':
+            result = await extractVidaraM3u8(embed.url);
             break;
 
           case 'seekstreaming':

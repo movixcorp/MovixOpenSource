@@ -11,17 +11,27 @@ import {
   Platform,
   TouchableOpacity,
   Linking,
+  Modal,
+  Share,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CONFIG } from '../config';
 import { useBrowserUIPrefs } from '../hooks/useBrowserUIPrefs';
 import { useAddress } from '../context/AddressContext';
 import { getLocalVersionName } from '../services/apkInstaller';
+import {
+  clearNetworkJournal,
+  getNetworkJournal,
+  loadNetworkJournalPreference,
+  setNetworkJournalEnabled,
+} from '../services/networkJournal';
 
 const { DnsModule } = NativeModules;
 
-const M3U8_KEYS = ['voe','fsvid','vidzy','vidmoly','sibnet','uqload','doodstream','seekstreaming'] as const;
-const LIVETV_KEYS = ['northlive','wiflix','sosplay','livetv','matches'] as const;
+// Doit rester aligné sur `M3U8_EXTRACTOR_KEYS` (src/utils/extractionPrefs.ts) :
+// les préférences sont partagées avec le site via le pont d'injection.
+const M3U8_KEYS = ['voe','fsvid','vidzy','vidmoly','sibnet','uqload','doodstream','seekstreaming','lulustream','veev','vidara'] as const;
+const LIVETV_KEYS = ['northlive','vavoo','matches'] as const;
 
 type ExtractionPrefs = {
   version: 1;
@@ -43,6 +53,42 @@ export default function SettingsScreen() {
   const [appVersion, setAppVersion] = useState<string>('—');
   const [extractionPrefs, setExtractionPrefs] = useState<ExtractionPrefs>(buildDefaultExtractionPrefs);
   const { prefs: uiPrefs, setShowUrlBar, setShowNavBar } = useBrowserUIPrefs();
+  const [journalEnabled, setJournalEnabled] = useState(false);
+  const [journalEntries, setJournalEntries] = useState<string[]>([]);
+  const [journalVisible, setJournalVisible] = useState(false);
+
+  useEffect(() => {
+    loadNetworkJournalPreference()
+      .then(setJournalEnabled)
+      .catch(() => setJournalEnabled(false));
+  }, []);
+
+  const toggleJournal = useCallback(async (value: boolean) => {
+    setJournalEnabled(value);
+    await setNetworkJournalEnabled(value);
+    if (!value) setJournalEntries([]);
+  }, []);
+
+  const openJournal = useCallback(async () => {
+    const entries = await getNetworkJournal();
+    setJournalEntries(entries);
+    setJournalVisible(true);
+  }, []);
+
+  const shareJournal = useCallback(async () => {
+    const entries = await getNetworkJournal();
+    if (!entries.length) {
+      Alert.alert('Journal réseau', 'Aucune requête enregistrée pour le moment.');
+      return;
+    }
+    // Le journal contient des URLs signées et des jetons de lecture : c'est ce
+    // qui le rend utile, et c'est pourquoi on ne le partage que sur demande.
+    try {
+      await Share.share({ message: entries.join('\n') });
+    } catch {
+      Alert.alert('Journal réseau', 'Partage impossible.');
+    }
+  }, []);
 
   useEffect(() => {
     getLocalVersionName()
@@ -325,6 +371,87 @@ export default function SettingsScreen() {
         </Text>
       </View>
 
+      {/* Débogage Section */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Débogage</Text>
+
+        <View style={styles.card}>
+          <View style={styles.row}>
+            <View style={{ flex: 1, paddingRight: 12 }}>
+              <Text style={styles.rowTitle}>Journal réseau</Text>
+              <Text style={styles.rowSubtitle}>
+                Enregistre chaque requête média : en-têtes réellement émis, code
+                de réponse, en-têtes reçus.
+              </Text>
+            </View>
+            <Switch
+              value={journalEnabled}
+              onValueChange={toggleJournal}
+              trackColor={{ false: '#333333', true: '#8b5cf6' }}
+              thumbColor={journalEnabled ? '#ffffff' : '#888888'}
+            />
+          </View>
+
+          {journalEnabled && (
+            <View style={{ marginTop: 12 }}>
+              <TouchableOpacity style={styles.linkButton} onPress={openJournal}>
+                <Text style={styles.linkText}>Voir le journal</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.linkButton, { marginTop: 8 }]}
+                onPress={shareJournal}>
+                <Text style={styles.linkText}>Partager le journal</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.linkButton, { marginTop: 8 }]}
+                onPress={async () => {
+                  await clearNetworkJournal();
+                  setJournalEntries([]);
+                }}>
+                <Text style={styles.linkText}>Vider le journal</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+
+        <Text style={styles.hint}>
+          Tout reste en mémoire sur l'appareil, rien n'est envoyé : le journal
+          disparaît en coupant l'interrupteur ou en fermant l'app. Il contient
+          des URLs signées et des jetons de lecture — à ne partager qu'avec
+          quelqu'un qui doit diagnostiquer.
+        </Text>
+      </View>
+
+      <Modal
+        visible={journalVisible}
+        animationType="slide"
+        onRequestClose={() => setJournalVisible(false)}>
+        <View style={styles.container}>
+          <View style={styles.journalHeader}>
+            <Text style={styles.sectionTitle}>
+              Journal réseau ({journalEntries.length})
+            </Text>
+            <TouchableOpacity onPress={() => setJournalVisible(false)}>
+              <Text style={styles.linkText}>Fermer</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView contentContainerStyle={styles.content} horizontal={false}>
+            {journalEntries.length === 0 ? (
+              <Text style={styles.hint}>
+                Aucune requête enregistrée. Lance une lecture, puis rouvre cet
+                écran.
+              </Text>
+            ) : (
+              journalEntries.map((entry, index) => (
+                <Text key={index} selectable style={styles.journalEntry}>
+                  {entry}
+                </Text>
+              ))
+            )}
+          </ScrollView>
+        </View>
+      </Modal>
+
       {/* About Section */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>À propos</Text>
@@ -464,5 +591,19 @@ const styles = StyleSheet.create({
     color: '#8b5cf6',
     fontSize: 14,
     fontWeight: '500',
+  },
+  journalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 16,
+  },
+  journalEntry: {
+    color: '#d4d4d4',
+    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Menlo',
+    fontSize: 11,
+    lineHeight: 15,
+    marginBottom: 12,
   },
 });

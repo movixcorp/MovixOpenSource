@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 interface JoinPartyModalProps {
     isOpen: boolean;
@@ -126,7 +127,7 @@ const JoinPartyModal: React.FC<JoinPartyModalProps> = ({ isOpen, onClose }) => {
         </AnimatePresence>
     );
 
-    return createPortal(modalContent, document.body);
+    return createPortal(modalContent, getOverlayPortalRoot());
 };
 
 export default JoinPartyModal;

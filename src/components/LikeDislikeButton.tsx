@@ -10,7 +10,25 @@ const API_URL = import.meta.env.VITE_MAIN_API;
 interface LikeDislikeButtonProps {
   contentType: 'movie' | 'tv' | 'shared-list';
   contentId: string;
+  onStatsChange?: (stats: LikeDislikeStats) => void;
 }
+
+export interface LikeDislikeStats {
+  likes: number;
+  dislikes: number;
+}
+
+const MIN_MOVIX_RATING_VOTES = 50;
+
+export const calculateLikeDislikeRating = ({ likes, dislikes }: LikeDislikeStats): number | null => {
+  const totalVotes = likes + dislikes;
+  if (likes < MIN_MOVIX_RATING_VOTES && dislikes < MIN_MOVIX_RATING_VOTES) {
+    return null;
+  }
+
+  // Keep the score conservative: truncate to one decimal instead of rounding up.
+  return Math.floor((likes * 100) / totalVotes) / 10;
+};
 
 // Helper function to calculate places array based on value
 const getPlacesForValue = (value: number): number[] => {
@@ -23,7 +41,7 @@ const getPlacesForValue = (value: number): number[] => {
   return places;
 };
 
-const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, contentId }) => {
+const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, contentId, onStatsChange }) => {
   const { currentProfile } = useProfile();
   const { isVerifying: verifying, resetToken: resetTurnstile, getValidToken } = useTurnstile();
   const [likes, setLikes] = useState(0);
@@ -58,9 +76,13 @@ const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, cont
 
         previousLikes.current = 0;
         previousDislikes.current = 0;
+        const fetchedLikes = Number(response.data.likes) || 0;
+        const fetchedDislikes = Number(response.data.dislikes) || 0;
+
         // Set likes/dislikes which will trigger animation from 0 to actual value
-        setLikes(response.data.likes);
-        setDislikes(response.data.dislikes);
+        setLikes(fetchedLikes);
+        setDislikes(fetchedDislikes);
+        onStatsChange?.({ likes: fetchedLikes, dislikes: fetchedDislikes });
         // Keep display at 0 - the useEffect will animate them up
         previousDisplayLikes.current = 0;
         previousDisplayDislikes.current = 0;
@@ -73,7 +95,7 @@ const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, cont
     };
 
     fetchLikes();
-  }, [contentType, contentId, currentProfile]);
+  }, [contentType, contentId, currentProfile, onStatsChange]);
 
   // Handle like/dislike
   const handleVote = async (voteType: 'like' | 'dislike') => {
@@ -134,6 +156,7 @@ const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, cont
     setLikes(newLikes);
     setDislikes(newDislikes);
     setUserVote(newUserVote);
+    onStatsChange?.({ likes: newLikes, dislikes: newDislikes });
 
     // Déclencher l'animation immédiatement
     if (voteType === 'like') {
@@ -171,13 +194,14 @@ const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, cont
       );
 
       // Synchroniser avec les valeurs du serveur (au cas où il y aurait une différence)
-      const serverLikes = response.data.likes;
-      const serverDislikes = response.data.dislikes;
+      const serverLikes = Number(response.data.likes) || 0;
+      const serverDislikes = Number(response.data.dislikes) || 0;
 
       // Mettre à jour les valeurs avec celles du serveur
       // Si elles sont différentes des valeurs actuelles, les useEffect déclencheront automatiquement l'animation
       setLikes(serverLikes);
       setDislikes(serverDislikes);
+      onStatsChange?.({ likes: serverLikes, dislikes: serverDislikes });
 
       setUserVote(response.data.userVote);
 
@@ -191,6 +215,7 @@ const LikeDislikeButton: React.FC<LikeDislikeButtonProps> = ({ contentType, cont
       setUserVote(oldUserVote);
       previousLikes.current = oldLikes;
       previousDislikes.current = oldDislikes;
+      onStatsChange?.({ likes: oldLikes, dislikes: oldDislikes });
       // Si 403 (token Turnstile expiré/invalide), reset pour en obtenir un nouveau
       if (error?.response?.status === 403) {
         resetTurnstile();

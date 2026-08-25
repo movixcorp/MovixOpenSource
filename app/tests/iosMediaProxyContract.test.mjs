@@ -69,6 +69,10 @@ async function loadBridge({ platform = 'ios', openResult = validIOSLocalURL(2812
           subscribePictureInPicture: () => noop,
         };
       }
+      if (specifier === './networkJournal') {
+        // Journal de diagnostic : inerte ici, il ne doit rien changer au pont.
+        return { recordJournalEntry: noop };
+      }
       throw new Error(`Unexpected bridge dependency: ${specifier}`);
     },
     AbortController,

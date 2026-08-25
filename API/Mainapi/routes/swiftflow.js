@@ -41,6 +41,7 @@ const {
   saveToCache,
 } = require('../utils/cacheManager');
 const { redis } = require('../config/redis');
+const { respondWithResolvedSources } = require('../utils/embedExtraction');
 
 const API_BASE = (process.env.SWIFTFLOW_BASE_URL || '').replace(/\/+$/, '');
 // Clé non secrète (SwiftFlow l'embarque dans l'URL du player côté client), mais
@@ -229,7 +230,10 @@ router.get('/movie/:id', async (req, res) => {
   try {
     const env = await withCache(`movie-${id}`, () => fetchMovie(id));
     if (!env) return res.json({ success: false, pending: true, tmdb_id: Number(id) });
-    res.json(buildMovieResponse(id, env));
+    await respondWithResolvedSources(req, res, buildMovieResponse(id, env), {
+      movieMapKey: 'players',
+      label: 'SWIFTFLOW MOVIE',
+    });
   } catch (err) {
     console.error(`[SwiftFlow MOVIE] ${id}: ${err.message}`);
     res.status(200).json({ success: false, error: 'Erreur SwiftFlow', tmdb_id: id });
@@ -246,7 +250,11 @@ router.get('/tv/:id/season/:season', async (req, res) => {
   try {
     const env = await withCache(`tv-${id}`, () => fetchSeries(id));
     if (!env) return res.json({ success: false, pending: true, tmdb_id: Number(id) });
-    res.json(buildSeasonResponse(id, env, season, episode));
+    // SwiftFlow range la map de langues à même l'épisode, sans enveloppe.
+    await respondWithResolvedSources(req, res, buildSeasonResponse(id, env, season, episode), {
+      languageKey: null,
+      label: 'SWIFTFLOW TV',
+    });
   } catch (err) {
     console.error(`[SwiftFlow TV] ${id} S${season}: ${err.message}`);
     res.status(200).json({ success: false, error: 'Erreur SwiftFlow', tmdb_id: id });

@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { ChevronLeft, ChevronRight, ImageOff } from 'lucide-react';
 import ContentRowSkeleton from './skeletons/ContentRowSkeleton';
 import { encodeId } from '../utils/idEncoder';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 interface Media {
   id: number;
@@ -26,13 +27,14 @@ interface ContentRowProps {
   isLoading?: boolean;
 }
 
-export const ContentRow: React.FC<ContentRowProps> = ({ title, items, mediaType, onLoadMore, isLoading }) => {
+export const ContentRow: React.FC<ContentRowProps> = ({ title, items, mediaType: _mediaType, onLoadMore, isLoading }) => {
+  const { items: allowedItems } = useAgeRestrictedContent(items);
   if (isLoading) {
     return <ContentRowSkeleton />;
   }
 
   // Filter out items without poster
-  const validItems = items.filter(item => item && (item.poster_path || item.backdrop_path));
+  const validItems = allowedItems.filter(item => item && (item.poster_path || item.backdrop_path));
 
   if (validItems.length === 0) {
     return null;

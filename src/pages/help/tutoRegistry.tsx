@@ -26,6 +26,7 @@ import {
   ListOrdered,
   Palette,
   History,
+  Bot,
 } from 'lucide-react';
 import CaMarchePlusPage from './CaMarchePlusPage';
 import DnsPage from './DnsPage';
@@ -53,6 +54,7 @@ import ExtractionPage from './ExtractionPage';
 import PrioriteSourcesPage from './PrioriteSourcesPage';
 import DernierLecteurPage from './DernierLecteurPage';
 import ApparencePage from './ApparencePage';
+import McpPage from './McpPage';
 
 export type TutoAccent = 'red' | 'blue' | 'green' | 'orange' | 'purple';
 
@@ -606,4 +608,55 @@ export const TUTO_REGISTRY: TutoMeta[] = [
       'help.apparence.limitsBody',
     ],
   },
+  {
+    slug: 'mcp',
+    component: McpPage,
+    titleKey: 'help.hub.cardMcpTitle',
+    subKey: 'help.hub.cardMcpSub',
+    icon: <Bot className="w-8 h-8" />,
+    accent: 'green',
+    searchKeys: [
+      'help.mcp.title',
+      'help.mcp.heroSub',
+      'help.mcp.introBody',
+      'help.mcp.whatTitle',
+      'help.mcp.whatBody',
+      'help.mcp.prereqTitle',
+      'help.mcp.prereqBody',
+      'help.mcp.clientsTitle',
+      'help.mcp.clientsIntro',
+      'help.mcp.clientClaudeName',
+      'help.mcp.clientClaudeStep1',
+      'help.mcp.clientClaudeStep2',
+      'help.mcp.clientClaudeStep3',
+      'help.mcp.clientClaudeStep4',
+      'help.mcp.clientClaudeNote',
+      'help.mcp.clientChatgptName',
+      'help.mcp.clientChatgptStep1',
+      'help.mcp.clientChatgptStep2',
+      'help.mcp.clientChatgptStep3',
+      'help.mcp.clientChatgptStep4',
+      'help.mcp.clientChatgptNote',
+      'help.mcp.clientLechatName',
+      'help.mcp.clientLechatStep1',
+      'help.mcp.clientLechatStep2',
+      'help.mcp.clientLechatStep3',
+      'help.mcp.clientLechatNote',
+      'help.mcp.clientEditorsName',
+      'help.mcp.clientEditorsStep1',
+      'help.mcp.clientEditorsStep2',
+      'help.mcp.clientEditorsStep3',
+      'help.mcp.clientEditorsNote',
+      'help.mcp.examplesTitle',
+      'help.mcp.examplesIntro',
+      'help.mcp.securityTitle',
+      'help.mcp.securityBody',
+      'help.mcp.advancedTitle',
+      'help.mcp.advancedBody',
+      'help.mcp.advancedNote',
+      'help.mcp.limitsTitle',
+      'help.mcp.limitsBody',
+    ],
+  },
 ];
+

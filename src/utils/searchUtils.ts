@@ -300,6 +300,7 @@ const ANIME_MODE_HIDDEN_IDS = new Set([
   "79141",
   "2085",
   "78173",
+  "110316",
 ]);
 
 const ANIME_MODE_DEFAULT_OFF_IDS = new Set([

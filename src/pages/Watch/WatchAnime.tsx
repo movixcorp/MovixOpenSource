@@ -9,9 +9,11 @@ import { getTmdbId, encodeId } from '../../utils/idEncoder';
 import HLSPlayer from '../../components/HLSPlayer';
 import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
-import { extractVidmolyM3u8, extractSibnetM3u8, extractOneUploadSources } from '../../utils/extractM3u8';
+import { getVipHeaders } from '../../utils/authUtils';
+import { registerServerResolvedSources } from '../../utils/extractM3u8';
+import { runExtractionPass } from '../../utils/runExtractionPass';
 import { pickAutoSelectedLanguage, sortHostersByPriority } from '../../utils/sourceAutoSelect';
-import { detectHoster } from '../../utils/hosterRegistry';
+import { detectHoster, toCanonicalHosterDomain } from '../../utils/hosterRegistry';
 import {
   getSourcePriorityPrefs,
   subscribeToPriorityChanges,
@@ -27,6 +29,7 @@ import {
   createHlsAutoFallbackGuard,
   syncHlsActiveSource,
 } from '../../utils/hlsAutoFallbackGuard';
+import { markEpisodeHandoff } from '../../utils/playerFullscreenPersistence';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -208,7 +211,6 @@ const WatchAnime: React.FC = () => {
   // Loading states for extractions
   const [loadingVidmolyExtraction, setLoadingVidmolyExtraction] = useState<boolean>(false);
   const [loadingSibnetExtraction, setLoadingSibnetExtraction] = useState<boolean>(false);
-  const [loadingOneUploadExtraction, setLoadingOneUploadExtraction] = useState<boolean>(false);
   const [extractionProgress, setExtractionProgress] = useState<string>('');
 
   // For HLS player
@@ -404,11 +406,18 @@ const WatchAnime: React.FC = () => {
 
       // Use the new fallback search logic
       const searchFunction = async (term: string) => {
-        const response = await axios.get(`${MAIN_API}/anime/search/${encodeURIComponent(term)}?includeSeasons=true&includeEpisodes=true`);
+        // `resolve` + saison/épisode : le serveur résout les m3u8 de ce seul
+        // épisode. On ne lui envoie que des identifiants — jamais d'URL, il
+        // n'existe plus d'endpoint qui en accepterait une.
+        const response = await axios.get(`${MAIN_API}/anime/search/${encodeURIComponent(term)}?includeSeasons=true&includeEpisodes=true`, {
+          params: { resolve: 1, season, episode },
+          headers: { ...getVipHeaders() }
+        });
         return response.data || [];
       };
 
       const results = await searchWithFallback(searchFunction, searchName, 'WatchAnime');
+      registerServerResolvedSources(results);
       // --- PATCH SPECIAL ANIMES ---
       if (results.length > 0) {
         type AnimeResult = {
@@ -648,17 +657,17 @@ const WatchAnime: React.FC = () => {
 
   // Check if loading is complete (including extractions)
   useEffect(() => {
-    if (loading && !loadingVidmolyExtraction && !loadingSibnetExtraction && !loadingOneUploadExtraction && videoSources.length > 0) {
+    if (loading && !loadingVidmolyExtraction && !loadingSibnetExtraction && videoSources.length > 0) {
       setLoading(false);
     }
-  }, [loading, loadingVidmolyExtraction, loadingSibnetExtraction, loadingOneUploadExtraction, videoSources.length]);
+  }, [loading, loadingVidmolyExtraction, loadingSibnetExtraction, videoSources.length]);
 
   // Process video sources from anime episode
   const processVideoSources = async (animeEpisode: AnimeEpisode) => {
     const sources: VideoSource[] = [];
-    const vidmolySources: VideoSource[] = [];
-    const sibnetSources: VideoSource[] = [];
-    const oneUploadSources: VideoSource[] = [];
+
+    // Prefs lues une fois : detectHoster les consulte pour chaque lecteur.
+    const detectPrefs = getSourcePriorityPrefs();
 
     // Traiter toutes les langues disponibles en une seule fois pour éviter les re-extractions
     for (const streamingLink of animeEpisode.streaming_links) {
@@ -667,65 +676,65 @@ const WatchAnime: React.FC = () => {
       for (const playerUrl of players) {
         const playerUrlString = typeof playerUrl === 'string' ? playerUrl : String(playerUrl);
 
-        // Check if this is a Vidmoly URL - extract M3U8
-        if (playerUrlString.includes('vidmoly.to') || playerUrlString.includes('vidmoly.net')) {
-          // Use the URL as-is if it's already .net, otherwise replace .to with .net
-          const vidmolyNetUrl = playerUrlString.includes('vidmoly.net')
-            ? playerUrlString
-            : playerUrlString.replace('vidmoly.to', 'vidmoly.net');
+        // Le hoster est identifié via le registre (`detectHoster`) et non par
+        // une liste de domaines en dur : Vidmoly, Sibnet et consorts font
+        // tourner leurs TLD, et anime-sama sert le lecteur sur le domaine du
+        // moment. Le registre couvre déjà tous les TLD d'un hoster par un
+        // pattern « mot », et respecte les `patternOverrides` de l'utilisateur.
+        const hoster = detectHoster(playerUrlString, {
+          patternOverrides: detectPrefs.patternOverrides,
+          customHosters: detectPrefs.customHosters,
+        });
 
-          const vidmolySource = {
+        // Les liens anime-sama internes ne sont pas des lecteurs.
+        if (playerUrlString.includes('anime-sama.fr') || playerUrlString.includes('anime-sama.to')) {
+          console.log('Skipping anime-sama URL:', playerUrlString);
+          continue;
+        }
+
+        if (hoster === 'vidmoly') {
+          // L'URL de l'embed garde le domaine servi par anime-sama : c'est le
+          // seul dont on sait qu'il est vivant. Seul .to, historiquement mort,
+          // est réécrit, comme le faisait déjà l'ancien code. La normalisation
+          // vers le domaine canonique attendu par le serveur d'extraction se
+          // fait dans extractVidmolyM3u8, donc côté extraction uniquement.
+          const vidmolyUrl = /vidmoly\.to/i.test(playerUrlString)
+            ? toCanonicalHosterDomain(playerUrlString, 'vidmoly')
+            : playerUrlString;
+
+          sources.push({
             language: streamingLink.language,
             quality: 'Auto',
-            url: vidmolyNetUrl,
+            url: vidmolyUrl,
             player: 'Vidmoly',
             label: `${streamingLink.language.toUpperCase()} - Vidmoly`,
-            id: `vidmoly-${streamingLink.language}-${vidmolyNetUrl}`
-          };
-
-          vidmolySources.push(vidmolySource);
-
-          // Also add as embed source for fallback
-          sources.push(vidmolySource);
+            id: `vidmoly-${streamingLink.language}-${vidmolyUrl}`
+          });
         }
-        // Check if this is a Sibnet URL - extract M3U8
-        else if (playerUrlString.includes('sibnet.ru')) {
-          const sibnetSource = {
+        else if (hoster === 'sibnet') {
+          sources.push({
             language: streamingLink.language,
             quality: 'Auto',
             url: playerUrlString,
             player: 'Sibnet',
             label: `${streamingLink.language.toUpperCase()} - Sibnet`,
             id: `sibnet-${streamingLink.language}-${playerUrlString}`
-          };
-
-          sibnetSources.push(sibnetSource);
-
-          // Also add as embed source for fallback
-          sources.push(sibnetSource);
+          });
         }
-        // Check if this is a OneUpload URL - extract M3U8
-        else if (playerUrlString.includes('oneupload.to')) {
-          const oneUploadSource = {
+        // OneUpload : lu en embed uniquement (l'extraction M3U8 passait par le
+        // proxy partagé, retiré pour cause de faille SSRF).
+        else if (hoster === 'oneupload') {
+          sources.push({
             language: streamingLink.language,
             quality: 'Auto',
             url: playerUrlString,
             player: 'OneUpload',
             label: `${streamingLink.language.toUpperCase()} - OneUpload`,
             id: `oneupload-${streamingLink.language}-${playerUrlString}`
-          };
-
-          oneUploadSources.push(oneUploadSource);
-
-          // Also add as embed source for fallback
-          sources.push(oneUploadSource);
+          });
         }
-        // Skip anime-sama URLs - don't display them as players
-        else if (playerUrlString.includes('anime-sama.fr') || playerUrlString.includes('anime-sama.to')) {
-          console.log('Skipping anime-sama URL:', playerUrlString);
-          continue;
-        } else {
-          // Extract domain name from URL to use as player name
+        else {
+          // Hoster non reconnu par le registre : nom dérivé du domaine.
           let playerName = "Unknown";
           try {
             const url = new URL(playerUrlString);
@@ -744,16 +753,11 @@ const WatchAnime: React.FC = () => {
               };
               playerName = domainMappings[playerName.toLowerCase()] || playerName.charAt(0).toUpperCase() + playerName.slice(1);
             }
-          } catch (e) {
-            try {
-              const domainMatch = playerUrlString.match(/https?:\/\/(?:www\.)?([^\/]+)/i);
-              if (domainMatch && domainMatch[1]) {
-                const domain = domainMatch[1].split('.')[0];
-                playerName = domain.charAt(0).toUpperCase() + domain.slice(1);
-              }
-            } catch (matchError) {
-              console.error("Error extracting domain:", matchError);
-              playerName = "Unknown";
+          } catch {
+            const domainMatch = playerUrlString.match(/https?:\/\/(?:www\.)?([^/]+)/i);
+            if (domainMatch && domainMatch[1]) {
+              const domain = domainMatch[1].split('.')[0];
+              playerName = domain.charAt(0).toUpperCase() + domain.slice(1);
             }
           }
 
@@ -770,107 +774,68 @@ const WatchAnime: React.FC = () => {
       }
     }
 
-    // Extract M3U8 from Vidmoly sources
-    if (vidmolySources.length > 0) {
-      console.log('🔍 Extracting M3U8 from Vidmoly sources...');
+    // =========== EXTRACTION M3U8 (passe générique) ===========
+    // Anime-sama ne tentait que Vidmoly et Sibnet ; `runExtractionPass` route
+    // chaque lecteur vers l'extracteur qui lui correspond, donc voe, uqload,
+    // doodstream, vidzy, fsvid et seekstreaming sont couverts d'office.
+    // OneUpload reste volontairement sans extracteur (faille SSRF).
+    const embedSources = [...sources];
+    if (embedSources.length > 0) {
+      console.log('🔍 Extraction m3u8 sur', embedSources.length, 'lecteur(s) anime-sama...');
       setLoadingVidmolyExtraction(true);
-      setExtractionProgress(t('watch.extractingSources', { provider: 'Vidmoly' }));
-
-      for (const vidmolySource of vidmolySources) {
-        try {
-          const extractionResult = await extractVidmolyM3u8(vidmolySource.url, MAIN_API);
-
-          if (extractionResult && extractionResult.success && extractionResult.m3u8Url) {
-            console.log('✅ Vidmoly M3U8 extracted:', extractionResult.m3u8Url);
-
-            // Add HLS source
-            sources.push({
-              language: vidmolySource.language,
-              quality: 'Auto',
-              url: extractionResult.m3u8Url,
-              player: 'Vidmoly',
-              label: `${vidmolySource.language.toUpperCase()} - Vidmoly HLS`,
-              isM3u8: true,
-              id: `vidmoly-hls-${vidmolySource.language}-${extractionResult.m3u8Url}`
-            });
-          } else {
-            console.log('❌ Vidmoly M3U8 extraction failed:', extractionResult?.error);
-          }
-        } catch (error) {
-          console.error('Error extracting Vidmoly M3U8:', error);
-        }
-      }
-      setLoadingVidmolyExtraction(false);
-    }
-
-    // Extract M3U8 from Sibnet sources
-    if (sibnetSources.length > 0) {
-      console.log('🔍 Extracting M3U8 from Sibnet sources...');
       setLoadingSibnetExtraction(true);
-      setExtractionProgress(t('watch.extractingSources', { provider: 'Sibnet' }));
+      setExtractionProgress(t('watch.extractingSources', { provider: 'Anime' }));
 
-      for (const sibnetSource of sibnetSources) {
-        try {
-          const extractionResult = await extractSibnetM3u8(sibnetSource.url, MAIN_API);
+      try {
+        const animePass = await runExtractionPass(
+          embedSources.map(source => ({
+            url: source.url,
+            label: source.label,
+            language: source.language,
+            player: source.player,
+            meta: { language: source.language },
+          })),
+          MAIN_API,
+          {
+            origin: 'anime-sama',
+            context: { category: 'anime' },
+            // anime-sama ne sert qu'un sous-ensemble de hosters, et le
+            // `hosterOrder` de la catégorie anime ne déclare que ceux-là.
+            // Extraire au-delà produit des entrées sans rang (MAX_SAFE_INTEGER
+            // dans sortHostersByPriority) qui remontent devant Vidmoly dans
+            // selectBestSource — les autres hosters restent lus en embed.
+            allowedHosters: getSourcePriorityPrefs().categories.anime.hosterOrder,
+          },
+        );
 
-          if (extractionResult && extractionResult.success && extractionResult.m3u8Url) {
-            console.log('✅ Sibnet source extracted:', extractionResult.m3u8Url);
-
-            // For Sibnet sources, always mark as HLS for UI consistency (even if MP4)
-            // The HLSPlayer will handle MP4 detection internally
-            sources.push({
-              language: sibnetSource.language,
-              quality: 'Auto',
-              url: extractionResult.m3u8Url,
-              player: 'Sibnet',
-              label: `${sibnetSource.language.toUpperCase()} - Sibnet HLS`,
-              isM3u8: true, // Always true for Sibnet to show HLS tag
-              id: `sibnet-hls-${sibnetSource.language}-${extractionResult.m3u8Url}`
-            });
-          } else {
-            console.log('❌ Sibnet M3U8 extraction failed:', extractionResult?.error);
+        for (const extracted of [...animePass.hls, ...animePass.file]) {
+          const language = typeof extracted.meta?.language === 'string' ? extracted.meta.language : '';
+          // Sans langue, la source est invisible pour selectBestSource (toutes
+          // ses branches comparent `source.language`) : mieux vaut ne pas la
+          // pousser que d'ajouter une entrée injouable au menu.
+          if (!language) {
+            console.warn('[anime-sama] source extraite sans langue, ignorée:', extracted.url);
+            continue;
           }
-        } catch (error) {
-          console.error('Error extracting Sibnet M3U8:', error);
+          const hosterId = extracted.source.split('-')[0];
+          const playerName = hosterId.charAt(0).toUpperCase() + hosterId.slice(1);
+
+          sources.push({
+            language,
+            quality: 'Auto',
+            url: extracted.url,
+            player: playerName,
+            label: `${language.toUpperCase()} - ${playerName} HLS`,
+            // Le tag « HLS » de l'UI signifie « lu nativement », y compris pour
+            // les fichiers progressifs : HLSPlayer détecte le MP4 tout seul.
+            isM3u8: true,
+            id: `${hosterId}-hls-${language}-${extracted.url}`,
+          });
         }
+      } finally {
+        setLoadingVidmolyExtraction(false);
+        setLoadingSibnetExtraction(false);
       }
-      setLoadingSibnetExtraction(false);
-    }
-
-    // Extract M3U8 from OneUpload sources
-    if (oneUploadSources.length > 0) {
-      console.log('🔍 Extracting M3U8 from OneUpload sources...');
-      setLoadingOneUploadExtraction(true);
-      setExtractionProgress(t('watch.extractingSources', { provider: 'OneUpload' }));
-
-      for (const oneUploadSource of oneUploadSources) {
-        try {
-          const extractionResult = await extractOneUploadSources(oneUploadSource.url);
-
-          if (extractionResult && extractionResult.success && (extractionResult.hlsUrl || extractionResult.m3u8Url)) {
-            const extractedUrl = extractionResult.hlsUrl || extractionResult.m3u8Url;
-            if (extractedUrl) {
-              console.log('✅ OneUpload source extracted:', extractedUrl);
-
-              // Add HLS source (mark as M3U8 for UI consistency, HLSPlayer will handle MP4 detection)
-              sources.push({
-                language: oneUploadSource.language,
-                quality: 'Auto',
-                url: extractedUrl,
-                player: 'OneUpload',
-                label: `${oneUploadSource.language.toUpperCase()} - OneUpload HLS`,
-                isM3u8: true,
-                id: `oneupload-hls-${oneUploadSource.language}-${extractedUrl}`
-              });
-            }
-          } else {
-            console.log('❌ OneUpload M3U8 extraction failed:', extractionResult?.error);
-          }
-        } catch (error) {
-          console.error('Error extracting OneUpload M3U8:', error);
-        }
-      }
-      setLoadingOneUploadExtraction(false);
     }
 
     // Tri par priorité hoster selon prefs utilisateur.
@@ -1114,7 +1079,14 @@ const WatchAnime: React.FC = () => {
   // Handle next episode (for HLSPlayer)
   const handleNextEpisodeFromPlayer = (seasonNum: number, episodeNum: number) => {
     if (!id) return;
-    window.location.href = `/watch/anime/${encodeId(id)}/season/${seasonNum}/episode/${episodeNum}`;
+    // Navigation SPA volontaire : un rechargement complet déchargerait le
+    // document, ce qui fait perdre le plein écran ET l'activation utilisateur.
+    // Sans activation, Firefox refuse tout `requestFullscreen()` — le plein
+    // écran serait donc irrécupérable. Ici le document survit, et le plein
+    // écran avec lui. L'état de la page repart quand même de zéro : le routeur
+    // remonte le composant (`RouteLazyContent` pose `key={pathname}`).
+    markEpisodeHandoff();
+    navigate(`/watch/anime/${encodeId(id)}/season/${seasonNum}/episode/${episodeNum}`);
   };
 
   // Handle next episode (for buttons)
@@ -1139,9 +1111,10 @@ const WatchAnime: React.FC = () => {
       }
     }
 
-    // Use window.location.href for full page reload
+    // Navigation SPA : voir `handleNextEpisodeFromPlayer`.
     if (!id) return;
-    window.location.href = `/watch/anime/${encodeId(id)}/season/${targetSeason}/episode/${targetEpisode}`;
+    markEpisodeHandoff();
+    navigate(`/watch/anime/${encodeId(id)}/season/${targetSeason}/episode/${targetEpisode}`);
   };
 
   // Handle previous episode
@@ -1165,8 +1138,9 @@ const WatchAnime: React.FC = () => {
         return;
       }
     }
-    // Use window.location.href for full page reload
-    window.location.href = `/watch/anime/${encodeId(id)}/season/${targetSeason}/episode/${targetEpisode}`;
+    // Navigation SPA : voir `handleNextEpisodeFromPlayer`.
+    markEpisodeHandoff();
+    navigate(`/watch/anime/${encodeId(id)}/season/${targetSeason}/episode/${targetEpisode}`);
   };
 
   useEffect(() => {
@@ -1306,7 +1280,7 @@ const WatchAnime: React.FC = () => {
           {extractionProgress && (
             <div className="text-gray-300 text-sm mt-2">{extractionProgress}</div>
           )}
-          {(loadingVidmolyExtraction || loadingSibnetExtraction || loadingOneUploadExtraction) && (
+          {(loadingVidmolyExtraction || loadingSibnetExtraction) && (
             <div className="mt-4 space-y-2">
               {loadingVidmolyExtraction && (
                 <div className="flex items-center gap-2 text-blue-400 text-sm">
@@ -1318,12 +1292,6 @@ const WatchAnime: React.FC = () => {
                 <div className="flex items-center gap-2 text-green-400 text-sm">
                   <div className="w-3 h-3 border-2 border-green-400 border-t-transparent rounded-full animate-spin"></div>
                   {t('watch.extractionPlayer', { player: 'Sibnet' })}
-                </div>
-              )}
-              {loadingOneUploadExtraction && (
-                <div className="flex items-center gap-2 text-purple-400 text-sm">
-                  <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
-                  {t('watch.extractionPlayer', { player: 'OneUpload' })}
                 </div>
               )}
             </div>
@@ -1575,10 +1543,11 @@ const WatchAnime: React.FC = () => {
                       <button
                         key={index}
                         onClick={() => {
-                          // Use window.location.href for full page reload
+                          // Navigation SPA : voir `handleNextEpisodeFromPlayer`.
                           if (!id) return;
-                          window.location.href = `/watch/anime/${encodeId(id)}/season/${displayedSeasonNumber}/episode/${index + 1}`;
+                          markEpisodeHandoff();
                           setShowEpisodesMenu(false);
+                          navigate(`/watch/anime/${encodeId(id)}/season/${displayedSeasonNumber}/episode/${index + 1}`);
                         }}
                         className={`flex items-start gap-3 p-2 rounded-lg transition-colors ${Number(episode) === index + 1 && displayedSeasonNumber === Number(season) // Highlight only if season and episode match URL
                           ? 'bg-red-900/30 border border-red-800/50'
@@ -1764,6 +1733,10 @@ const WatchAnime: React.FC = () => {
               src={hlsPlayerSrc}
               autoPlay={true}
               controls={true}
+              // Le lecteur remplit déjà la fenêtre ici : le plein écran est
+              // porté par le conteneur racine de l'app, pour survivre au
+              // remontage du lecteur (changement d'épisode ou de source).
+              fullscreenTarget="page"
               className="w-full h-full"
               poster={showDetails?.backdrop_path ? `https://image.tmdb.org/t/p/w1280${showDetails.backdrop_path}` : undefined}
               tvShow={{

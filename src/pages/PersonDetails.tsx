@@ -7,6 +7,7 @@ import { ExternalLink, Clock, Star } from 'lucide-react';
 import { TMDB_API_KEY } from '../config/config';
 import { useTranslation } from 'react-i18next';
 import { getTmdbLanguage } from '../i18n';
+import AgeRestrictedMedia from '../components/AgeRestrictedMedia';
 
 interface Person {
   id: number;
@@ -268,6 +269,7 @@ const PersonDetails: React.FC = () => {
                   {/* Credits for this year */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-5xl mx-auto">
                     {creditsByYear[year].map((credit, creditIdx) => (
+                      <AgeRestrictedMedia key={`${credit.id}-${credit.character || credit.job}`} item={credit}>
                       <motion.div
                         key={`${credit.id}-${credit.character || credit.job}`}
                         initial={{ opacity: 0, y: 50 }}
@@ -332,6 +334,7 @@ const PersonDetails: React.FC = () => {
                           </motion.div>
                         </Link>
                       </motion.div>
+                      </AgeRestrictedMedia>
                     ))}
                   </div>
                 </div>
@@ -344,4 +347,4 @@ const PersonDetails: React.FC = () => {
   );
 };
 
-export default PersonDetails; 
+export default PersonDetails;

@@ -504,7 +504,7 @@ const Anime: React.FC = () => {
   if (loading && animeShows.length === 0) {
     return (
       <div className="min-h-screen bg-black text-white">
-        <div className="relative w-full pt-4 sm:pt-8 md:pt-14 lg:pt-16">
+        <div className="relative w-full pt-16 md:pt-20 lg:pt-24">
           <HeroSkeleton />
         </div>
         <div className="container mx-auto px-4 py-8 space-y-8">
@@ -520,7 +520,7 @@ const Anime: React.FC = () => {
     <div className="min-h-screen bg-black text-white">
       <style>{pageStyles}</style>
 
-      <div className="relative w-full pt-4 sm:pt-8 md:pt-14 lg:pt-16">
+      <div className="relative w-full pt-16 md:pt-20 lg:pt-24">
         {featuredShows.length > 0 && (
           <HeroSlider
             items={featuredShows.map((show) => ({ ...show, media_type: 'tv' }))}

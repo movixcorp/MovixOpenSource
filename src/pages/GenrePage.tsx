@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
@@ -207,8 +207,19 @@ const GenrePage: React.FC = () => {
     if (p !== currentPage) setCurrentPage(p);
   }, [searchParams]);
 
-  // Reset on genre/media change — replace to avoid polluting history
+  // Reset on genre/media change — replace to avoid polluting history.
+  //
+  // Sauté au montage : le routeur remonte déjà la page quand le genre ou le
+  // type change (`RouteLazyContent` pose `key={pathname}`), l'état repart donc
+  // de zéro tout seul. Le faire quand même à l'arrivée écrasait un lien profond
+  // `?page=5` — et déclenchait deux requêtes, une pour la page de l'URL puis
+  // une pour la page 1 réécrite dans la foulée.
+  const isFirstRunRef = useRef(true);
   useEffect(() => {
+    if (isFirstRunRef.current) {
+      isFirstRunRef.current = false;
+      return;
+    }
     setCurrentPage(1);
     setSearchParams({ page: '1' }, { replace: true });
     setLoading(true);
@@ -436,8 +447,12 @@ const GenrePage: React.FC = () => {
             )}
           </AnimatePresence>
 
-          {/* Content */}
-          {loading && !initialLoad ? (
+          {/* Content
+              La grille reste affichée pendant le chargement de la page
+              suivante, simplement estompée. La remplacer par un spinner
+              démontait les 20 cartes, vidait les images et faisait sauter la
+              mise en page à chaque changement de page. */}
+          {loading && content.length === 0 ? (
             <div className="flex justify-center py-20">
               <Loader2 className="w-8 h-8 text-red-500 animate-spin" />
             </div>
@@ -459,7 +474,7 @@ const GenrePage: React.FC = () => {
               </motion.button>
             </motion.div>
           ) : (
-            <>
+            <div className={`transition-opacity duration-200 ${loading ? 'opacity-40 pointer-events-none' : ''}`}>
               {/* Grid View */}
               {viewType === 'grid' && (
                 <div className={`grid ${getGridClasses()} gap-3`}>
@@ -501,7 +516,7 @@ const GenrePage: React.FC = () => {
                   onSelect={handlePageChange}
                 />
               )}
-            </>
+            </div>
           )}
         </div>
       </motion.div>

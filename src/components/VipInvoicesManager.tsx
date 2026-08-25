@@ -316,9 +316,12 @@ const VipInvoicesManager: React.FC = () => {
           {invoices.map((invoice) => {
             const statusMeta = getVipStatusMeta(t, invoice.status);
             const paymentLabel = getVipPaymentLabel(t, invoice.paymentMethod, invoice.coin);
-            const amountSummary = invoice.paymentMethod === 'paygate_hosted'
-              ? `${formatVipFiat(i18n.language, invoice.amountEur, 'EUR')} - ${formatVipFiat(i18n.language, invoice.amountUsd, 'USD')}`
-              : `${formatVipFiat(i18n.language, invoice.amountEur, 'EUR')} - ${formatVipCrypto(i18n.language, invoice.amountCryptoExpected || 0)} ${(invoice.coin || '').toUpperCase()}`;
+            const amountSummary = invoice.paymentMethod === 'cryptogate'
+              || invoice.paymentMethod === 'payblis'
+              ? formatVipFiat(i18n.language, invoice.amountEur, 'EUR')
+              : invoice.paymentMethod === 'paygate_hosted'
+                ? `${formatVipFiat(i18n.language, invoice.amountEur, 'EUR')} - ${formatVipFiat(i18n.language, invoice.amountUsd, 'USD')}`
+                : `${formatVipFiat(i18n.language, invoice.amountEur, 'EUR')} - ${formatVipCrypto(i18n.language, invoice.amountCryptoExpected || 0)} ${(invoice.coin || '').toUpperCase()}`;
             const addressPreview = (invoice.trackingAddress || invoice.paymentAddress || '-');
 
             return (

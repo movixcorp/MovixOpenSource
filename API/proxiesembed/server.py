@@ -17,7 +17,8 @@ from aiohttp.resolver import DefaultResolver
 from aiohttp.web import Request, Response
 import logging
 import sys
-from typing import Optional, Dict, Any, Tuple, Set
+from contextlib import AsyncExitStack
+from typing import List, Optional, Dict, Any, Tuple, Set
 from dataclasses import dataclass
 from functools import lru_cache
 import codecs
@@ -42,6 +43,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from uqload_utils import (
+    decode_packed_script_from_html,
     extract_uqload_media_url,
     get_uqload_site_origin,
     normalize_uqload_embed_url,
@@ -60,10 +62,79 @@ from seekstreaming_utils import (
     validate_seekstreaming_media_url,
     validate_seekstreaming_resolved_address,
 )
+from hoster_decoders import (
+    VOE_PAYLOAD_RE,
+    VOE_REDIRECT_MARKER,
+    VOE_REDIRECT_RE,
+    decrypt_voe_payload,
+    extract_veev_challenges,
+    extract_voe_plain_source,
+    extract_voe_subtitles,
+    parse_voe_marker_table,
+    pick_voe_source,
+    veev_build_array,
+    veev_decode_url,
+    veev_lzw_decode,
+)
 from fsvid_vidzy_sandbox import execute_player_scripts
 
-# Load local .env from proxiesembed folder
+# Load local .env from proxiesembed folder — must run BEFORE media_signing is
+# imported, since that module reads its secrets at import time.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
+from media_signing import (
+    DRM_BASE_ROUTE,
+    SIGNATURE_PARAMS,
+    append_signature,
+    check_internal_key,
+    decode_signed_drm_base,
+    encode_signed_drm_base,
+    internal_key_configured,
+    is_public_http_url,
+    redact_url,
+    signing_configured,
+    verify_request,
+)
+
+
+def _undo_truststore_ssl_injection() -> None:
+    """Rend à `ssl.SSLContext` sa classe d'origine si truststore l'a remplacée.
+
+    L'installation locale de `requests` appelle `truststore.inject_into_ssl()`
+    dès son import, ce qui réassigne `ssl.SSLContext` à une *sous-classe*
+    truststore. Les contextes qu'aiohttp fabrique et met en cache à son propre
+    import restent, eux, des `ssl.SSLContext` d'origine : ils cessent donc
+    d'être des instances de la classe désormais installée sous ce nom.
+
+    `asyncio.base_events.start_tls()` fait exactement ce test, d'où un
+    TypeError où l'objet incriminé a pourtant l'air correct :
+
+        sslcontext is expected to be an instance of ssl.SSLContext,
+        got <ssl.SSLContext object at 0x...>
+
+    Seul le TLS monté par-dessus un tunnel déjà ouvert passe par `start_tls`,
+    c'est-à-dire tout notre egress SOCKS5 (vidzy, fsvid, vidmoly, sibnet…).
+    Les connexions directes empruntent `create_connection` et ne voient rien :
+    le symptôme frappe donc une partie des services seulement.
+
+    On force l'import de `requests` — donc l'injection — avant de la défaire,
+    sinon un import tardif par une dépendance (WideFrog) la rétablirait dans
+    notre dos. `extract_from_ssl()` est idempotent et sans effet si aucune
+    injection n'a eu lieu.
+    """
+    try:
+        import requests  # noqa: F401  (importé pour son effet de bord)
+    except Exception:
+        pass
+    try:
+        import truststore
+
+        truststore.extract_from_ssl()
+    except Exception:
+        pass
+
+
+_undo_truststore_ssl_injection()
 
 
 class PublicOnlyResolver(AbstractResolver):
@@ -508,8 +579,9 @@ def _extract_manifest_sync_inner(content_url: str) -> dict:
 #  DRM proxy URL rewriting helpers
 # ---------------------------------------------------------------------------
 def _drm_proxy_url(target_url: str, route: str = '/drm/resource') -> str:
-    """Build a proxy URL for DRM resources."""
-    return f"{route}?url={urllib.parse.quote(target_url, safe='')}"
+    """Build a signed proxy URL for DRM resources."""
+    url = f"{route}?url={urllib.parse.quote(target_url, safe='')}"
+    return append_signature(url, route, target_url)
 
 
 def _drm_resolve_url(base_url: str, relative: str) -> str:
@@ -519,9 +591,13 @@ def _drm_resolve_url(base_url: str, relative: str) -> str:
 
 
 def _drm_make_base_proxy_url(original_base_url: str) -> str:
-    """Encode a base URL into a path-based proxy prefix for DASH."""
-    b = base64.urlsafe_b64encode(original_base_url.encode()).decode().rstrip('=')
-    return f"/drm/b/{b}/"
+    """Encode a base URL into a signed, path-based proxy prefix for DASH.
+
+    The signature travels inside the base64 blob rather than as a query param:
+    a DASH <BaseURL> is a path prefix the player appends to, so a trailing
+    `?exp=&sig=` would break every relative URL resolved against it.
+    """
+    return f"/drm/b/{encode_signed_drm_base(original_base_url)}/"
 
 
 def _drm_rewrite_m3u8(content: str, base_url: str) -> str:
@@ -668,6 +744,98 @@ class HTTP2NoiseFilter(logging.Filter):
 aiohttp_server_logger = logging.getLogger('aiohttp.server')
 aiohttp_server_logger.addFilter(HTTP2NoiseFilter())
 
+# Proxy routes exempt from HMAC signature enforcement.
+#
+# Empty on purpose: every streaming surface is signed. Kept as a named seam so
+# that adding an exemption stays a deliberate, reviewable act rather than an
+# `if` buried in a handler.
+SELF_VALIDATED_PROXY_ROUTES: frozenset = frozenset()
+
+
+def _sign_seekstreaming_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Sign the /seekstreaming-proxy URLs built by build_seekstreaming_result.
+
+    Done here rather than inside seekstreaming_utils so that module stays free
+    of any signing dependency. Each candidate URL already carries its target in
+    the `url` query param — that is what we sign against.
+    """
+
+    def sign(candidate_url: Any) -> Any:
+        if not isinstance(candidate_url, str) or not candidate_url:
+            return candidate_url
+        target = urllib.parse.parse_qs(urlparse(candidate_url).query).get('url', [None])[0]
+        if not target:
+            return candidate_url
+        return append_signature(candidate_url, '/seekstreaming-proxy', target)
+
+    signed = dict(result)
+    for key in ('url', 'ip_url'):
+        if key in signed:
+            signed[key] = sign(signed[key])
+
+    candidates = signed.get('candidates')
+    if isinstance(candidates, list):
+        signed['candidates'] = [
+            {**item, 'url': sign(item.get('url'))} if isinstance(item, dict) else item
+            for item in candidates
+        ]
+
+    return signed
+
+
+def _is_allowed_embed_host(url: str, allowed_suffixes: Tuple[str, ...]) -> bool:
+    """Vrai si l'URL vise bien l'un des domaines de l'hébergeur.
+
+    Remplace les tests par sous-chaîne (`'vidmoly' in url`) qui laissaient
+    passer n'importe quelle cible du moment que le nom apparaissait quelque
+    part : `https://interne.exemple/vidmoly` les satisfaisait.
+    """
+    try:
+        parsed = urlparse(url or '')
+    except (TypeError, ValueError):
+        return False
+
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return False
+    # Un `user:pass@` permet de faire passer le vrai hôte pour un chemin aux
+    # yeux d'un lecteur humain : on refuse plutôt que d'arbitrer.
+    if parsed.username or parsed.password:
+        return False
+
+    hostname = parsed.hostname.lower().rstrip('.')
+    return any(
+        hostname == suffix or hostname.endswith(f'.{suffix}')
+        for suffix in allowed_suffixes
+    )
+
+
+VIDMOLY_HOSTS = ('vidmoly.net', 'vidmoly.to', 'vidmoly.me', 'vidmoly.biz', 'vidmoly.org')
+SIBNET_HOSTS = ('sibnet.ru',)
+UQLOAD_EXTRACT_HOSTS = (
+    'uqload.com', 'uqload.co', 'uqload.io', 'uqload.net', 'uqload.to',
+    'uqload.cx', 'uqload.vc', 'uqload.is', 'uqload.ws', 'uqload.org',
+    'uqload.bz',
+)
+# LuluStream sert le même lecteur depuis une grappe de domaines interchangeables.
+LULUSTREAM_HOSTS = (
+    'lulustream.com', 'luluvdo.com', 'luluvdoo.com', 'luluvid.com', 'lulu.st',
+    'streamhihi.com', 'cdn1.site', 'd00ds.site', '732eg54de642sa.sbs',
+)
+VEEV_HOSTS = ('veev.to', 'veev.pro', 'poophq.com', 'doods.to')
+VIDARA_HOSTS = ('vidara.to', 'vidara.so')
+
+
+def _signed_service_url(route: str, target_url: str) -> str:
+    """Absolute, signed URL for one of the dedicated service proxy routes.
+
+    This is what extraction handlers hand back to mainapi (and mainapi to the
+    player): the destination is pinned by the signature, so the client can hold
+    the URL but never repoint it. Extraction results are cached for at most 2 h,
+    well inside the signature TTL, so a cache hit never serves a dead signature.
+    """
+    url = f"{PROXY_BASE}{route}?url={urllib.parse.quote(target_url)}"
+    return append_signature(url, route, target_url)
+
 # URL encoding key
 URL_ENCODE_KEY = b"ce1f909bbd8b8fa6bdd29035f75ccd1a284fae92a12ff64580008dd0de6e7bc8"
 
@@ -714,6 +882,26 @@ PROBLEMATIC_DOMAINS = frozenset([
 # A request missing either one is answered with a 302 to their decoy stream
 # (s1.fsvid.lol/troll/master.m3u8) on fsvid, or a bare 403 on vidzy.
 FSVID_VIDZY_SEC_CH_UA = '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"'
+
+# Un vrai Chrome n'émet jamais Sec-Ch-Ua seul : les trois indices client
+# partent ensemble, avec un User-Agent dont la version majeure correspond à
+# celle annoncée dans Sec-Ch-Ua. Les en-têtes d'ici annonçaient Chrome 140 dans
+# Sec-Ch-Ua tout en signant l'User-Agent en 139 (fsvid) ou 141 (vidzy), et
+# n'envoyaient ni Sec-Ch-Ua-Mobile, ni Sec-Ch-Ua-Platform, ni Accept-Language :
+# une signature qu'aucun navigateur ne produit. L'extraction et le relais
+# partagent désormais le même jeu, pour que la page d'embed et le CDN voient un
+# client identique.
+FSVID_VIDZY_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+)
+FSVID_VIDZY_CLIENT_HINTS = {
+    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'User-Agent': FSVID_VIDZY_USER_AGENT,
+}
 
 # AES decryption constants for seekstreaming (embed4me)
 SEEKSTREAMING_AES_KEY = b"kiemtienmua911ca"
@@ -1083,8 +1271,28 @@ class ProxyServer:
     RE_MERI = re.compile(r'merichunidya\.com', re.IGNORECASE)
     # Streaming CDN patterns: numeric domains, epic*, quest*, hero*, etc.
     RE_NUMERIC_CDN = re.compile(r'([a-z0-9]+\.\d+\.net|epicquest|questher|hero.*\.com|trainer\.net|dishtrainer)', re.IGNORECASE)
-    RE_DOODSTREAM = re.compile(r'd0000d\.com|doodstream\.com|dood\.(cx|la|pm|sh|so|to|watch|wf|yt|re)|cloudatacdn\.com|dsvplay\.com|doply\.net', re.IGNORECASE)
+    # DoodStream renomme sa grappe en permanence (d0o0d, ds2play, playmogo…) :
+    # la liste suit celle du plugin ResolveURL, qui la maintient à jour.
+    RE_DOODSTREAM = re.compile(
+        r'do*0*o*0*ds?(?:tream|ter|cdn)?\.(?:com|to|so|sh|cx|la|ws|pm|wf|re|yt|li|work|stream|io|net|pro)'
+        r'|ds[2v](?:play|video)\.com|(?:my)?vid(?:pla?y|e0)\.(?:com|net)|vvide0\.com'
+        r'|all3do\.com|do7go\.com|doply\.net|d-s\.io|playmogo\.com|cloudatacdn\.com',
+        re.IGNORECASE,
+    )
     RE_DOODSTREAM_PASS = re.compile(r'/pass_md5/[\w-]+/(?P<token>[\w-]+)')
+    # `dsplayer.hotkeys … '<chemin pass_md5>'` : le lecteur récent construit
+    # l'URL du flux ici plutôt que de la coder en dur dans la page.
+    RE_DOODSTREAM_MAKEPLAY = re.compile(r"""dsplayer\.hotkeys[^']+'(/[^']+)'""")
+    # Le jeton apparaît tel quel dans `makePlay()` ; il ne coïncide plus
+    # toujours avec le dernier segment du chemin pass_md5.
+    RE_DOODSTREAM_TOKEN = re.compile(r'[?&]token=([\w-]+)')
+    RE_DOODSTREAM_IFRAME = re.compile(r'<iframe[^>]*\ssrc="([^"]+)"', re.IGNORECASE)
+    RE_LULUSTREAM = re.compile(
+        r'(?:lulu(?:stream|vi?do?o?)?|streamhihi|d00ds|cdn1|732eg54de642sa)\.(?:com|sbs|site|st)',
+        re.IGNORECASE,
+    )
+    RE_VEEV = re.compile(r'\b(?:veev|poophq|doods)\.(?:to|com|pro)\b', re.IGNORECASE)
+    RE_VIDARA = re.compile(r'\bvidara\.(?:to|so)\b|\.s1q2105\.com', re.IGNORECASE)
     RE_RANGE = re.compile(r'bytes=(\d+)-(\d*)')
     RE_M3U8_URI_DQ = re.compile(r'URI="([^"]+)"', re.IGNORECASE)
     RE_M3U8_URI_SQ = re.compile(r"URI='([^']+)'", re.IGNORECASE)
@@ -1109,6 +1317,11 @@ class ProxyServer:
         self.uqload_cache = TTLCache(maxsize=2500, ttl=7200)  # Was saturating at 1003/500
         self.uqload_mp4_cache = TTLCache(maxsize=2500, ttl=7200)
         self.doodstream_cache = TTLCache(maxsize=500, ttl=3600)    # 1h - doodstream links expire
+        self.lulustream_cache = TTLCache(maxsize=500, ttl=3600)
+        self.veev_cache = TTLCache(maxsize=500, ttl=3600)
+        # Le jeton Vidara est lié à l'IP sortante ET expire vite : on cache
+        # court, sinon on ressert une URL déjà morte.
+        self.vidara_cache = TTLCache(maxsize=500, ttl=900)
         self.seekstreaming_cache = TTLCache(maxsize=500, ttl=300)
         self.vip_cache = TTLCache(maxsize=5000, ttl=VIP_CACHE_TTL)  # VIP access key verification cache
         self.m3u8_response_cache = TTLCache(maxsize=2000, ttl=M3U8_CACHE_TTL)  # Short-lived M3U8 response cache
@@ -1281,7 +1494,48 @@ class ProxyServer:
             
         return self.sessions['normal']
     
-    def _make_cors_response(self, body: bytes = b'', status: int = 200, 
+    # Certains CDN refusent des plages d'IP entières — typiquement les
+    # datacenters — tout en servant sans broncher une IP résidentielle. Le
+    # jeton, lui, n'est pas lié à l'IP qui l'a obtenu : la même URL fonctionne
+    # depuis n'importe où, pourvu que la sortie soit acceptée. D'où ce repli :
+    # sur un refus, on rejoue la requête via le pool SOCKS5.
+    FORBIDDEN_RETRY_STATUSES = frozenset({401, 403})
+    FORBIDDEN_RETRY_MAX = 2
+
+    def _fallback_sessions(self, session: aiohttp.ClientSession) -> List[Tuple[str, aiohttp.ClientSession]]:
+        """Sorties SOCKS5 à tenter après un refus sur la sortie courante."""
+        fallbacks = []
+        for key in sorted(k for k in self.sessions if k.startswith('proxy_')):
+            if len(fallbacks) >= self.FORBIDDEN_RETRY_MAX:
+                break
+            candidate = self.sessions[key]
+            if candidate is not session and not candidate.closed:
+                fallbacks.append((key, candidate))
+        return fallbacks
+
+    async def _fetch_with_forbidden_fallback(self, fetch, session: aiohttp.ClientSession):
+        """Rejoue `fetch(session)` par une sortie SOCKS5 si l'amont refuse.
+
+        `fetch` doit renvoyer le tuple (status, body, headers, redirect) des
+        aides `_fetch_*_upstream`. Le premier essai passe par la sortie
+        habituelle : le repli ne coûte rien tant que rien n'est refusé.
+        """
+        result = await fetch(session)
+        if result[0] not in self.FORBIDDEN_RETRY_STATUSES:
+            return result
+
+        for label, fallback in self._fallback_sessions(session):
+            logger.warning(
+                '[PROXY] Amont refusé (%s), nouvelle tentative via %s', result[0], label,
+            )
+            retried = await fetch(fallback)
+            if retried[0] not in self.FORBIDDEN_RETRY_STATUSES:
+                return retried
+            result = retried
+
+        return result
+
+    def _make_cors_response(self, body: bytes = b'', status: int = 200,
                             headers: Optional[Dict] = None, content_type: str = None) -> Response:
         """Create response with CORS headers"""
         resp_headers = dict(CORS_HEADERS)
@@ -1556,6 +1810,9 @@ class ProxyServer:
         self.app.router.add_get('/api/extract-sibnet', self.sibnet_extract_handler)
         self.app.router.add_get('/api/extract-uqload', self.uqload_extract_handler)
         self.app.router.add_get('/api/extract-doodstream', self.doodstream_extract_handler)
+        self.app.router.add_get('/api/extract-lulustream', self.lulustream_extract_handler)
+        self.app.router.add_get('/api/extract-veev', self.veev_extract_handler)
+        self.app.router.add_get('/api/extract-vidara', self.vidara_extract_handler)
         self.app.router.add_get('/api/extract-seekstreaming', self.seekstreaming_extract_handler)
         
         # Service-specific proxy routes (dedicated headers, no regex detection needed)
@@ -1566,6 +1823,9 @@ class ProxyServer:
         self.app.router.add_get('/sibnet-proxy', self.sibnet_proxy_handler)
         self.app.router.add_get('/uqload-proxy', self.uqload_proxy_handler)
         self.app.router.add_get('/doodstream-proxy', self.doodstream_proxy_handler)
+        self.app.router.add_get('/lulustream-proxy', self.lulustream_proxy_handler)
+        self.app.router.add_get('/veev-proxy', self.veev_proxy_handler)
+        self.app.router.add_get('/vidara-proxy', self.vidara_proxy_handler)
         self.app.router.add_get('/seekstreaming-proxy', self.seekstreaming_proxy_handler)
         self.app.router.add_get('/cinep-proxy', self.cinep_proxy_handler)
         self.app.router.add_get('/kisskh-proxy', self.kisskh_proxy_handler)
@@ -2077,6 +2337,9 @@ class ProxyServer:
 
     async def debrid_unlock_handler(self, request: Request) -> Response:
         """Unlock a link via the selected debrid provider."""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
@@ -2133,6 +2396,9 @@ class ProxyServer:
             'uqload_cache': f"{len(self.uqload_cache._cache)}/{self.uqload_cache._maxsize}",
             'uqload_mp4_cache': f"{len(self.uqload_mp4_cache._cache)}/{self.uqload_mp4_cache._maxsize}",
             'doodstream_cache': f"{len(self.doodstream_cache._cache)}/{self.doodstream_cache._maxsize}",
+            'lulustream_cache': f"{len(self.lulustream_cache._cache)}/{self.lulustream_cache._maxsize}",
+            'veev_cache': f"{len(self.veev_cache._cache)}/{self.veev_cache._maxsize}",
+            'vidara_cache': f"{len(self.vidara_cache._cache)}/{self.vidara_cache._maxsize}",
             'seekstreaming_cache': f"{len(self.seekstreaming_cache._cache)}/{self.seekstreaming_cache._maxsize}",
             'vip_cache': f"{len(self.vip_cache._cache)}/{self.vip_cache._maxsize}",
             'm3u8_response_cache': f"{len(self.m3u8_response_cache._cache)}/{self.m3u8_response_cache._maxsize}",
@@ -2223,6 +2489,14 @@ class ProxyServer:
                 if not target_url:
                     return web.json_response({'error': 'No URL provided'}, status=400)
 
+            # SSRF gate: /proxy relays only URLs the backend itself signed —
+            # either mainapi handing one to the player, or this service
+            # rewriting a playlist. Verify BEFORE the query-param reconstruction
+            # below, since that mutates target_url and would break the match.
+            signature_error = self._require_signature(request, target_url, route='/proxy')
+            if signature_error is not None:
+                return signature_error
+
             # SeekStreaming must use its dedicated route, which enforces strict
             # URL validation and a public-only DNS connector. Reject it before
             # processing caller headers, logging, or dispatching upstream.
@@ -2248,7 +2522,7 @@ class ProxyServer:
             # Reconstruct split query parameters (handles unencoded URLs)
             query_params = []
             for k, v in request.query.items():
-                if k not in ('url', 'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'sosplay', 'use_proxy', 'use_proxy_key'):
+                if k not in ('url', 'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'sosplay', 'use_proxy', 'use_proxy_key') + SIGNATURE_PARAMS:
                     query_params.append((k, v))
             
             if query_params:
@@ -2290,7 +2564,7 @@ class ProxyServer:
                 custom_headers = {**custom_headers, **shortcut_headers}
             
             # Clean proxy-specific params from target URL
-            proxy_params = {'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'url', 'sosplay', 'use_proxy', 'use_proxy_key'}
+            proxy_params = {'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'url', 'sosplay', 'use_proxy', 'use_proxy_key', *SIGNATURE_PARAMS}
             if parsed_target.query:
                 existing_params = urllib.parse.parse_qs(parsed_target.query, keep_blank_values=True)
                 for p in proxy_params:
@@ -2436,7 +2710,9 @@ class ProxyServer:
                     if use_proxy is not None:
                         query_parts.append(f'use_proxy={use_proxy}')
                     suffix = ('?' + '&'.join(query_parts)) if query_parts else ''
-                    proxied_location = f"/proxy/{encoded_location}{suffix}"
+                    proxied_location = append_signature(
+                        f"/proxy/{encoded_location}{suffix}", '/proxy', abs_location
+                    )
                     return (response.status, b'', {**CORS_HEADERS, 'Cache-Control': 'no-cache'}, proxied_location)
 
             # Upstream HTTP errors
@@ -2506,7 +2782,9 @@ class ProxyServer:
                     if use_proxy is not None:
                         query_parts.append(f'use_proxy={use_proxy}')
                     suffix = ('?' + '&'.join(query_parts)) if query_parts else ''
-                    proxied_location = f"/proxy/{encoded_location}{suffix}"
+                    proxied_location = append_signature(
+                        f"/proxy/{encoded_location}{suffix}", '/proxy', abs_location
+                    )
                     return (response.status, b'', {**CORS_HEADERS, 'Cache-Control': 'no-cache'}, proxied_location)
 
             # Upstream errors
@@ -2615,10 +2893,13 @@ class ProxyServer:
                 coalesce_key = target_url
                 is_coalesced, result = await self.coalescer.get_or_fetch(
                     coalesce_key,
-                    self._fetch_m3u8_upstream(
-                        target_url, headers, timeout, content, service,
-                        is_bandwidth, sosplay_mode, custom_headers, request,
-                        use_proxy, session
+                    self._fetch_with_forbidden_fallback(
+                        lambda sess: self._fetch_m3u8_upstream(
+                            target_url, headers, timeout, content, service,
+                            is_bandwidth, sosplay_mode, custom_headers, request,
+                            use_proxy, sess
+                        ),
+                        session,
                     )
                 )
                 status, body, resp_hdrs, redirect_loc = result
@@ -2674,9 +2955,12 @@ class ProxyServer:
                 coalesce_key = f"seg:{target_url}"
                 is_coalesced, result = await self.coalescer.get_or_fetch(
                     coalesce_key,
-                    self._fetch_segment_upstream(
-                        target_url, headers, timeout, session,
-                        custom_headers, use_proxy
+                    self._fetch_with_forbidden_fallback(
+                        lambda sess: self._fetch_segment_upstream(
+                            target_url, headers, timeout, sess,
+                            custom_headers, use_proxy
+                        ),
+                        session,
                     )
                 )
                 status, body, resp_hdrs, redirect_loc = result
@@ -2710,9 +2994,29 @@ class ProxyServer:
             # If upstream returns 302/301, we forward that status + Location back to the client.
             allow_redirects = False
 
-            async with session.request('GET', target_url, headers=headers,
-                                        timeout=timeout,
-                                        allow_redirects=allow_redirects) as response:
+            # Même repli que pour les playlists et les segments : si la sortie
+            # habituelle se fait refuser, on rejoue par une sortie SOCKS5. Le
+            # corps n'a pas encore commencé à être relayé à ce stade, la
+            # seconde tentative est donc sans effet de bord.
+            candidates = [('direct', session)] + self._fallback_sessions(session)
+            stack = AsyncExitStack()
+            for attempt, (label, candidate_session) in enumerate(candidates):
+                response = await stack.enter_async_context(
+                    candidate_session.request('GET', target_url, headers=headers,
+                                              timeout=timeout,
+                                              allow_redirects=allow_redirects)
+                )
+                if (response.status in self.FORBIDDEN_RETRY_STATUSES
+                        and attempt + 1 < len(candidates)):
+                    await response.read()
+                    logger.warning(
+                        '[PROXY] Amont refusé (%s) via %s pour %s, nouvelle tentative via %s',
+                        response.status, label, target_url, candidates[attempt + 1][0],
+                    )
+                    continue
+                break
+
+            async with stack:
 
                 resp_headers = self._prepare_stream_headers(response.headers)
                 response_content_type = (response.headers.get('Content-Type') or '').lower()
@@ -2738,7 +3042,9 @@ class ProxyServer:
                             if use_proxy is not None:
                                 query_parts.append(f'use_proxy={use_proxy}')
                             suffix = ('?' + '&'.join(query_parts)) if query_parts else ''
-                            proxied_location = f"/proxy/{encoded_location}{suffix}"
+                            proxied_location = append_signature(
+                                f"/proxy/{encoded_location}{suffix}", '/proxy', abs_location
+                            )
                         except Exception as e:
                             logger.warning(f"[PROXY] Failed to rewrite redirect Location: {e}")
                             proxied_location = location
@@ -3018,8 +3324,8 @@ class ProxyServer:
             return {
                 'Accept': '*/*',
                 'Host': target_host,
-                'Origin': 'https://vidmoly.net',
-                'Referer': 'https://vidmoly.net/',
+                'Origin': 'https://vidmoly.org',
+                'Referer': 'https://vidmoly.org/',
                 'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
             }
         
@@ -3047,8 +3353,7 @@ class ProxyServer:
                 'Host': target_host,
                 'Origin': 'https://fsvid.lol',
                 'Referer': 'https://fsvid.lol/',
-                'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
-                'User-Agent': 'Mozilla/5.0 Chrome/139.0.0.0'
+                **FSVID_VIDZY_CLIENT_HINTS,
             }
 
         if self.RE_SIBNET.search(target_url):
@@ -3074,8 +3379,7 @@ class ProxyServer:
                 'Host': target_host,
                 'Origin': 'https://vidzy.org',
                 'Referer': 'https://vidzy.org/',
-                'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
-                'User-Agent': 'Mozilla/5.0 Chrome/141.0.0.0'
+                **FSVID_VIDZY_CLIENT_HINTS,
             }
 
         if self.RE_BANDWIDTH.search(target_url):
@@ -3106,6 +3410,33 @@ class ProxyServer:
                 'Connection': 'keep-alive'
             }
         
+        if self.RE_LULUSTREAM.search(target_url):
+            return {
+                'Accept': '*/*',
+                'Host': target_host,
+                'Origin': 'https://lulustream.com',
+                'Referer': 'https://lulustream.com/',
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
+            }
+
+        if self.RE_VEEV.search(target_url):
+            return {
+                'Accept': '*/*',
+                'Host': target_host,
+                'Origin': 'https://veev.to',
+                'Referer': 'https://veev.to/',
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
+            }
+
+        if self.RE_VIDARA.search(target_url):
+            return {
+                'Accept': '*/*',
+                'Host': target_host,
+                'Origin': 'https://vidara.to',
+                'Referer': 'https://vidara.to/',
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
+            }
+
         # Numeric CDN domains (e.g., 8nwwqrar.12703830.net) - used by various streaming services
         if self.RE_NUMERIC_CDN.search(target_url):
             return {
@@ -3198,9 +3529,14 @@ class ProxyServer:
             
             # Pass custom headers (embed referer/origin) and proxy choice to segment URLs
             if query_parts:
-                return f"/proxy/{encoded_url}?{'&'.join(query_parts)}"
-            
-            return f"/proxy/{encoded_url}"
+                rewritten = f"/proxy/{encoded_url}?{'&'.join(query_parts)}"
+            else:
+                rewritten = f"/proxy/{encoded_url}"
+
+            # Sign every segment we hand to the player: /proxy refuses anything
+            # it did not issue itself. The signed target is the decoded absolute
+            # URL, which is exactly what proxy_handler reconstructs from the path.
+            return append_signature(rewritten, '/proxy', abs_url)
         
         # Use pre-compiled patterns for speed
         re_uri_dq = self.RE_M3U8_URI_DQ
@@ -3228,8 +3564,84 @@ class ProxyServer:
         
         return '\n'.join(rewrite_line(line) for line in content.split('\n'))
     
+    # ===== Access guards (signature + internal key) =====
+
+    def _signature_denied_response(self, reason: str) -> Response:
+        """403 for an unsigned/forged/expired media URL.
+
+        The reason is deliberately generic in the body: telling a caller
+        `bad_signature` vs `expired` hands them a forging oracle. The detail
+        goes to the logs only.
+        """
+        return web.json_response(
+            {'error': 'Unsigned or expired media URL', 'code': 'SIGNATURE_REQUIRED'},
+            status=403,
+            headers=CORS_HEADERS,
+        )
+
+    def _require_signature(self, request: Request, target_url: str,
+                           route: Optional[str] = None) -> Optional[Response]:
+        """Reject the request unless it carries a valid signature for `target_url`.
+
+        Returns an error Response to return immediately, or None when the
+        request may proceed. `route` defaults to the request path, which is
+        exactly what the URL generators sign against.
+        """
+        effective_route = route if route is not None else request.path
+
+        if not signing_configured():
+            # Fail-closed: without a secret we cannot tell our own URLs from a
+            # forged one, and serving anything here is an open SSRF proxy.
+            logger.error(
+                '[SIGNING] MEDIA_SIGNING_SECRET missing — refusing %s',
+                effective_route,
+            )
+            return self._signature_denied_response('signing_not_configured')
+
+        valid, reason = verify_request(request, effective_route, target_url)
+        if not valid:
+            logger.warning(
+                '[SIGNING] Rejected %s reason=%s url=%s',
+                effective_route,
+                reason,
+                redact_url(target_url),
+            )
+            return self._signature_denied_response(reason)
+
+        # Defence in depth: a signed URL must still never point inside the
+        # infrastructure. Guards against a leaked secret and against our own
+        # URL-construction bugs.
+        if not is_public_http_url(target_url):
+            logger.warning(
+                '[SIGNING] Signed URL targets a non-public address: %s',
+                redact_url(target_url),
+            )
+            return self._signature_denied_response('non_public_target')
+
+        return None
+
+    def _require_internal(self, request: Request) -> Optional[Response]:
+        """Reject the request unless it comes from mainapi with the internal key."""
+        if not internal_key_configured():
+            logger.error('[INTERNAL] INTERNAL_API_KEY missing — refusing %s', request.path)
+            return web.json_response(
+                {'error': 'Internal access required', 'code': 'INTERNAL_KEY_REQUIRED'},
+                status=403,
+                headers=CORS_HEADERS,
+            )
+
+        if not check_internal_key(request):
+            logger.warning('[INTERNAL] Rejected %s (bad or missing key)', request.path)
+            return web.json_response(
+                {'error': 'Internal access required', 'code': 'INTERNAL_KEY_REQUIRED'},
+                status=403,
+                headers=CORS_HEADERS,
+            )
+
+        return None
+
     # ===== VIP Verification =====
-    
+
     async def _check_vip(self, request: Request) -> bool:
         """Verify VIP access key directly against MySQL access_keys table.
         Returns True if VIP, False otherwise. Results are cached for VIP_CACHE_TTL seconds."""
@@ -3317,6 +3729,9 @@ class ProxyServer:
     
     async def voe_m3u8_handler(self, request: Request) -> Response:
         """VOE M3U8 extraction with caching"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
@@ -3328,7 +3743,15 @@ class ProxyServer:
                 url = base64.b64decode(encoded_url).decode('utf-8')
             except:
                 return web.json_response({'error': 'Invalid URL'}, status=400)
-            
+
+            # VOE fait tourner ses domaines chaque mois : une allowlist figée
+            # casserait l'extraction à chaque rotation. On refuse donc au moins
+            # toute cible interne, faute de pouvoir énumérer les domaines
+            # légitimes (cf. la liste d'alias dans src/utils/hosterRegistry.ts).
+            if not is_public_http_url(url):
+                logger.warning('[VOE] Cible non publique refusée: %s', redact_url(url))
+                return web.json_response({'error': 'Invalid URL'}, status=400)
+
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.voe_cache.get(cache_key)
             if cached:
@@ -3341,22 +3764,35 @@ class ProxyServer:
                 'Referer': 'https://voe.sx/',
             }
             
-            html, _ = await self._fetch_with_redirects(url, headers, timeout_seconds=5)
-            json_content = self._extract_json_from_html(html)
-            
-            if not json_content or not isinstance(json_content, list):
+            html, final_url = await self._fetch_with_redirects(url, headers, timeout_seconds=5)
+            # Certaines pages Voe ne font que rebondir en JS avant d'exposer le
+            # lecteur : on suit ces sauts avant de tenter le déchiffrement.
+            html, final_url = await self._follow_voe_js_redirects(html, final_url or url, headers)
+
+            decrypted = await self._decrypt_voe_page(html, final_url or url, headers)
+
+            source_url = pick_voe_source(decrypted) if decrypted else None
+            if not source_url:
+                # Repli : certaines variantes servent le flux en clair.
+                source_url = extract_voe_plain_source(html)
+
+            if not source_url:
+                if decrypted:
+                    result = {'decrypted': decrypted}
+                    self.voe_cache.set(cache_key, result)
+                    resp = web.json_response(result)
+                    resp.headers['X-Cache'] = 'MISS'
+                    return resp
                 return web.json_response({'error': 'Content not found'}, status=404)
-            
-            decrypted = self._decrypt_voe_data(json_content[0])
-            if not decrypted:
-                return web.json_response({'error': 'Decryption failed'}, status=500)
-            
-            source_url = decrypted.get('source', '')
-            if '.m3u8' in source_url:
-                result = {'source': f"{PROXY_BASE}/voe-proxy?url={urllib.parse.quote(source_url)}"}
-            else:
-                result = {'decrypted': decrypted}
-            
+
+            result = {'source': _signed_service_url('/voe-proxy', source_url)}
+            subtitles = extract_voe_subtitles(decrypted or {}, final_url or url)
+            if subtitles:
+                result['subtitles'] = {
+                    label: _signed_service_url('/voe-proxy', sub_url)
+                    for label, sub_url in subtitles.items()
+                }
+
             self.voe_cache.set(cache_key, result)
             resp = web.json_response(result)
             resp.headers['X-Cache'] = 'MISS'
@@ -3436,27 +3872,85 @@ class ProxyServer:
                 pass
         return None
     
-    def _decrypt_voe_data(self, encrypted: str) -> Optional[Dict]:
-        """Decrypt VOE.SX data"""
-        try:
-            step1 = codecs.encode(encrypted, 'rot13')
-            for sym in ['@$', '^^', '~@', '%?', '*~', '!!', '#&']:
-                step1 = step1.replace(sym, '')
-            
-            padding = (4 - len(step1) % 4) % 4
-            step2 = base64.b64decode(step1 + '=' * padding).decode('utf-8')
-            step3 = ''.join(chr(ord(c) - 3) for c in step2)[::-1]
-            
-            padding = (4 - len(step3) % 4) % 4
-            step4 = base64.b64decode(step3 + '=' * padding).decode('utf-8')
-            
-            return json.loads(step4)
-        except Exception as e:
-            logger.error(f'VOE decryption error: {e}')
-            return None
-    
+    def _decrypt_voe_data(self, encrypted: str, markers=None) -> Optional[Dict]:
+        """Déchiffre une charge Voe (marqueurs figés par défaut)."""
+        if markers is None:
+            return decrypt_voe_payload(encrypted)
+        return decrypt_voe_payload(encrypted, markers)
+
+    async def _follow_voe_js_redirects(self, html: str, url: str, headers: Dict,
+                                       max_hops: int = 3) -> Tuple[str, str]:
+        """Suit les sauts `window.location.href` des pages relais de Voe."""
+        session = self.sessions.get('proxy_0', self.sessions['normal'])
+        current_url = url
+
+        for _ in range(max_hops):
+            if VOE_REDIRECT_MARKER not in html:
+                break
+            match = VOE_REDIRECT_RE.search(html)
+            if not match:
+                break
+            target = match.group(1)
+            next_url = target if target.startswith('http') else urljoin(current_url, target)
+            if next_url == current_url or not is_public_http_url(next_url):
+                break
+            try:
+                async with session.request(
+                    'GET', next_url, headers={**headers, 'Referer': current_url},
+                    timeout=ClientTimeout(total=5),
+                ) as resp:
+                    html = await resp.text()
+                    current_url = next_url
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                break
+
+        return html, current_url
+
+    async def _decrypt_voe_page(self, html: str, page_url: str,
+                                headers: Dict) -> Optional[Dict]:
+        """Configuration du lecteur d'une page Voe, chiffrée ou non.
+
+        Voe régénère à chaque déploiement la liste des marqueurs à retirer de
+        sa charge et la publie dans le bundle JS voisin. On la lit donc là où
+        elle se trouve ; la liste figée historique ne sert plus que de repli
+        pour les pages servies par une version antérieure du lecteur.
+        """
+        payload = VOE_PAYLOAD_RE.search(html)
+        if payload:
+            bundle_url = urljoin(page_url, payload.group(2))
+            markers = None
+            if is_public_http_url(bundle_url):
+                try:
+                    session = self.sessions.get('proxy_0', self.sessions['normal'])
+                    async with session.request(
+                        'GET', bundle_url, headers={**headers, 'Referer': page_url},
+                        timeout=ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            markers = parse_voe_marker_table(await resp.text())
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    logger.warning('[VOE] Bundle inaccessible: %s', redact_url(bundle_url))
+
+            decrypted = self._decrypt_voe_data(payload.group(1), markers)
+            if decrypted:
+                return decrypted
+            # Le bundle a pu changer de forme : on retente avec les marqueurs figés.
+            decrypted = self._decrypt_voe_data(payload.group(1))
+            if decrypted:
+                return decrypted
+
+        json_content = self._extract_json_from_html(html)
+        if json_content and isinstance(json_content, list) and json_content:
+            return self._decrypt_voe_data(json_content[0])
+
+        return None
+
+
     async def fsvid_extract_handler(self, request: Request) -> Response:
         """FSVID M3U8 extraction"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
@@ -3474,34 +3968,55 @@ class ProxyServer:
                 self.fsvid_cache.delete(cache_key)
             
             headers = {
-                'accept': 'text/html,*/*',
-                'referer': 'https://fsmirror46.lol/',
-                'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
+                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                'Referer': 'https://fsmirror46.lol/',
+                'Sec-Fetch-Dest': 'iframe',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'cross-site',
+                **FSVID_VIDZY_CLIENT_HINTS,
             }
             
             
             async with self.sessions['normal'].request('GET', url, headers=headers,
                                         timeout=ClientTimeout(total=8)) as response:
                 if response.status != 200:
+                    logger.warning(
+                        '[FSVID-EXTRACT] Page embed HTTP %s pour %s',
+                        response.status,
+                        redact_url_for_log(url),
+                    )
                     return web.json_response({'error': 'Fetch failed'}, status=500)
-                
+
                 html = await response.text(encoding='utf-8')
 
                 m3u8_url = await self._resolve_fsvid_vidzy_m3u8(html, url, 'fsvid')
                 if not m3u8_url:
+                    logger.warning(
+                        '[FSVID-EXTRACT] M3U8 introuvable dans la page %s (%s octets)',
+                        redact_url_for_log(url),
+                        len(html),
+                    )
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
-                
+
                 result = {
-                    'm3u8Url': f"{PROXY_BASE}/fsvid-proxy?url={urllib.parse.quote(m3u8_url)}",
+                    'm3u8Url': _signed_service_url('/fsvid-proxy', m3u8_url),
                     'source': 'fsvid'
                 }
-                
+
                 self.fsvid_cache.set(cache_key, result)
                 resp = web.json_response(result)
                 resp.headers['X-Cache'] = 'MISS'
                 return resp
-                
+
         except Exception as e:
+            # Sans trace ici, mainapi ne voit qu'un « HTTP 500 » muet et la
+            # cause reste invisible des deux côtés.
+            logger.error(
+                '[FSVID-EXTRACT] %s pour %s',
+                type(e).__name__,
+                redact_url_for_log(request.query.get('url')),
+                exc_info=True,
+            )
             return web.json_response({'error': str(e)}, status=500)
     
     def _deobfuscate_fsvid_script(self, script: str) -> str:
@@ -3848,6 +4363,9 @@ class ProxyServer:
     
     async def vidzy_extract_handler(self, request: Request) -> Response:
         """VIDZY M3U8 extraction"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
@@ -3865,42 +4383,77 @@ class ProxyServer:
                 self.vidzy_cache.delete(cache_key)
             
             headers = {
-                'accept': 'text/html,*/*',
-                'referer': 'https://vidzy.org/',
-                'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
+                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                'Referer': 'https://vidzy.org/',
+                'Sec-Fetch-Dest': 'iframe',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'cross-site',
+                **FSVID_VIDZY_CLIENT_HINTS,
             }
             
             
             async with self.sessions['no_ssl'].request('GET', url, headers=headers,
                                         timeout=ClientTimeout(total=8)) as response:
                 if response.status != 200:
+                    logger.warning(
+                        '[VIDZY-EXTRACT] Page embed HTTP %s pour %s',
+                        response.status,
+                        redact_url_for_log(url),
+                    )
                     return web.json_response({'error': 'Fetch failed'}, status=500)
-                
+
                 html = await response.text()
                 m3u8_url = await self._resolve_fsvid_vidzy_m3u8(html, url, 'vidzy')
                 if not m3u8_url:
+                    logger.warning(
+                        '[VIDZY-EXTRACT] M3U8 introuvable dans la page %s (%s octets)',
+                        redact_url_for_log(url),
+                        len(html),
+                    )
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
-                
+
                 result = {
-                    'm3u8Url': f"{PROXY_BASE}/vidzy-proxy?url={urllib.parse.quote(m3u8_url)}",
+                    'm3u8Url': _signed_service_url('/vidzy-proxy', m3u8_url),
                     'source': 'vidzy'
                 }
-                
+
                 self.vidzy_cache.set(cache_key, result)
                 resp = web.json_response(result)
                 resp.headers['X-Cache'] = 'MISS'
                 return resp
-                
+
         except Exception as e:
+            logger.error(
+                '[VIDZY-EXTRACT] %s pour %s',
+                type(e).__name__,
+                redact_url_for_log(request.query.get('url')),
+                exc_info=True,
+            )
             return web.json_response({'error': str(e)}, status=500)
     
+    @staticmethod
+    def _vidmoly_media_id(url: str) -> Optional[str]:
+        """Identifiant Vidmoly, quelle que soit la forme du lien.
+
+        Vidmoly expose le même fichier via `/embed-<id>.html`, `/w/<id>`,
+        `/v/<id>` et `/dl/<id>` : le cookie Turnstile est indexé sur l'id nu.
+        """
+        match = re.search(
+            r'/(?:embed-|w/|v/|dl/)?([0-9a-zA-Z]+)(?:\.html)?/?$',
+            urlparse(str(url or '')).path,
+        )
+        return match.group(1) if match else None
+
     async def vidmoly_extract_handler(self, request: Request) -> Response:
         """VIDMOLY M3U8 extraction"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
             url = request.query.get('url')
-            if not url or 'vidmoly' not in url.lower():
+            if not _is_allowed_embed_host(url, VIDMOLY_HOSTS):
                 return web.json_response({'error': 'Invalid URL'}, status=400)
             
             cache_key = hashlib.md5(url.encode()).hexdigest()
@@ -3915,14 +4468,19 @@ class ProxyServer:
                 'referer': 'https://voirdrama.to/',
                 'user-agent': 'Mozilla/5.0 Chrome/143.0.0.0'
             }
-            
-            html, _ = await self._fetch_with_redirects(url, headers, use_proxy=True, 
+            # Vidmoly place son lecteur derrière un challenge Turnstile ; sans ce
+            # cookie la page ne rend qu'un interstitiel, sans balise `sources`.
+            media_id = self._vidmoly_media_id(url)
+            if media_id:
+                headers['cookie'] = f'cf_turnstile_demo_pass_{media_id}=1'
+
+            html, _ = await self._fetch_with_redirects(url, headers, use_proxy=True,
                                                         specific_proxy=VIDMOLY_PROXY)
-            
+
             # Try multiple patterns
             source_url = None
             for pattern in [
-                r'sources:\s*\[\s*{\s*file:\s*["\']([^"\']+)["\']',
+                r'sources\s*:\s*\[\s*{\s*file\s*:\s*["\']([^"\']+)["\']',
                 r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
                 r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*'
             ]:
@@ -3930,12 +4488,17 @@ class ProxyServer:
                 if match:
                     source_url = match.group(1) if match.lastindex else match.group(0)
                     break
-            
+
+            # Le MPD de Vidmoly n'est pas jouable par nos lecteurs : on refuse
+            # plutôt que de renvoyer une URL qui échouera côté client.
+            if source_url and source_url.split('?')[0].endswith('.mpd'):
+                source_url = None
+
             if not source_url:
                 return web.json_response({'error': 'M3U8 not found'}, status=404)
             
             result = {
-                'sourceUrl': f"{PROXY_BASE}/vidmoly-proxy?url={urllib.parse.quote(source_url)}",
+                'sourceUrl': _signed_service_url('/vidmoly-proxy', source_url),
                 'source': 'vidmoly'
             }
             
@@ -3947,63 +4510,91 @@ class ProxyServer:
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
     
+    @staticmethod
+    def _normalize_sibnet_url(raw_url: str) -> str:
+        """URL de lecteur Sibnet canonique pour n'importe quelle forme de lien.
+
+        Sibnet expose la même vidéo via `/shell.php?videoid=N` et via des
+        permaliens `/videoN-Titre.html`. Seule la première forme sert le
+        lecteur, donc on ramène tout à celle-là plutôt que de dépendre de ce
+        que le catalogue a scrapé.
+        """
+        parsed = urlparse(str(raw_url or '').strip())
+        video_id = ''
+
+        query_match = re.search(r'(?:^|&)videoid=(\d+)', parsed.query or '')
+        if query_match:
+            video_id = query_match.group(1)
+        else:
+            path_match = re.search(r'/video(\d+)', parsed.path or '')
+            if path_match:
+                video_id = path_match.group(1)
+
+        if not video_id:
+            raise ValueError('Invalid Sibnet URL')
+        return f'https://video.sibnet.ru/shell.php?videoid={video_id}'
+
     async def sibnet_extract_handler(self, request: Request) -> Response:
         """SIBNET extraction"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
             url = request.query.get('url')
-            if not url or 'sibnet.ru' not in url.lower():
+            if not _is_allowed_embed_host(url, SIBNET_HOSTS):
                 return web.json_response({'error': 'Invalid URL'}, status=400)
-            
+
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.sibnet_cache.get(cache_key)
             if cached:
                 resp = web.json_response(cached)
                 resp.headers['X-Cache'] = 'HIT'
                 return resp
-            
+
+            player_url = self._normalize_sibnet_url(url)
             headers = {
                 'accept': 'text/html,*/*',
                 'referer': 'https://video.sibnet.ru/',
                 'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
             }
-            
+
             # Use SIBNET proxy
             session = self.sessions.get('sibnet', self.sessions['normal'])
             timeout = ClientTimeout(total=15)
-            
-            async with session.get(url, headers=headers, timeout=timeout) as response:
+
+            async with session.get(player_url, headers=headers, timeout=timeout) as response:
                     if response.status != 200:
                         return web.json_response({'error': 'Fetch failed'}, status=500)
                     html = await response.text()
-            
-            soup = BeautifulSoup(html, 'html.parser')
-            body_scripts = soup.find('body').find_all('script') if soup.find('body') else []
-            
-            if len(body_scripts) < 22:
-                return web.json_response({'error': 'Script not found'}, status=404)
-            
-            script_content = body_scripts[21].string or ''
-            mp4_match = re.search(r'player\.src\(\[\{\s*src:\s*["\']([^"\']+\.mp4[^"\']*)["\']', script_content)
-            
-            if not mp4_match:
-                mp4_match = re.search(r'player\.src\(\[\{\s*src:\s*["\']([^"\']+\.mp4[^"\']*)["\']', html)
-            
-            if not mp4_match:
-                return web.json_response({'error': 'MP4 not found'}, status=404)
-            
-            mp4_url = f"https://video.sibnet.ru{mp4_match.group(1)}"
-            
+
+            # La source vit dans un `src: "…"` du script du lecteur. On la
+            # cherche dans toute la page : l'ancienne version visait le 22e
+            # `<script>` du body, un index que Sibnet a déjà décalé (le script
+            # est aujourd'hui le 21e) et qui recassera à la prochaine retouche
+            # de leur page.
+            source_match = (
+                re.search(r'player\.src\(\s*\[\s*{\s*src:\s*["\']([^"\']+)["\']', html)
+                or re.search(r'\bsrc:\s*["\'](/[^"\']+)["\']', html)
+            )
+            if not source_match:
+                return web.json_response({'error': 'Source not found'}, status=404)
+
+            # Sibnet sert du MP4 aujourd'hui mais rien dans sa page ne le
+            # garantit : on relaie l'extension telle quelle plutôt que d'exiger
+            # `.mp4` comme avant.
+            media_url = urljoin('https://video.sibnet.ru', source_match.group(1))
+
             # Follow redirect to get final URL
             mp4_headers = {
                 'accept': '*/*',
                 'referer': 'https://video.sibnet.ru/',
                 'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
             }
-            
+
             # Continue using same session
-            async with session.get(mp4_url, headers=mp4_headers, 
+            async with session.get(media_url, headers=mp4_headers,
                                    allow_redirects=False, timeout=timeout) as resp:
                     if resp.status in [301, 302, 303, 307, 308]:
                         location = resp.headers.get('Location', '')
@@ -4011,22 +4602,29 @@ class ProxyServer:
                             location = 'https:' + location
                         elif not location.startswith('http'):
                             location = 'https://' + location
-                        
-                        result = {
-                            'sourceUrl': f"{PROXY_BASE}/sibnet-proxy?url={urllib.parse.quote(location)}",
-                            'source': 'sibnet'
-                        }
-                        
-                        self.sibnet_cache.set(cache_key, result)
-                        resp = web.json_response(result)
-                        resp.headers['X-Cache'] = 'MISS'
-                        return resp
-            
-            return web.json_response({'error': 'Expected redirect'}, status=500)
-            
+                        media_url = location
+                    elif resp.status >= 400:
+                        return web.json_response(
+                            {'error': f'Media unavailable: {resp.status}'}, status=502,
+                        )
+                    # 200 direct : Sibnet ne redirige pas toujours vers un nœud
+                    # CDN, l'URL du fichier est alors déjà la bonne.
+
+            result = {
+                'sourceUrl': _signed_service_url('/sibnet-proxy', media_url),
+                'source': 'sibnet'
+            }
+
+            self.sibnet_cache.set(cache_key, result)
+            resp = web.json_response(result)
+            resp.headers['X-Cache'] = 'MISS'
+            return resp
+
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
-    
+
     def _validate_uqload_url(self, url: str) -> str:
         """Validate and format UQLOAD URL"""
         return normalize_uqload_embed_url(url)
@@ -4070,11 +4668,14 @@ class ProxyServer:
     
     async def uqload_extract_handler(self, request: Request) -> Response:
         """UQLOAD extraction"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
             url = request.query.get('url')
-            if not url or 'uqload' not in url.lower():
+            if not _is_allowed_embed_host(url, UQLOAD_EXTRACT_HOSTS):
                 return web.json_response({'error': 'Invalid URL'}, status=400)
             
             cache_key = hashlib.md5(url.encode()).hexdigest()
@@ -4091,7 +4692,7 @@ class ProxyServer:
                 return web.json_response({'error': 'Extraction failed'}, status=404)
             
             result = {
-                'url': f"{PROXY_BASE}/uqload-proxy?url={urllib.parse.quote(media_url)}",
+                'url': _signed_service_url('/uqload-proxy', media_url),
                 'source': 'uqload'
             }
             
@@ -4107,29 +4708,86 @@ class ProxyServer:
     
     # ===== DoodStream Extraction =====
     
-    def _extract_doodstream_video_url(self, html_content: str, original_url: str) -> Optional[str]:
-        """Extract video URL from DoodStream HTML page"""
+    def _extract_doodstream_video_url(self, html_content: str, original_url: str):
+        """`(origine, chemin pass_md5, jeton)` d'une page lecteur DoodStream.
+
+        Deux générations de lecteur cohabitent : la récente publie le jeton
+        dans `makePlay()`, séparément du chemin `pass_md5`, tandis que
+        l'ancienne réutilise le dernier segment du chemin. On lit la forme
+        récente d'abord et on retombe sur l'ancienne.
+        """
         parsed_url = urlparse(original_url)
         domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        pattern_match = self.RE_DOODSTREAM_PASS.search(html_content)
-        if not pattern_match:
+
+        pass_match = self.RE_DOODSTREAM_PASS.search(html_content)
+        make_play = self.RE_DOODSTREAM_MAKEPLAY.search(html_content)
+        pass_path = pass_match.group(0) if pass_match else (
+            make_play.group(1) if make_play else None
+        )
+        if not pass_path:
             return None
-        
-        pass_md5_url = pattern_match.group(0)
-        token = pattern_match.group("token")
-        
-        return domain, pass_md5_url, token
-    
+
+        token_match = self.RE_DOODSTREAM_TOKEN.search(html_content)
+        token = token_match.group(1) if token_match else pass_path.rstrip('/').rsplit('/', 1)[-1]
+
+        return domain, pass_path, token
+
+    async def _fetch_doodstream_player_html(self, url: str, headers: Dict,
+                                            session, timeout) -> Tuple[str, str]:
+        """HTML du lecteur DoodStream, en suivant l'iframe de la page `/d/`.
+
+        Un lien `/d/<id>` sert une page de garde dont l'iframe pointe le vrai
+        lecteur ; sans ce saut la page ne contient ni `pass_md5` ni `makePlay`.
+        """
+        async with session.get(url, headers=headers, timeout=timeout,
+                               allow_redirects=True) as response:
+            if response.status != 200:
+                raise ValueError(f'Failed to fetch page: {response.status}')
+            html = await response.text()
+            current_url = str(response.url)
+
+        if self.RE_DOODSTREAM_MAKEPLAY.search(html) or self.RE_DOODSTREAM_PASS.search(html):
+            return html, current_url
+
+        iframe = self.RE_DOODSTREAM_IFRAME.search(html)
+        next_url = urljoin(current_url, iframe.group(1)) if iframe else (
+            current_url.replace('/d/', '/e/') if '/d/' in current_url else None
+        )
+        if not next_url or next_url == current_url or not is_public_http_url(next_url):
+            return html, current_url
+
+        try:
+            async with session.get(
+                next_url, headers={**headers, 'Referer': current_url},
+                timeout=timeout, allow_redirects=True,
+            ) as response:
+                if response.status == 200:
+                    return await response.text(), str(response.url)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+
+        return html, current_url
+
+
     async def doodstream_extract_handler(self, request: Request) -> Response:
         """DoodStream extraction handler"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         try:
             url = request.query.get('url')
             if not url:
                 return web.json_response({'error': 'Missing url parameter'}, status=400, headers=CORS_HEADERS)
-            
+
+            # Comme VOE, DoodStream fait tourner ses domaines (d0000d, ds2play,
+            # myvidplay…) : pas d'allowlist figée possible sans casser
+            # l'extraction. On refuse au moins toute cible interne.
+            if not is_public_http_url(url):
+                logger.warning('[DOODSTREAM] Cible non publique refusée: %s', redact_url(url))
+                return web.json_response({'error': 'Invalid URL'}, status=400, headers=CORS_HEADERS)
+
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.doodstream_cache.get(cache_key)
             if cached:
@@ -4138,23 +4796,27 @@ class ProxyServer:
                 resp.headers['X-Cache'] = 'HIT'
                 return resp
             
-            # Step 1: Fetch the embed page
+            # Step 1: Fetch the embed page. DoodStream vérifie que le Referer
+            # appartient au domaine servi : le figer casse les miroirs.
+            embed_origin = urlparse(url)
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://d0000d.com/',
+                'Referer': f'{embed_origin.scheme}://{embed_origin.netloc}/',
             }
-            
+
             # Use proxy_1 (SOCKS5 2) instead of no_ssl
             session = self.sessions.get('proxy_1', self.sessions.get('proxy_0', self.sessions['normal']))
             timeout = ClientTimeout(total=10)
             
-            async with session.get(url, headers=headers, timeout=timeout) as response:
-                if response.status != 200:
-                    return web.json_response({'error': f'Failed to fetch page: {response.status}'}, status=502, headers=CORS_HEADERS)
-                html_content = await response.text()
-            
+            try:
+                html_content, player_url = await self._fetch_doodstream_player_html(
+                    url, headers, session, timeout,
+                )
+            except ValueError as exc:
+                return web.json_response({'error': str(exc)}, status=502, headers=CORS_HEADERS)
+
             # Step 2: Extract pass_md5 URL and token
-            extracted = self._extract_doodstream_video_url(html_content, url)
+            extracted = self._extract_doodstream_video_url(html_content, player_url)
             if not extracted:
                 return web.json_response(
                     {
@@ -4169,20 +4831,33 @@ class ProxyServer:
             
             # Step 3: Call pass_md5 endpoint to get base URL
             pass_headers = {
-                'Referer': domain,
+                'Referer': player_url or domain,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
             }
             
-            async with session.get(f"{domain}{pass_md5_url}", headers=pass_headers, timeout=timeout) as response:
-                base_url = await response.text()
-            
+            pass_url = pass_md5_url if pass_md5_url.startswith('http') else f"{domain}{pass_md5_url}"
+            async with session.get(pass_url, headers=pass_headers, timeout=timeout) as response:
+                base_url = (await response.text()).strip()
+
+            if not base_url.startswith('http'):
+                return web.json_response(
+                    {'error': 'DoodStream: unexpected pass_md5 payload'},
+                    status=502,
+                    headers=CORS_HEADERS,
+                )
+
             # Step 4: Build final video URL
-            random_str = ''.join(random.choices(ascii_letters + digits, k=10))
-            expiry = int(time.time() * 1000)
-            video_url = f"{base_url}{random_str}?token={token}&expiry={expiry}"
-            
+            # Sur les fichiers servis depuis Cloudflare R2, pass_md5 renvoie déjà
+            # l'URL complète et signée : y accoler suffixe et jeton la casserait.
+            if 'cloudflarestorage.' in base_url:
+                video_url = base_url
+            else:
+                random_str = ''.join(random.choices(ascii_letters + digits, k=10))
+                expiry = int(time.time() * 1000)
+                video_url = f"{base_url}{random_str}?token={token}&expiry={expiry}"
+
             result = {
-                'url': f"{PROXY_BASE}/doodstream-proxy?url={urllib.parse.quote(video_url)}",
+                'url': _signed_service_url('/doodstream-proxy', video_url),
                 'source': 'doodstream'
             }
             
@@ -4196,10 +4871,312 @@ class ProxyServer:
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
     
+    # ===== LuluStream Extraction =====
+
+    @staticmethod
+    def _normalize_lulustream_url(raw_url: str) -> str:
+        """URL de lecteur LuluStream canonique (`/e/<id>`) pour un lien accepté."""
+        parsed = urlparse(str(raw_url or '').strip())
+        if parsed.scheme != 'https' or parsed.username or parsed.password:
+            raise ValueError('Invalid LuluStream URL')
+
+        media_id = next((part for part in reversed(parsed.path.split('/')) if part), '')
+        media_id = re.sub(r'\.html$', '', media_id, flags=re.IGNORECASE)
+        if not re.fullmatch(r'[0-9a-zA-Z]+', media_id):
+            raise ValueError('Invalid LuluStream URL')
+
+        return f'https://{parsed.hostname}/e/{media_id}'
+
+    async def lulustream_extract_handler(self, request: Request) -> Response:
+        """LuluStream (luluvdo, streamhihi…) — extraction du m3u8 du lecteur."""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
+        if not await self._check_vip(request):
+            return self._vip_denied_response()
+        try:
+            url = request.query.get('url')
+            if not _is_allowed_embed_host(url, LULUSTREAM_HOSTS):
+                return web.json_response({'error': 'Invalid URL'}, status=400, headers=CORS_HEADERS)
+
+            cache_key = hashlib.md5(url.encode()).hexdigest()
+            cached = self.lulustream_cache.get(cache_key)
+            if cached:
+                self._cache_hits += 1
+                resp = web.json_response(cached)
+                resp.headers['X-Cache'] = 'HIT'
+                return resp
+
+            embed_url = self._normalize_lulustream_url(url)
+            origin = f"https://{urlparse(embed_url).hostname}"
+            headers = {
+                'Accept': 'text/html,*/*',
+                'Origin': origin,
+                'Referer': f'{origin}/',
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0',
+            }
+
+            # Requête directe plutôt que `_fetch_with_redirects` : ce dernier
+            # rebondit tant qu'il n'a pas trouvé le bloc JSON propre à Voe, ce
+            # qui ferait quitter la page de lecteur LuluStream. Les 301 entre
+            # miroirs (lulustream.com <-> luluvdo.com) suffisent ici.
+            session = self.sessions.get('proxy_0', self.sessions['normal'])
+            async with session.get(
+                embed_url, headers=headers, timeout=ClientTimeout(total=10),
+                allow_redirects=True,
+            ) as response:
+                if response.status != 200:
+                    return web.json_response(
+                        {'error': f'Failed to fetch page: {response.status}'},
+                        status=502, headers=CORS_HEADERS,
+                    )
+                html = await response.text()
+
+            # Le lecteur est empaqueté (Dean Edwards) sur la plupart des miroirs :
+            # on cherche d'abord dans le script décodé, puis dans la page brute.
+            source_url = None
+            for candidate_html in (decode_packed_script_from_html(html), html):
+                if not candidate_html:
+                    continue
+                match = re.search(
+                    r'sources\s*:\s*\[\s*{\s*file\s*:\s*["\']([^"\']+)["\']',
+                    candidate_html,
+                    re.IGNORECASE,
+                ) or re.search(
+                    r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*',
+                    candidate_html,
+                    re.IGNORECASE,
+                )
+                if match:
+                    source_url = (match.group(1) if match.lastindex else match.group(0)).replace('\\/', '/')
+                    break
+
+            if not source_url:
+                return web.json_response({'error': 'M3U8 not found'}, status=404, headers=CORS_HEADERS)
+
+            result = {
+                'url': _signed_service_url('/lulustream-proxy', source_url),
+                'source': 'lulustream',
+            }
+            self.lulustream_cache.set(cache_key, result)
+            resp = web.json_response(result)
+            resp.headers['X-Cache'] = 'MISS'
+            return resp
+
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400, headers=CORS_HEADERS)
+        except asyncio.TimeoutError:
+            return web.json_response({'error': 'Timeout'}, status=504, headers=CORS_HEADERS)
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
+
+    # ===== Veev Extraction =====
+
+    async def veev_extract_handler(self, request: Request) -> Response:
+        """Veev (poophq, doods.to) — résolution via son API `player_api`.
+
+        La page ne porte pas l'URL du flux : elle porte un défi (`ch`) qu'il
+        faut décoder pour interroger `/dl`, dont la réponse est elle-même
+        encodée avec un ordre d'opérations dérivé de ce même défi.
+        """
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
+        if not await self._check_vip(request):
+            return self._vip_denied_response()
+        try:
+            url = request.query.get('url')
+            if not _is_allowed_embed_host(url, VEEV_HOSTS):
+                return web.json_response({'error': 'Invalid URL'}, status=400, headers=CORS_HEADERS)
+
+            cache_key = hashlib.md5(url.encode()).hexdigest()
+            cached = self.veev_cache.get(cache_key)
+            if cached:
+                self._cache_hits += 1
+                resp = web.json_response(cached)
+                resp.headers['X-Cache'] = 'HIT'
+                return resp
+
+            parsed = urlparse(url)
+            media_id = next((part for part in reversed(parsed.path.split('/')) if part), '')
+            if not re.fullmatch(r'[0-9a-zA-Z]+', media_id):
+                return web.json_response({'error': 'Invalid URL'}, status=400, headers=CORS_HEADERS)
+
+            embed_url = f'https://{parsed.hostname}/e/{media_id}'
+            headers = {
+                'Accept': 'text/html,*/*',
+                'Referer': embed_url,
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0',
+            }
+
+            session = self.sessions.get('proxy_0', self.sessions['normal'])
+            timeout = ClientTimeout(total=10)
+
+            async with session.get(embed_url, headers=headers, timeout=timeout,
+                                   allow_redirects=True) as response:
+                if response.status != 200:
+                    return web.json_response(
+                        {'error': f'Failed to fetch page: {response.status}'},
+                        status=502, headers=CORS_HEADERS,
+                    )
+                html = await response.text()
+                final_url = str(response.url)
+
+            # Une redirection change le code fichier : on repart de celui servi.
+            final_id = next((part for part in reversed(urlparse(final_url).path.split('/')) if part), '')
+            if re.fullmatch(r'[0-9a-zA-Z]+', final_id):
+                media_id = final_id
+
+            source_url = None
+            for challenge in extract_veev_challenges(html):
+                params = urllib.parse.urlencode({
+                    'op': 'player_api',
+                    'cmd': 'gi',
+                    'file_code': media_id,
+                    'ch': challenge,
+                    'ie': 1,
+                })
+                api_url = f'https://{parsed.hostname}/dl?{params}'
+                try:
+                    async with session.get(api_url, headers=headers, timeout=timeout) as response:
+                        payload = await response.json(content_type=None)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    continue
+
+                file_info = payload.get('file') if isinstance(payload, dict) else None
+                if not isinstance(file_info, dict) or file_info.get('file_status') != 'OK':
+                    continue
+
+                streams = file_info.get('dv')
+                if not isinstance(streams, list) or not streams:
+                    continue
+
+                encoded = streams[0].get('s') if isinstance(streams[0], dict) else None
+                operations = veev_build_array(challenge)
+                if not encoded or not operations:
+                    continue
+
+                source_url = veev_decode_url(veev_lzw_decode(encoded), operations[0])
+                if source_url:
+                    break
+
+            if not source_url:
+                return web.json_response(
+                    {'error': 'Veev: video unavailable', 'reason': 'deleted'},
+                    status=410, headers=CORS_HEADERS,
+                )
+
+            result = {
+                'url': _signed_service_url('/veev-proxy', source_url),
+                'source': 'veev',
+            }
+            self.veev_cache.set(cache_key, result)
+            resp = web.json_response(result)
+            resp.headers['X-Cache'] = 'MISS'
+            return resp
+
+        except asyncio.TimeoutError:
+            return web.json_response({'error': 'Timeout'}, status=504, headers=CORS_HEADERS)
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
+
+    # ===== Vidara Extraction =====
+
+    async def vidara_extract_handler(self, request: Request) -> Response:
+        """Vidara — `POST /api/stream` renvoie directement le master HLS.
+
+        Le jeton du manifeste encode l'IP qui a appelé l'API : l'extraction et
+        la lecture doivent sortir par la même adresse, d'où le passage
+        obligatoire par `/vidara-proxy` (même session sortante) et un cache
+        court.
+        """
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
+        if not await self._check_vip(request):
+            return self._vip_denied_response()
+        try:
+            url = request.query.get('url')
+            if not _is_allowed_embed_host(url, VIDARA_HOSTS):
+                return web.json_response({'error': 'Invalid URL'}, status=400, headers=CORS_HEADERS)
+
+            parsed = urlparse(url)
+            filecode = next((part for part in reversed(parsed.path.split('/')) if part), '')
+            if not re.fullmatch(r'[0-9a-zA-Z]+', filecode):
+                return web.json_response({'error': 'Invalid URL'}, status=400, headers=CORS_HEADERS)
+
+            cache_key = hashlib.md5(filecode.encode()).hexdigest()
+            cached = self.vidara_cache.get(cache_key)
+            if cached:
+                self._cache_hits += 1
+                resp = web.json_response(cached)
+                resp.headers['X-Cache'] = 'HIT'
+                return resp
+
+            origin = f'https://{parsed.hostname}'
+            headers = {
+                'Accept': 'application/json, */*',
+                'Content-Type': 'application/json',
+                'Origin': origin,
+                'Referer': f'{origin}/e/{filecode}',
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0',
+            }
+
+            session = self.sessions['normal']
+            async with session.post(
+                f'{origin}/api/stream',
+                headers=headers,
+                json={'filecode': filecode, 'device': 'web'},
+                timeout=ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    return web.json_response(
+                        {'error': f'Vidara API returned {response.status}'},
+                        status=502, headers=CORS_HEADERS,
+                    )
+                payload = await response.json(content_type=None)
+
+            source_url = payload.get('streaming_url') if isinstance(payload, dict) else None
+            if not isinstance(source_url, str) or not source_url.startswith('http'):
+                return web.json_response(
+                    {'error': 'Vidara: video unavailable', 'reason': 'deleted'},
+                    status=410, headers=CORS_HEADERS,
+                )
+
+            result = {
+                'url': _signed_service_url('/vidara-proxy', source_url),
+                'source': 'vidara',
+            }
+
+            subtitles = payload.get('subtitles')
+            if isinstance(subtitles, list) and subtitles:
+                result['subtitles'] = [
+                    {
+                        'label': item.get('label') or item.get('lang')
+                                 or payload.get('default_sub_lang'),
+                        'url': _signed_service_url('/vidara-proxy', item['file']),
+                    }
+                    for item in subtitles
+                    if isinstance(item, dict) and isinstance(item.get('file'), str)
+                ]
+
+            self.vidara_cache.set(cache_key, result)
+            resp = web.json_response(result)
+            resp.headers['X-Cache'] = 'MISS'
+            return resp
+
+        except asyncio.TimeoutError:
+            return web.json_response({'error': 'Timeout'}, status=504, headers=CORS_HEADERS)
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
+
     # ===== SeekStreaming (Embed4me) Extraction =====
-    
+
     async def seekstreaming_extract_handler(self, request: Request) -> Response:
         """SeekStreaming (embed4me) extraction handler - accepts full URL"""
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
 
@@ -4311,6 +5288,7 @@ class ProxyServer:
                 headers=CORS_HEADERS,
             )
 
+        result = _sign_seekstreaming_result(result)
         self.seekstreaming_cache.set(cache_key, result)
         response = web.json_response(result, headers=CORS_HEADERS)
         response.headers["X-Cache"] = "MISS"
@@ -4342,7 +5320,11 @@ class ProxyServer:
 
             # Append extra query params (referer, origin, etc.)
             suffix = f"&{extra_query}" if extra_query else ""
-            return f"{proxy_route}?url={urllib.parse.quote(abs_url)}{suffix}"
+            return append_signature(
+                f"{proxy_route}?url={urllib.parse.quote(abs_url)}{suffix}",
+                proxy_route,
+                abs_url,
+            )
 
         def proxify_sub(url: str) -> str:
             # SUBTITLES URIs must resolve to an m3u8 playlist. When a source
@@ -4357,7 +5339,11 @@ class ProxyServer:
             if not (low.endswith('.vtt') or low.endswith('.srt')):
                 return proxify(url)
             suffix = f"&{extra_query}" if extra_query else ""
-            return f"{proxy_route}?url={urllib.parse.quote(abs_url)}&vttwrap=1{suffix}"
+            return append_signature(
+                f"{proxy_route}?url={urllib.parse.quote(abs_url)}&vttwrap=1{suffix}",
+                proxy_route,
+                abs_url,
+            )
 
         re_uri_dq = self.RE_M3U8_URI_DQ
         re_uri_sq = self.RE_M3U8_URI_SQ
@@ -4404,6 +5390,14 @@ class ProxyServer:
         target_url = request.query.get('url')
         if not target_url:
             return web.json_response({'error': 'Missing url parameter'}, status=400, headers=CORS_HEADERS)
+
+        # SSRF gate for every dedicated service proxy. The route path is the
+        # signature domain, so a URL signed for /fsvid-proxy cannot be replayed
+        # against /vidmoly-proxy to borrow that route's SOCKS egress.
+        if request.path not in SELF_VALIDATED_PROXY_ROUTES:
+            signature_error = self._require_signature(request, target_url)
+            if signature_error is not None:
+                return signature_error
 
         if service_name == "seekstreaming":
             try:
@@ -4472,6 +5466,14 @@ class ProxyServer:
             forwarded_proxy_params = {
                 k: v for k, v in request.query.items() if k != "url"
             }
+        # `exp`/`sig` authentifient CETTE requête-ci et rien d'autre. Les
+        # reconduire sur les URLs réécrites y colle une signature périmée qui,
+        # en doublon avec la nouvelle, l'emporte à la lecture (`query.get`
+        # renvoie la première occurrence) : la playlist enfant est alors
+        # refusée en `bad_signature`. Chaque URL émise plus bas est resignée
+        # pour sa propre cible.
+        for _signature_param in SIGNATURE_PARAMS:
+            forwarded_proxy_params.pop(_signature_param, None)
         extra_query = urllib.parse.urlencode(forwarded_proxy_params)
 
         # Timeouts based on content
@@ -4517,7 +5519,11 @@ class ProxyServer:
             }
             inner_query = urllib.parse.urlencode(inner_params)
             inner_suffix = f"&{inner_query}" if inner_query else ""
-            inner_url = f"{route}?url={urllib.parse.quote(target_url)}{inner_suffix}"
+            inner_url = append_signature(
+                f"{route}?url={urllib.parse.quote(target_url)}{inner_suffix}",
+                route,
+                target_url,
+            )
             playlist = (
                 "#EXTM3U\n"
                 "#EXT-X-VERSION:3\n"
@@ -4610,10 +5616,17 @@ class ProxyServer:
                             status=502,
                             headers=CORS_HEADERS,
                         )
-                    proxied_location = f"{route}?" + urllib.parse.urlencode({
-                        "url": redirected,
-                        **forwarded_proxy_params,
-                    })
+                    # La signature reçue couvre `target_url`, jamais la cible du
+                    # 302. Sans resignature, le client se voit refuser l'URL que
+                    # nous venons nous-mêmes de lui donner.
+                    proxied_location = append_signature(
+                        f"{route}?" + urllib.parse.urlencode({
+                            "url": redirected,
+                            **forwarded_proxy_params,
+                        }),
+                        route,
+                        redirected,
+                    )
                     return web.Response(
                         status=response.status,
                         headers={
@@ -4820,11 +5833,15 @@ class ProxyServer:
                 headers=CORS_HEADERS,
             )
         except Exception as e:
+            # Traceback complet : sans lui, un `Unexpected TypeError` seul ne dit
+            # ni quelle ligne ni quelle couche a lâché, et l'URL journalisée est
+            # caviardée. Le corps renvoyé au client reste générique.
             logger.error(
                 "[%s-PROXY] Unexpected %s for %s",
                 service_name.upper(),
                 type(e).__name__,
                 redact_url_for_log(target_url),
+                exc_info=True,
             )
             return web.json_response(
                 {'error': 'Unexpected proxy error'},
@@ -4847,6 +5864,13 @@ class ProxyServer:
         service_name: str,
         default_headers: Dict,
     ) -> Response:
+        # Verify BEFORE picking an egress: the SOCKS-pool lookup below can bail
+        # out with 503, which would mask the 403 an unsigned request must get.
+        if request.method != 'OPTIONS' and request.path not in SELF_VALIDATED_PROXY_ROUTES:
+            signature_error = self._require_signature(request, request.query.get('url', ''))
+            if signature_error is not None:
+                return signature_error
+
         session_key = self._random_socks5_session_key()
         if session_key is None:
             logger.warning(
@@ -4882,8 +5906,7 @@ class ProxyServer:
             'Accept': 'application/vnd.apple.mpegurl,*/*',
             'Origin': 'https://fsvid.lol',
             'Referer': 'https://fsvid.lol/',
-            'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
-            'User-Agent': 'Mozilla/5.0 Chrome/139.0.0.0'
+            **FSVID_VIDZY_CLIENT_HINTS,
         })
 
     async def kisskh_proxy_handler(self, request: Request) -> Response:
@@ -4906,6 +5929,13 @@ class ProxyServer:
                 status=400,
                 headers=CORS_HEADERS,
             )
+
+        # Verify up-front: the 403 retry path below is meant for an upstream
+        # rejection. Without this, a refused signature would be mistaken for one
+        # and pointlessly retried over SOCKS, masking the real reason.
+        signature_error = self._require_signature(request, target_url)
+        if signature_error is not None:
+            return signature_error
 
         headers = {
             'Accept': 'application/vnd.apple.mpegurl,*/*',
@@ -4963,16 +5993,15 @@ class ProxyServer:
             'Accept': 'application/vnd.apple.mpegurl,*/*',
             'Origin': 'https://vidzy.org',
             'Referer': 'https://vidzy.org/',
-            'Sec-Ch-Ua': FSVID_VIDZY_SEC_CH_UA,
-            'User-Agent': 'Mozilla/5.0 Chrome/141.0.0.0'
+            **FSVID_VIDZY_CLIENT_HINTS,
         })
     
     async def vidmoly_proxy_handler(self, request: Request) -> Response:
         """Vidmoly proxy"""
         return await self._service_proxy(request, 'vidmoly', {
             'Accept': '*/*',
-            'Origin': 'https://vidmoly.net',
-            'Referer': 'https://vidmoly.net/',
+            'Origin': 'https://vidmoly.org',
+            'Referer': 'https://vidmoly.org/',
             'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
         }, session_key='proxy_1')
     
@@ -5004,6 +6033,42 @@ class ProxyServer:
             'User-Agent': 'Mozilla/5.0 Chrome/142.0.0.0'
         })
     
+    async def lulustream_proxy_handler(self, request: Request) -> Response:
+        """LuluStream proxy.
+
+        Même égress que l'extraction (`proxy_0`) : LuluStream signe ses
+        manifestes pour l'adresse qui a chargé la page du lecteur.
+        """
+        return await self._service_proxy(request, 'lulustream', {
+            'Accept': '*/*',
+            'Origin': 'https://lulustream.com',
+            'Referer': 'https://lulustream.com/',
+            'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
+        }, session_key='proxy_0')
+
+    async def veev_proxy_handler(self, request: Request) -> Response:
+        """Veev proxy"""
+        return await self._service_proxy(request, 'veev', {
+            'Accept': '*/*',
+            'Origin': 'https://veev.to',
+            'Referer': 'https://veev.to/',
+            'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
+        }, session_key='proxy_0')
+
+    async def vidara_proxy_handler(self, request: Request) -> Response:
+        """Vidara proxy.
+
+        Le jeton du manifeste est lié à l'IP qui a appelé `/api/stream` :
+        l'extraction sort par la session `normal`, la lecture doit faire pareil
+        sinon le CDN renvoie 403.
+        """
+        return await self._service_proxy(request, 'vidara', {
+            'Accept': '*/*',
+            'Origin': 'https://vidara.to',
+            'Referer': 'https://vidara.to/',
+            'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
+        }, session_key='normal')
+
     async def doodstream_proxy_handler(self, request: Request) -> Response:
         """DoodStream proxy â€” robust streaming with SOCKS5 retry on connection drop.
         Unlike the generic _service_proxy, this handler automatically resumes
@@ -5016,6 +6081,12 @@ class ProxyServer:
         target_url = request.query.get('url')
         if not target_url:
             return web.json_response({'error': 'Missing url parameter'}, status=400, headers=CORS_HEADERS)
+
+        # This handler streams upstream directly instead of going through
+        # _service_proxy, so it needs its own SSRF gate.
+        signature_error = self._require_signature(request, target_url)
+        if signature_error is not None:
+            return signature_error
 
         self._request_count += 1
 
@@ -5224,6 +6295,9 @@ class ProxyServer:
     async def drm_extract_handler(self, request: Request) -> Response:
         """Extract manifest info from a content URL (JSON API, GET or POST)"""
         # VIP check â€” DRM extraction is a premium feature
+        internal_error = self._require_internal(request)
+        if internal_error is not None:
+            return internal_error
         if not await self._check_vip(request):
             return self._vip_denied_response()
         
@@ -5263,9 +6337,15 @@ class ProxyServer:
         target_url = request.query.get('url', '')
         if not target_url:
             return web.Response(text='Missing url parameter', status=400)
-        
-        target_url = urllib.parse.unquote(target_url)
-        
+
+        # No extra unquote(): aiohttp already decoded the query value once, and
+        # _drm_proxy_url quoted it exactly once. Decoding twice corrupts targets
+        # containing literal %XX and would let a crafted URL diverge from the
+        # one that was actually signed.
+        signature_error = self._require_signature(request, target_url)
+        if signature_error is not None:
+            return signature_error
+
         # Build headers
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -5317,9 +6397,12 @@ class ProxyServer:
         target_url = request.query.get('url', '')
         if not target_url:
             return web.Response(text='Missing url parameter', status=400)
-        
-        target_url = urllib.parse.unquote(target_url)
-        
+
+        # See drm_manifest_handler: single decode only, then verify.
+        signature_error = self._require_signature(request, target_url)
+        if signature_error is not None:
+            return signature_error
+
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                           '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
@@ -5328,7 +6411,7 @@ class ProxyServer:
         }
         if _WIDEFROG_AVAILABLE and hasattr(builtins, 'CONFIG'):
             headers['User-Agent'] = builtins.CONFIG.get('USER_AGENT', headers['User-Agent'])
-        
+
         # Forward range headers
         range_header = request.headers.get('Range') or request.headers.get('range')
         if range_header:
@@ -5398,16 +6481,22 @@ class ProxyServer:
         Used when <BaseURL> is set to /drm/b/<base64>/ in rewritten MPD manifests."""
         base_b64 = request.match_info['base_b64']
         subpath = request.match_info['subpath']
-        
-        # Decode base URL
-        padding = 4 - len(base_b64) % 4
-        if padding != 4:
-            base_b64 += '=' * padding
-        try:
-            decoded_base = base64.urlsafe_b64decode(base_b64).decode()
-        except Exception:
-            return web.Response(text='Invalid base encoding', status=400)
-        
+
+        # The blob carries its own signature (see _drm_make_base_proxy_url).
+        decoded_base, reason = decode_signed_drm_base(base_b64)
+        if decoded_base is None:
+            logger.warning('[SIGNING] Rejected /drm/b base blob reason=%s', reason)
+            return self._signature_denied_response(reason)
+
+        if not is_public_http_url(decoded_base):
+            logger.warning(
+                '[SIGNING] Signed DASH base targets a non-public address: %s',
+                redact_url(decoded_base),
+            )
+            return self._signature_denied_response('non_public_target')
+
+        # `subpath` is appended to the signed base, so it can walk the path but
+        # never change host — the signature still pins the destination server.
         target_url = decoded_base + subpath
         
         # Preserve query string
@@ -5607,11 +6696,14 @@ async def main():
 
 
 if __name__ == '__main__':
-    # Performance optimizations for Windows
-    if sys.platform == 'win32':
-        # Use SelectorEventLoop for better Windows performance
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
+    # Windows : on garde la boucle par défaut (Proactor). L'ancien passage
+    # forcé en WindowsSelectorEventLoop cassait `asyncio.create_subprocess_exec`
+    # — la boucle Selector ne sait pas lancer de sous-processus — donc le bac à
+    # sable JavaScript de fsvid/vidzy, qui en dépend. Selector plafonne en plus
+    # à 512 descripteurs via select(), ce qui n'a rien d'un gain pour un proxy
+    # de streaming. Rien ici ne réclame Selector : aiodns n'est pas installé,
+    # aiohttp résout donc via ThreadedResolver, compatible Proactor.
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

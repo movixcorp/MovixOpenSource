@@ -115,12 +115,23 @@ enum MediaProxyPolicyError: Error, Equatable {
 enum MediaProxyPolicy {
   static let maximumURLLength = 16_384
   static let maximumHeaderValueLength = 8_192
-  static let playbackUserAgent = "Mozilla/5.0 Chrome/140.0.0.0"
+  // « Mozilla/5.0 Chrome/140.0.0.0 » est un User-Agent qu'aucun navigateur
+  // n'émet : envoyé à côté d'un Sec-Ch-Ua qui annonce Chrome 140, il signait nos
+  // requêtes aussi sûrement qu'une absence d'en-tête. On émet donc la chaîne
+  // complète, alignée sur playbackSecChUa et sur le relais Python
+  // (API/proxiesembed/server.py, FSVID_VIDZY_CLIENT_HINTS).
+  static let playbackUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
   // Fsvid/Vidzy exigent un Referer sur un de leurs domaines ET la présence de
   // Sec-Ch-Ua. Sans cet en-tête leur CDN répond 302 vers .../troll/master.m3u8
   // (fsvid) ou 403 (vidzy). Seule la présence compte, pas la valeur.
   static let playbackSecChUa =
     "\"Chromium\";v=\"140\", \"Not=A?Brand\";v=\"24\", \"Google Chrome\";v=\"140\""
+  // Un vrai Chrome ne dissocie jamais les trois indices client : poser Sec-Ch-Ua
+  // seul revenait à annoncer un navigateur tout en le contredisant.
+  static let playbackSecChUaMobile = "?0"
+  static let playbackSecChUaPlatform = "\"Windows\""
 
   private static let providerDecoyHostSuffixes = ["fsvid.lol", "vidzy.cc", "vidzy.org"]
 
@@ -150,16 +161,28 @@ enum MediaProxyPolicy {
     "referer": "Referer",
     // Fsvid/Vidzy renvoient leur flux leurre (302 vers .../troll/master.m3u8)
     // ou une 403 si Sec-Ch-Ua manque : cet en-tête doit atteindre l'amont.
+    // Ses deux jumeaux aussi : un vrai Chrome ne les dissocie jamais, et les
+    // filtrer ici revenait à signer nos requêtes comme non-navigateur alors même
+    // que le pont JS prenait soin de les poser.
     "sec-ch-ua": "Sec-Ch-Ua",
+    "sec-ch-ua-mobile": "Sec-Ch-Ua-Mobile",
+    "sec-ch-ua-platform": "Sec-Ch-Ua-Platform",
     "sec-fetch-dest": "Sec-Fetch-Dest",
     "sec-fetch-mode": "Sec-Fetch-Mode",
     "sec-fetch-site": "Sec-Fetch-Site",
     "user-agent": "User-Agent",
   ]
 
+  // Ces en-têtes-là décrivent la requête du lecteur — la plage d'octets qu'il
+  // veut, ce qu'il a déjà en cache — donc ils doivent l'emporter sur ceux du
+  // pont. Pas `accept-language` ni `accept` : ceux-là décrivent l'IDENTITÉ du
+  // client, que le pont épingle pour rejouer celle qui a obtenu le jeton.
+  // Mesuré sur un 403 LuluStream côté Android : le pont émettait
+  // « fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7 » et la requête locale du lecteur
+  // l'écrasait par la liste de locales de l'appareil (« …,ka-GE;q=0.8,… »),
+  // faisant présenter au CDN un client autre que celui qu'il avait signé.
+  // Parité avec MediaProxyPolicy.kt/allowedLocalOverrideHeaders.
   static let allowedLocalOverrides: Set<String> = [
-    "accept",
-    "accept-language",
     "if-modified-since",
     "if-none-match",
     "range",

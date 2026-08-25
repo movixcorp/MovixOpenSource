@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { X } from 'lucide-react';
 import { avatarCategories } from '../data/avatars';
 import { platformAvatars, platforms } from '../data/new_avatars';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 interface AvatarSelectorProps {
   isOpen: boolean;
@@ -211,7 +212,7 @@ const AvatarSelector: React.FC<AvatarSelectorProps> = ({
     </AnimatePresence>
   );
 
-  return createPortal(modalContent, document.body);
+  return createPortal(modalContent, getOverlayPortalRoot());
 };
 
 export default memo(AvatarSelector);

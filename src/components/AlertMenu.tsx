@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Bell, Calendar, Clock } from 'lucide-react';
 import { AlertMenuProps, NotifyBeforeDays } from '../types/alerts';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 const AlertMenu: React.FC<AlertMenuProps> = ({
   isOpen,
@@ -276,7 +277,7 @@ const AlertMenu: React.FC<AlertMenuProps> = ({
         </motion.div>
       )}
     </AnimatePresence>,
-    document.body
+    getOverlayPortalRoot()
   );
 };
 

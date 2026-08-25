@@ -1,7 +1,7 @@
 import { buildRoutePresence } from './routes/buildRoutePresence.js'
 
 const presence = new Presence({
-  clientId: '1259926474174238741',
+  clientId: '1517232036425895996',
 })
 
 async function getBooleanSetting(

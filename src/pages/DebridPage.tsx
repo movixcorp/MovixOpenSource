@@ -29,7 +29,7 @@ import { SquareBackground } from '../components/ui/square-background';
 import ShinyText from '../components/ui/shiny-text';
 import AnimatedBorderCard from '../components/ui/animated-border-card';
 import { Button } from '../components/ui/button';
-import { BESTDEBRID_API_BASE, MAIN_API, PROXIES_EMBED_API } from '../config/runtime';
+import { BESTDEBRID_API_BASE, MAIN_API } from '../config/runtime';
 import { getVipHeaders } from '../utils/vipUtils';
 
 // Hébergeurs non supportés
@@ -203,7 +203,7 @@ interface DebridResult {
   provider: DebridProvider;
 }
 
-type DebridProvider = 'deepbrid' | 'realdebrid' | 'bestdebrid';
+type DebridProvider = 'deepbrid' | 'realdebrid' | 'bestdebrid' | 'debridr';
 
 interface DebridHistoryItem {
   originalLink: string;
@@ -220,7 +220,7 @@ const MAX_HISTORY = 50;
 const DEFAULT_PROVIDER: DebridProvider = 'deepbrid';
 
 const isDebridProvider = (value: string | null | undefined): value is DebridProvider =>
-  value === 'deepbrid' || value === 'realdebrid' || value === 'bestdebrid';
+  value === 'deepbrid' || value === 'realdebrid' || value === 'bestdebrid' || value === 'debridr';
 
 const normalizeDebridedLink = (link: string, provider: DebridProvider): string => {
   const trimmed = link.trim();
@@ -283,7 +283,7 @@ const DebridPage: React.FC = () => {
   const isVip = localStorage.getItem('is_vip') === 'true';
   const hasAutoDebrided = useRef(false);
 
-  const providerOptions: DebridProvider[] = ['deepbrid', 'realdebrid', 'bestdebrid'];
+  const providerOptions: DebridProvider[] = ['deepbrid', 'realdebrid', 'bestdebrid', 'debridr'];
   const isSubmitDisabled = isLoading || !url.trim();
 
   const fetchBestDebridApiKey = useCallback(async (): Promise<string> => {
@@ -387,7 +387,9 @@ const DebridPage: React.FC = () => {
       const newResult = activeProvider === 'bestdebrid'
         ? await unlockWithBestDebrid(targetUrl)
         : await (async (): Promise<DebridResult> => {
-          const response = await fetch(`${PROXIES_EMBED_API}/api/debrid/unlock`, {
+          // Le débridage passe par mainapi : proxiesembed n'accepte plus
+          // d'appel direct depuis le navigateur.
+          const response = await fetch(`${MAIN_API}/api/media/debrid/unlock`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...getVipHeaders() },
             body: JSON.stringify({ link: targetUrl, provider: activeProvider }),
@@ -577,6 +579,9 @@ const DebridPage: React.FC = () => {
                   </div>
                   {provider === 'bestdebrid' && (
                     <p className="text-xs text-white/40">{t('debrid.bestdebridClientNotice')}</p>
+                  )}
+                  {provider === 'debridr' && (
+                    <p className="text-xs text-white/40">{t('debrid.debridrNotice')}</p>
                   )}
                   <input
                     type="url"

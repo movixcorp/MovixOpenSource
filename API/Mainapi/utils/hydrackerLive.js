@@ -1,146 +1,87 @@
 // API/Mainapi/utils/hydrackerLive.js
 //
 // Live raw-URL resolution path used by darkiworldSqlite.decodeLink when both
-// the disk cache and the two sqlite snapshots miss. See:
-//   docs/superpowers/plans/2026-05-16-hydracker-live-raw-resolution.md
+// the disk cache and the two sqlite snapshots miss.
+//
+// Hydracker's /api/v1/content/liens/:id returns the raw hoster URL directly in
+// `lien.lien`, so resolution is a single direct GET — no debrid roundtrip, no
+// concurrency queue, no single-flight lock. The disk cache + a short Redis
+// cache + a cluster-wide 5xx cooldown are the only protection layers kept.
 
 'use strict';
 
-const { randomUUID } = require('node:crypto');
-
-const LOCK_RELEASE_SCRIPT =
-  "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
-
-function createLimit(max) {
-  let active = 0;
-  const queue = [];
-  const pump = () => {
-    if (active >= max || queue.length === 0) return;
-    const job = queue.shift();
-    active++;
-    Promise.resolve()
-      .then(job.fn)
-      .then(
-        (v) => { active--; job.resolve(v); pump(); },
-        (e) => { active--; job.reject(e); pump(); },
-      );
-  };
-  return (fn) => new Promise((resolve, reject) => {
-    queue.push({ fn, resolve, reject });
-    pump();
-  });
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function withRedisLock(redis, key, ttlSec, work, opts = {}) {
-  const waitMs = opts.waitMs ?? 65000;
-  const pollMs = opts.pollMs ?? 500;
-  const onWaitCheck = opts.onWaitCheck || (async () => null);
-  const token = randomUUID();
-
-  let acquired = null;
-  try {
-    acquired = await redis.set(key, token, 'NX', 'EX', ttlSec);
-  } catch (_) {
-    // Redis unreachable — fail closed so we don't bypass single-flight and
-    // overload upstream during a Redis outage.
-    return { owned: false, value: null, redisDown: true };
-  }
-
-  if (acquired === 'OK') {
-    try {
-      const value = await work();
-      return { owned: true, value };
-    } finally {
-      try {
-        await redis.eval(LOCK_RELEASE_SCRIPT, 1, key, token);
-      } catch (_) { /* swallow */ }
-    }
-  }
-
-  const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
-    await sleep(pollMs);
-    let cached = null;
-    try { cached = await onWaitCheck(); } catch (_) { cached = null; }
-    if (cached) return { owned: false, value: cached };
-  }
-  return { owned: false, value: null, timedOut: true };
-}
-
 async function fetchHydrackerLien(lienId, deps) {
-  const { axios, limit, cookies, xsrf, timeoutMs } = deps;
-  return limit(async () => {
-    try {
-      const resp = await axios.get(
-        `https://hydracker.com/api/v1/content/liens/${lienId}`,
-        {
-          timeout: timeoutMs,
-          headers: {
-            accept: 'application/json',
-            cookie: cookies || '',
-            'x-xsrf-token': xsrf || '',
-            'user-agent': 'Mozilla/5.0 (Movix HydrackerLive)',
-          },
-          validateStatus: (s) => s >= 200 && s < 300,
+  const { axios, cookies, xsrf, timeoutMs } = deps;
+  try {
+    const resp = await axios.get(
+      `https://hydracker.com/api/v1/content/liens/${lienId}`,
+      {
+        timeout: timeoutMs,
+        headers: {
+          accept: 'application/json',
+          cookie: cookies || '',
+          'x-xsrf-token': xsrf || '',
+          'user-agent': 'Mozilla/5.0 (Movix HydrackerLive)',
         },
-      );
-      const body = resp.data || {};
-      const directDL = body.directDL;
-      if (!directDL || typeof directDL !== 'string') {
-        return { ok: false, code: 'live_no_directdl' };
-      }
-      return {
-        ok: true,
-        directDL,
-        rawUrl: typeof body.raw_url === 'string' && body.raw_url ? body.raw_url : null,
-        taille: body.lien?.taille ?? null,
-        created_at: body.lien?.created_at ?? null,
-      };
-    } catch (e) {
-      return {
-        ok: false,
-        code: 'live_hydracker_error',
-        status: e?.response?.status || 0,
-      };
+        validateStatus: (s) => s >= 200 && s < 300,
+      },
+    );
+    const body = resp.data || {};
+    const lienObj = body.lien || {};
+    const lienUrl = typeof lienObj.lien === 'string' && lienObj.lien ? lienObj.lien : null;
+    const directDL = body.directDL;
+    if (!lienUrl && (!directDL || typeof directDL !== 'string')) {
+      return { ok: false, code: 'live_no_directdl' };
     }
-  });
+    return {
+      ok: true,
+      directDL: directDL || lienUrl,
+      lienUrl,
+      id_host: lienObj.id_host ?? null,
+      rawUrl: typeof body.raw_url === 'string' && body.raw_url ? body.raw_url : null,
+      taille: lienObj.taille ?? null,
+      created_at: lienObj.created_at ?? null,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      code: 'live_hydracker_error',
+      status: e?.response?.status || 0,
+    };
+  }
 }
 
 async function fetchHydrackerTitleLiens(titleId, deps) {
-  const { axios, limit, cookies, xsrf, timeoutMs } = deps;
-  return limit(async () => {
-    try {
-      const resp = await axios.get(
-        `https://hydracker.com/api/v1/titles/${titleId}/content/liens`,
-        {
-          params: {
-            perPage: 100,
-            loader: 'linksdl',
-            filters: '',
-            paginate: 'preferLengthAware',
-          },
-          timeout: timeoutMs,
-          headers: {
-            accept: 'application/json',
-            cookie: cookies || '',
-            'x-xsrf-token': xsrf || '',
-            'user-agent': 'Mozilla/5.0 (Movix HydrackerLive)',
-          },
-          validateStatus: (s) => s >= 200 && s < 300,
+  const { axios, cookies, xsrf, timeoutMs } = deps;
+  try {
+    const resp = await axios.get(
+      `https://hydracker.com/api/v1/titles/${titleId}/content/liens`,
+      {
+        params: {
+          perPage: 100,
+          loader: 'linksdl',
+          filters: '',
+          paginate: 'preferLengthAware',
         },
-      );
-      const rows = Array.isArray(resp.data?.pagination?.data) ? resp.data.pagination.data : [];
-      return { ok: true, rows };
-    } catch (e) {
-      return {
-        ok: false,
-        code: 'live_hydracker_list_error',
-        status: e?.response?.status || 0,
-      };
-    }
-  });
+        timeout: timeoutMs,
+        headers: {
+          accept: 'application/json',
+          cookie: cookies || '',
+          'x-xsrf-token': xsrf || '',
+          'user-agent': 'Mozilla/5.0 (Movix HydrackerLive)',
+        },
+        validateStatus: (s) => s >= 200 && s < 300,
+      },
+    );
+    const rows = Array.isArray(resp.data?.pagination?.data) ? resp.data.pagination.data : [];
+    return { ok: true, rows };
+  } catch (e) {
+    return {
+      ok: false,
+      code: 'live_hydracker_list_error',
+      status: e?.response?.status || 0,
+    };
+  }
 }
 
 function normalizeHydrackerLien(row) {
@@ -172,8 +113,6 @@ function normalizeHydrackerLien(row) {
   };
 }
 
-const FAILED_MARKER_TTL_MS = 2 * 60 * 60 * 1000; // 2h — match darkiworldSqlite
-
 function buildFailedMarker(lienId, code, status) {
   return {
     failed: true,
@@ -185,24 +124,25 @@ function buildFailedMarker(lienId, code, status) {
   };
 }
 
-function buildSuccessPayload(lienId, raw, hydracker) {
+function buildSuccessPayload(lienId, hyd) {
+  const url = hyd.lienUrl || hyd.directDL || hyd.rawUrl;
   return {
     success: true,
     id: String(lienId),
     provider: 'hydracker-live',
     embed_url: {
-      lien: raw.link,
-      taille: raw.size ?? hydracker.taille ?? 0,
-      created_at: hydracker.created_at ?? null,
+      lien: url,
+      taille: hyd.taille ?? 0,
+      created_at: hyd.created_at ?? null,
+      id_host: hyd.id_host ?? null,
     },
     metadata: {
       language: undefined,
       quality: undefined,
       sub: undefined,
-      size: raw.size ?? hydracker.taille ?? undefined,
-      upload_date: hydracker.created_at ?? undefined,
-      host: raw.host ?? undefined,
-      filename: raw.filename ?? undefined,
+      size: hyd.taille ?? undefined,
+      upload_date: hyd.created_at ?? undefined,
+      host_id: hyd.id_host ?? undefined,
     },
     source: 'live',
   };
@@ -211,15 +151,12 @@ function buildSuccessPayload(lienId, raw, hydracker) {
 function createHydrackerLive(deps) {
   const {
     redis, axios, cookies, xsrf,
-    concurrency = 6, timeoutMs = 20000,
+    timeoutMs = 20000,
     cacheGet, cacheSet, cacheKeyFor, cacheDir,
     hydrackerLienCacheTtl = 60,
     titleListCacheTtl = 300,
-    lockTtlSec = 60, lockWaitMs = 65000, lockPollMs = 500,
     upstreamCooldownMs = 5 * 60 * 1000,
   } = deps;
-
-  const limit = createLimit(concurrency);
 
   // Cluster-wide hydracker upstream cooldown — stored in Redis so a 5xx
   // observed by any worker stops ALL workers from hammering a sick server.
@@ -282,83 +219,39 @@ function createHydrackerLive(deps) {
 
   async function resolveLien(lienId) {
     const key = cacheKeyFor(lienId);
-    const lockKey = `lock:hydracker:lien:${lienId}`;
-    const enterTime = Date.now();
 
-    const lockResult = await withRedisLock(redis, lockKey, lockTtlSec, async () => {
-      // Winner path. Re-check cache in case a previous holder finished
-      // between our miss check and lock acquisition.
-      // IMPORTANT: only short-circuit on success payloads. Failed markers
-      // (especially the legacy `sqlite_miss` one) are precisely why the
-      // caller's decodeLink self-heal decided to invoke us; honouring them
-      // here would loop the retry back into the same marker and the live
-      // fetch would never run.
-      const pre = await cacheGet(cacheDir, key);
-      if (pre && pre.success === true) return pre;
+    // Disk cache: only short-circuit on success payloads. Failed markers
+    // (especially the legacy `sqlite_miss` one) are precisely why the caller's
+    // decodeLink self-heal decided to invoke us; honouring them would loop the
+    // retry back into the same marker and the live fetch would never run.
+    const pre = await cacheGet(cacheDir, key);
+    if (pre && pre.success === true) return { payload: pre };
 
-      // Reuse a recent hydracker response (Redis, hydrackerLienCacheTtl) so
-      // we don't re-hit upstream while waiting for AllDebrid history to
-      // pick up a freshly-debrided link. Saves rate-limit budget.
-      let hyd = await getCachedHydracker(lienId);
-      if (!hyd) {
-        if (await isHydrackerInCooldown()) {
-          // Don't persist marker — cooldown is transient; retry cheap after
-          // window ends instead of locking a 2h disk marker.
-          return buildFailedMarker(lienId, 'live_hydracker_cooldown', 0);
-        }
-        hyd = await fetchHydrackerLien(lienId, {
-          axios, limit, cookies, xsrf, timeoutMs,
-        });
-        if (hyd.ok) {
-          await cacheHydracker(lienId, hyd);
-        } else {
-          await armHydrackerCooldownIfServerError(hyd.status);
-        }
+    // Reuse a recent hydracker response (Redis, hydrackerLienCacheTtl) to save
+    // rate-limit budget on bursts before the disk success payload is written.
+    let hyd = await getCachedHydracker(lienId);
+    if (!hyd) {
+      if (await isHydrackerInCooldown()) {
+        // Don't persist marker — cooldown is transient; retry cheap after the
+        // window ends instead of locking a 2h disk marker.
+        return { failed: buildFailedMarker(lienId, 'live_hydracker_cooldown', 0) };
       }
-      if (!hyd.ok) {
-        const marker = buildFailedMarker(lienId, hyd.code, hyd.status);
-        try { await cacheSet(cacheDir, key, marker); } catch (_) {}
-        return marker;
+      hyd = await fetchHydrackerLien(lienId, { axios, cookies, xsrf, timeoutMs });
+      if (hyd.ok) {
+        await cacheHydracker(lienId, hyd);
+      } else {
+        await armHydrackerCooldownIfServerError(hyd.status);
       }
-
-      // hydracker returns the raw host link (1fichier, ...) directly in
-      // raw_url/directDL now — no debrid unlock step. directDL is the
-      // fallback when raw_url is absent.
-      const match = {
-        link: hyd.rawUrl || hyd.directDL,
-        size: hyd.taille ?? undefined,
-        host: undefined,
-        filename: undefined,
-      };
-
-      const payload = buildSuccessPayload(lienId, match, hyd);
-      try { await cacheSet(cacheDir, key, payload); } catch (_) {}
-      return payload;
-    }, {
-      waitMs: lockWaitMs,
-      pollMs: lockPollMs,
-      onWaitCheck: async () => {
-        const c = await cacheGet(cacheDir, key);
-        if (!c) return null;
-        if (c.success === true) return c;
-        // Only honour a failed marker if it was written AFTER we started
-        // waiting — otherwise it's a stale pre-existing marker that has
-        // nothing to do with the current holder's in-flight work.
-        if (c.failed === true && typeof c.failedAt === 'number' && c.failedAt >= enterTime) {
-          return c;
-        }
-        return null;
-      },
-    });
-
-    if (lockResult.redisDown) {
-      return { failed: buildFailedMarker(lienId, 'live_redis_down') };
     }
-    if (lockResult.timedOut || !lockResult.value) {
-      return { failed: buildFailedMarker(lienId, 'live_lock_timeout') };
+    if (!hyd.ok) {
+      const marker = buildFailedMarker(lienId, hyd.code, hyd.status);
+      try { await cacheSet(cacheDir, key, marker); } catch (_) {}
+      return { failed: marker };
     }
-    const result = lockResult.value;
-    return result.success === true ? { payload: result } : { failed: result };
+
+    const payload = buildSuccessPayload(lienId, hyd);
+    try { await cacheSet(cacheDir, key, payload); } catch (_) {}
+    return { payload };
   }
 
   async function listLiensForTitle(titleId, opts = {}) {
@@ -382,9 +275,7 @@ function createHydrackerLive(deps) {
         console.warn(`[hydrackerLive] title list skipped (cooldown active) title=${titleNum}`);
         return [];
       }
-      const res = await fetchHydrackerTitleLiens(titleNum, {
-        axios, limit, cookies, xsrf, timeoutMs,
-      });
+      const res = await fetchHydrackerTitleLiens(titleNum, { axios, cookies, xsrf, timeoutMs });
       if (!res.ok) {
         await armHydrackerCooldownIfServerError(res.status);
         console.warn(`[hydrackerLive] title list fetch failed title=${titleNum} code=${res.code} status=${res.status ?? '-'}`);
@@ -418,8 +309,6 @@ function createHydrackerLive(deps) {
 
 module.exports = {
   createHydrackerLive,
-  _createLimit: createLimit,
-  _withRedisLock: withRedisLock,
   _fetchHydrackerLien: fetchHydrackerLien,
   _fetchHydrackerTitleLiens: fetchHydrackerTitleLiens,
   _normalizeHydrackerLien: normalizeHydrackerLien,

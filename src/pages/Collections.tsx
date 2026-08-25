@@ -8,6 +8,7 @@ import { SquareBackground } from '../components/ui/square-background';
 import ShinyText from '../components/ui/shiny-text';
 import AnimatedBorderCard from '../components/ui/animated-border-card';
 import { getTmdbLanguage } from '../i18n';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 
 // Clés i18n pour les textes accrocheurs (collections.catchyText1 à catchyText5)
@@ -115,6 +116,12 @@ const CollectionCard: React.FC<CollectionCardProps> = React.memo(({
   getOptimizedImageUrl,
   t,
 }) => {
+  const { items: ageAllowedParts } = useAgeRestrictedContent(
+    (collection.parts || []).map((movie) => ({ ...movie, media_type: 'movie' as const })),
+  );
+
+  if (collection.parts?.length > 0 && ageAllowedParts.length === 0) return null;
+
   return (
     <Link to={`/collection/${collection.id}`}>
       <div
@@ -139,7 +146,7 @@ const CollectionCard: React.FC<CollectionCardProps> = React.memo(({
           <h3 className="text-xl font-bold text-white mb-2">{collection.name}</h3>
           <div className="flex items-center gap-2 text-sm text-gray-300">
             <Film size={16} />
-            <span>{collection.parts?.filter(movie => movie.poster_path).length || 0} {t('collections.films')}</span>
+            <span>{ageAllowedParts.filter(movie => movie.poster_path).length || 0} {t('collections.films')}</span>
           </div>
         </div>
       </div>
@@ -262,13 +269,13 @@ const CollectionCard: React.FC<CollectionCardProps> = React.memo(({
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
             {(() => {
-              const totalMovies = collection.parts?.filter(movie => movie.poster_path).length || 0;
+              const totalMovies = ageAllowedParts.filter(movie => movie.poster_path).length || 0;
               const maxDisplayed = 5; // Maximum 5 films affichés
               const moviesToShow = Math.min(totalMovies, maxDisplayed);
 
               // Si on a 5 films ou moins, on les affiche tous
               if (totalMovies <= 5) {
-                return collection.parts?.slice(0, moviesToShow).map((movie) => (
+                return ageAllowedParts.slice(0, moviesToShow).map((movie) => (
                   <div
                     key={movie.id}
                     className="w-14 h-20 sm:w-12 sm:h-16 rounded overflow-hidden hover:scale-110 transition-transform border border-gray-600"
@@ -293,7 +300,7 @@ const CollectionCard: React.FC<CollectionCardProps> = React.memo(({
                                  // Si on a plus de 5 films, on affiche 4 images + 1 compteur
                return (
                  <>
-                   {collection.parts?.slice(0, 4).map((movie) => (
+                   {ageAllowedParts.slice(0, 4).map((movie) => (
                      <div
                        key={movie.id}
                        className="w-14 h-20 sm:w-12 sm:h-16 rounded overflow-hidden hover:scale-110 transition-transform border border-gray-600"

@@ -7,6 +7,7 @@ import App from './App.tsx'
 import axios from 'axios'
 import { api } from './services/api'
 import { registerBlockDetection } from './services/blockDetection'
+import { installHttpCache } from './utils/httpCache'
 import './index.css'
 import './styles/light-mode.css'
 
@@ -143,6 +144,14 @@ if (localStorage.getItem('square_corners_enabled') === '1') {
 // since instances created via axios.create() don't inherit from the default.
 registerBlockDetection(axios)
 registerBlockDetection(api)
+
+// Cache des lectures de catalogue (TMDB, /api/content) : une réponse déjà vue
+// est resservie sans réseau, et rafraîchie en arrière-plan si elle a vieilli.
+// Même remarque que ci-dessus : les deux instances ont besoin de leur propre
+// installation. Voir `utils/httpCache.ts` pour ce qui est mis en cache — et
+// surtout pour ce qui ne l'est jamais.
+installHttpCache(axios)
+installHttpCache(api)
 
 // ---------------------------------------------------------------------------
 // Resilience patches — run before the app mounts.

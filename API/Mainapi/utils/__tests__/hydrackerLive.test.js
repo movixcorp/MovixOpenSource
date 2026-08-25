@@ -1,35 +1,22 @@
 // API/Mainapi/utils/__tests__/hydrackerLive.test.js
+//
+// Couvre le chemin live actuel : hydracker renvoie l'URL hoster directement,
+// la resolution est un GET unique. Pas de file d'attente de concurrence, pas
+// de verrou Redis, pas d'aller-retour debrid — ces couches ont ete retirees.
 const { test, mock } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { _createLimit } = require('../hydrackerLive');
-
-test('createLimit: caps in-flight executions at the configured limit', async () => {
-  const limit = _createLimit(2);
-  let inFlight = 0;
-  let peak = 0;
-  const work = async () => {
-    inFlight++;
-    peak = Math.max(peak, inFlight);
-    await new Promise((r) => setTimeout(r, 20));
-    inFlight--;
-  };
-  await Promise.all(Array.from({ length: 10 }, () => limit(work)));
-  assert.equal(peak, 2);
-});
-
-test('createLimit: propagates result values and rejections', async () => {
-  const limit = _createLimit(1);
-  assert.equal(await limit(async () => 42), 42);
-  await assert.rejects(limit(async () => { throw new Error('boom'); }), /boom/);
-});
-
-const { _withRedisLock } = require('../hydrackerLive');
+const {
+  createHydrackerLive,
+  _fetchHydrackerLien,
+  _normalizeHydrackerLien,
+} = require('../hydrackerLive');
 
 function makeFakeRedis() {
   const store = new Map();
   return {
     store,
+    exists: mock.fn(async (key) => (store.has(key) ? 1 : 0)),
     set: mock.fn(async (key, val, ...args) => {
       const flags = new Set(args);
       if (flags.has('NX') && store.has(key)) return null;
@@ -38,61 +25,8 @@ function makeFakeRedis() {
     }),
     del: mock.fn(async (key) => { store.delete(key); return 1; }),
     get: mock.fn(async (key) => store.get(key) ?? null),
-    eval: mock.fn(async (_script, _numKeys, key, expected) => {
-      if (store.get(key) === expected) {
-        store.delete(key);
-        return 1;
-      }
-      return 0;
-    }),
   };
 }
-
-test('withRedisLock: runs work when lock is acquired and releases it', async () => {
-  const redis = makeFakeRedis();
-  const result = await _withRedisLock(redis, 'lock:test', 30, async () => 'done', {
-    waitMs: 100, pollMs: 10, onWaitCheck: async () => null,
-  });
-  assert.deepEqual(result, { owned: true, value: 'done' });
-  assert.equal(redis.eval.mock.callCount(), 1);
-  assert.equal(redis.eval.mock.calls[0].arguments[2], 'lock:test');
-});
-
-test('withRedisLock: releases the lock even when work throws', async () => {
-  const redis = makeFakeRedis();
-  await assert.rejects(
-    _withRedisLock(redis, 'lock:err', 30, async () => { throw new Error('fail'); }, {
-      waitMs: 100, pollMs: 10, onWaitCheck: async () => null,
-    }),
-    /fail/,
-  );
-  assert.equal(redis.eval.mock.callCount(), 1);
-  assert.equal(redis.eval.mock.calls[0].arguments[2], 'lock:err');
-});
-
-test('withRedisLock: waiter returns cache value produced by holder', async () => {
-  const redis = makeFakeRedis();
-  redis.store.set('lock:hot', '1'); // holder already in flight
-  let calls = 0;
-  const result = await _withRedisLock(redis, 'lock:hot', 30, async () => 'unused', {
-    waitMs: 200,
-    pollMs: 20,
-    onWaitCheck: async () => (++calls >= 2 ? { fromCache: true } : null),
-  });
-  assert.deepEqual(result, { owned: false, value: { fromCache: true } });
-  assert.ok(calls >= 2);
-});
-
-test('withRedisLock: waiter times out when cache never populates', async () => {
-  const redis = makeFakeRedis();
-  redis.store.set('lock:cold', '1');
-  const result = await _withRedisLock(redis, 'lock:cold', 30, async () => 'unused', {
-    waitMs: 80, pollMs: 20, onWaitCheck: async () => null,
-  });
-  assert.deepEqual(result, { owned: false, value: null, timedOut: true });
-});
-
-const { _fetchHydrackerLien } = require('../hydrackerLive');
 
 function makeAxiosStub(handler) {
   return { get: mock.fn(handler) };
@@ -100,13 +34,12 @@ function makeAxiosStub(handler) {
 
 const fetchDeps = () => ({
   axios: null,
-  limit: (fn) => fn(),
   cookies: 'SERVERID=S1',
   xsrf: 'xsrf-token',
   timeoutMs: 20000,
 });
 
-test('fetchHydrackerLien: returns the directDL and metadata on success', async () => {
+test('fetchHydrackerLien: returns the direct URL and metadata on success', async () => {
   const deps = fetchDeps();
   deps.axios = makeAxiosStub(async (url, cfg) => {
     assert.equal(url, 'https://hydracker.com/api/v1/content/liens/18780524');
@@ -114,21 +47,41 @@ test('fetchHydrackerLien: returns the directDL and metadata on success', async (
     assert.equal(cfg.headers.cookie, 'SERVERID=S1');
     assert.equal(cfg.headers['x-xsrf-token'], 'xsrf-token');
     return { status: 200, data: {
-      lien: { id: 18780524, taille: 1658392158, created_at: '2025-12-16T12:56:27.000000Z' },
-      directDL: 'https://n3zy9n.debrid.it/dl/4p9xcom427a/F.mkv',
+      lien: {
+        id: 18780524,
+        lien: 'https://1fichier.com/?bluzzibv1a9sedt69saa',
+        id_host: 5,
+        taille: 1658392158,
+        created_at: '2025-12-16T12:56:27.000000Z',
+      },
+      raw_url: 'https://1fichier.com/?bluzzibv1a9sedt69saa',
+      directDL: 'https://1fichier.com/?bluzzibv1a9sedt69saa',
     }};
   });
   const out = await _fetchHydrackerLien(18780524, deps);
   assert.deepEqual(out, {
     ok: true,
-    directDL: 'https://n3zy9n.debrid.it/dl/4p9xcom427a/F.mkv',
-    rawUrl: null,
+    directDL: 'https://1fichier.com/?bluzzibv1a9sedt69saa',
+    lienUrl: 'https://1fichier.com/?bluzzibv1a9sedt69saa',
+    id_host: 5,
+    rawUrl: 'https://1fichier.com/?bluzzibv1a9sedt69saa',
     taille: 1658392158,
     created_at: '2025-12-16T12:56:27.000000Z',
   });
 });
 
-test('fetchHydrackerLien: returns ok=false with code live_no_directdl when directDL is null', async () => {
+test('fetchHydrackerLien: falls back to lien.lien when directDL is absent', async () => {
+  const deps = fetchDeps();
+  deps.axios = makeAxiosStub(async () => ({ status: 200, data: {
+    lien: { id: 7, lien: 'https://1fichier.com/?onlylien', id_host: 5 },
+  }}));
+  const out = await _fetchHydrackerLien(7, deps);
+  assert.equal(out.ok, true);
+  assert.equal(out.directDL, 'https://1fichier.com/?onlylien');
+  assert.equal(out.lienUrl, 'https://1fichier.com/?onlylien');
+});
+
+test('fetchHydrackerLien: returns ok=false with code live_no_directdl when no URL is returned', async () => {
   const deps = fetchDeps();
   deps.axios = makeAxiosStub(async () => ({ status: 200, data: { lien: { id: 1 }, directDL: null }}));
   const out = await _fetchHydrackerLien(1, deps);
@@ -156,16 +109,35 @@ test('fetchHydrackerLien: returns code live_hydracker_error on network failure',
   assert.deepEqual(out, { ok: false, code: 'live_hydracker_error', status: 0 });
 });
 
-test('fetchHydrackerLien: runs the request through the limit wrapper', async () => {
-  const deps = fetchDeps();
-  const calls = [];
-  deps.limit = (fn) => { calls.push('wrapped'); return fn(); };
-  deps.axios = makeAxiosStub(async () => ({ status: 200, data: { directDL: 'https://x/' }}));
-  await _fetchHydrackerLien(1, deps);
-  assert.deepEqual(calls, ['wrapped']);
+test('normalizeHydrackerLien: surfaces the real host name as the visible provider', () => {
+  const out = _normalizeHydrackerLien({
+    id: 19329390,
+    id_host: 5,
+    taille: 956860149,
+    created_at: '2026-08-21T19:17:00.000000Z',
+    saison: 1,
+    episode: 1,
+    full_saison: 0,
+    host: { name: '1Fichier', icon: '/hosts/1fichier.svg' },
+    qual: { qual: '1080p' },
+    langues_compact: [{ name: 'VF' }],
+    subs_compact: [{ name: 'VOSTFR' }],
+  });
+  assert.equal(out.id, 19329390);
+  assert.equal(out.provider, '1Fichier');
+  assert.equal(out.host_name, '1Fichier');
+  assert.equal(out.host_id, 5);
+  assert.equal(out.quality, '1080p');
+  assert.equal(out.language, 'VF');
+  assert.equal(out.sub, 'VOSTFR');
+  assert.equal(out.full_saison, undefined);
+  assert.equal(out.source, 'hydracker-live');
 });
 
-const { createHydrackerLive } = require('../hydrackerLive');
+test('normalizeHydrackerLien: rejects rows without a numeric id', () => {
+  assert.equal(_normalizeHydrackerLien(null), null);
+  assert.equal(_normalizeHydrackerLien({ id: 'abc' }), null);
+});
 
 function setupLive(overrides = {}) {
   const redis = makeFakeRedis();
@@ -187,14 +159,11 @@ function setupLive(overrides = {}) {
     axios,
     cookies: 'c',
     xsrf: 'x',
-    concurrency: 6,
     timeoutMs: 20000,
     cacheGet: async (_, k) => cacheStore.get(k) ?? null,
     cacheSet: async (_, k, v) => { cacheStore.set(k, v); },
     cacheKeyFor: (id) => `darkiworld_decode_v2_${id}`,
     cacheDir: '/tmp',
-    lockPollMs: 5,
-    lockWaitMs: 500,
     ...overrides,
   };
   const live = createHydrackerLive(deps);
@@ -214,7 +183,7 @@ test('resolveLien: returns success payload with raw URL on happy path', async ()
   assert.equal(axios.get.mock.callCount(), 1);
 });
 
-test('resolveLien: returns failed marker live_no_directdl when hydracker has no directDL', async () => {
+test('resolveLien: returns failed marker live_no_directdl when hydracker has no URL', async () => {
   const { live } = setupLive({
     axios: { get: mock.fn(async () => ({ status: 200, data: { lien: { id: 42 }, directDL: null }})) },
   });
@@ -233,48 +202,31 @@ test('resolveLien: returns failed marker live_hydracker_error on hydracker 5xx',
   assert.equal(out.failed.debug, 'live_hydracker_error');
 });
 
-test('resolveLien: concurrent calls for the same id fetch hydracker at most once', async () => {
-  const { live, axios } = setupLive();
-  const [a, b, c] = await Promise.all([live.resolveLien(42), live.resolveLien(42), live.resolveLien(42)]);
-  const hydrackerCalls = axios.get.mock.calls.filter((call) =>
-    call.arguments[0].startsWith('https://hydracker.com/')
-  ).length;
-  assert.ok(hydrackerCalls <= 1, `expected <=1 hydracker fetch, got ${hydrackerCalls}`);
-  assert.ok(a.payload || a.failed);
-  assert.ok(b.payload || b.failed);
-  assert.ok(c.payload || c.failed);
-});
-
-test('withRedisLock: fenced release only deletes lock when token matches', async () => {
-  const redis = makeFakeRedis();
-  // Pre-populate the lock with someone else's token to simulate
-  // holder-TTL-expired-and-another-worker-acquired scenario.
-  redis.store.set('lock:fenced', 'someone-elses-token');
-  const result = await _withRedisLock(redis, 'lock:fenced', 30, async () => 'work-done', {
-    waitMs: 50, pollMs: 10, onWaitCheck: async () => null,
+test('resolveLien: a 5xx arms the cluster-wide cooldown and the next call short-circuits', async () => {
+  const { live, redis, axios } = setupLive({
+    axios: { get: mock.fn(async () => { const e = new Error('503'); e.response = { status: 503 }; throw e; }) },
   });
-  // We never acquired — work didn't run, returned timed-out result.
-  assert.equal(result.owned, false);
-  assert.equal(result.timedOut, true);
-  // The other worker's lock is still there — we did NOT del it.
-  assert.equal(redis.store.get('lock:fenced'), 'someone-elses-token');
+  await live.resolveLien(42);
+  assert.equal(redis.store.has('hydracker:cooldown:5xx'), true);
+  const callsAfterFirst = axios.get.mock.callCount();
+  const out = await live.resolveLien(43);
+  assert.equal(out.failed.debug, 'live_hydracker_cooldown');
+  assert.equal(axios.get.mock.callCount(), callsAfterFirst, 'cooldown must stop outbound fetches');
 });
 
-test('withRedisLock: returns redisDown when redis.set throws', async () => {
+test('resolveLien: a Redis outage must not block the live fetch (fail-open)', async () => {
   const brokenRedis = {
     store: new Map(),
+    exists: async () => { throw new Error('ECONNREFUSED'); },
     set: async () => { throw new Error('ECONNREFUSED'); },
     del: async () => 0,
-    get: async () => null,
-    eval: async () => 0,
+    get: async () => { throw new Error('ECONNREFUSED'); },
   };
-  let workCalls = 0;
-  const result = await _withRedisLock(brokenRedis, 'lock:down', 30, async () => {
-    workCalls++;
-    return 'should-not-run';
-  }, { waitMs: 50, pollMs: 10, onWaitCheck: async () => null });
-  assert.deepEqual(result, { owned: false, value: null, redisDown: true });
-  assert.equal(workCalls, 0, 'work must not run when Redis is down');
+  const { live, axios } = setupLive({ redis: brokenRedis });
+  const out = await live.resolveLien(42);
+  assert.ok(out.payload, 'live fetch must still run when Redis is down');
+  assert.equal(out.payload.embed_url.lien, 'https://1fichier.com/?raw42');
+  assert.equal(axios.get.mock.callCount(), 1);
 });
 
 test('resolveLien: ignores stale pre-existing sqlite_miss marker in cache and runs hydracker fetch', async () => {
@@ -304,29 +256,57 @@ test('resolveLien: second call for the same id reuses cached hydracker response 
   assert.equal(hydrackerCallsAfterSecond, 1, 'hydracker must not be hit twice within hydrackerLienCacheTtl');
 });
 
-test('resolveLien: returns live_redis_down failure when redis is unreachable', async () => {
-  const brokenRedis = {
-    store: new Map(),
-    set: async () => { throw new Error('ECONNREFUSED'); },
-    del: async () => 0,
-    get: async () => null,
-    eval: async () => 0,
+function setupList(rows, overrides = {}) {
+  const redis = makeFakeRedis();
+  const axios = {
+    get: mock.fn(async () => ({ status: 200, data: { pagination: { data: rows } } })),
   };
-  const axiosThatShouldNotBeCalled = { get: mock.fn(async () => { throw new Error('do not call'); }) };
-  const cacheStore = new Map();
   const live = createHydrackerLive({
-    redis: brokenRedis,
-    axios: axiosThatShouldNotBeCalled,
-    cookies: 'c', xsrf: 'x',
-    concurrency: 6, timeoutMs: 20000,
-    apikey: 'k', agent: 'movix', historyTtl: 60,
-    cacheGet: async (_, k) => cacheStore.get(k) ?? null,
-    cacheSet: async (_, k, v) => { cacheStore.set(k, v); },
+    redis,
+    axios,
+    cookies: 'c',
+    xsrf: 'x',
+    timeoutMs: 20000,
+    cacheGet: async () => null,
+    cacheSet: async () => {},
     cacheKeyFor: (id) => `darkiworld_decode_v2_${id}`,
     cacheDir: '/tmp',
+    ...overrides,
   });
-  const out = await live.resolveLien(99);
-  assert.equal(out.failed.failed, true);
-  assert.equal(out.failed.debug, 'live_redis_down');
-  assert.equal(axiosThatShouldNotBeCalled.get.mock.callCount(), 0);
+  return { live, redis, axios };
+}
+
+test('listLiensForTitle: returns every normalized row for a movie', async () => {
+  const { live } = setupList([
+    { id: 1, host: { name: '1Fichier' }, saison: 0, episode: null },
+    { id: 2, host: { name: 'Send' }, saison: 0, episode: null },
+  ]);
+  const out = await live.listLiensForTitle(17323, { type: 'movie' });
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((r) => r.id), [1, 2]);
+});
+
+test('listLiensForTitle: keeps the matching episode and the full-season packs', async () => {
+  const { live } = setupList([
+    { id: 1, host: { name: 'A' }, saison: 1, episode: 1 },
+    { id: 2, host: { name: 'B' }, saison: 1, episode: 2 },
+    { id: 3, host: { name: 'C' }, saison: 1, episode: null, full_saison: 1 },
+    { id: 4, host: { name: 'D' }, saison: 2, episode: 1 },
+  ]);
+  const out = await live.listLiensForTitle(17323, { type: 'tv', season: 1, episode: 1 });
+  assert.deepEqual(out.map((r) => r.id), [1, 3]);
+});
+
+test('listLiensForTitle: rejects a non-numeric title id without any fetch', async () => {
+  const { live, axios } = setupList([]);
+  assert.deepEqual(await live.listLiensForTitle('abc'), []);
+  assert.deepEqual(await live.listLiensForTitle(-1), []);
+  assert.equal(axios.get.mock.callCount(), 0);
+});
+
+test('listLiensForTitle: returns an empty list instead of throwing when hydracker fails', async () => {
+  const { live } = setupList([], {
+    axios: { get: mock.fn(async () => { const e = new Error('500'); e.response = { status: 500 }; throw e; }) },
+  });
+  assert.deepEqual(await live.listLiensForTitle(17323, { type: 'movie' }), []);
 });

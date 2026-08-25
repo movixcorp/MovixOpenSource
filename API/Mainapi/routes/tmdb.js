@@ -14,6 +14,31 @@ const fsp = require('fs').promises;
 const { CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
 const { fetchTmdbDetails, searchTmdb } = require('../utils/tmdbCache');
 const { acquireRedisLock } = require('../utils/redisLock');
+const { respondWithResolvedSources } = require('../utils/embedExtraction');
+
+// Coflix et FrenchStream n'ont pas de routeur propre : leurs données sortent
+// par /api/tmdb/:type/:id et /api/imdb/:type/:id. Ils rangent leurs lecteurs
+// dans `player_links`, à un emplacement qui dépend du type de contenu.
+//
+// Coflix sert déjà UN épisode par appel (`?season=&episode=`), d'où le chemin
+// `current_episode.player_links` côté série.
+const respondWithCoflixSources = (req, res, payload, type) =>
+  respondWithResolvedSources(req, res, payload, {
+    movieMapKey: type === 'tv' ? 'current_episode.player_links' : 'player_links',
+    label: 'COFLIX',
+  });
+
+// FrenchStream ne prend aucun paramètre d'épisode : sa réponse série porte
+// TOUTES les saisons (`seasons[].episodes[].versions`). Résoudre là-dedans
+// reviendrait à extraire une série entière pour une seule lecture — on s'en
+// tient donc aux films, où `player_links` est à la racine.
+const respondWithFrenchStreamSources = (req, res, payload, type) =>
+  type === 'tv'
+    ? res.json(payload)
+    : respondWithResolvedSources(req, res, payload, {
+        movieMapKey: 'player_links',
+        label: 'FRENCHSTREAM',
+      });
 const { COFLIX_ENABLED } = require('./coflix');
 const {
   applyCloneUrlsToPlayerLinks,
@@ -375,7 +400,7 @@ router.get('/tmdb/:type/:id', async (req, res) => {
     let dataReturned = false;
     if (cachedData) {
       const cachedDataWithClones = await applyCloneUrlsToTmdbResult(cachedData, type, id, season, episode);
-      res.json(filterEmmmmbedReaders(cachedDataWithClones));
+      await respondWithCoflixSources(req, res, filterEmmmmbedReaders(cachedDataWithClones), type);
       dataReturned = true;
 
       // Lancer la mise a jour en arriere-plan si necessaire
@@ -554,7 +579,7 @@ router.get('/tmdb/:type/:id', async (req, res) => {
 
         // Si les donnees n'avaient pas ete retournees initialement, les retourner maintenant
         if (!dataReturned) {
-          res.json(filterEmmmmbedReaders(result));
+          await respondWithCoflixSources(req, res, filterEmmmmbedReaders(result), type);
         }
 
       } catch (updateError) {
@@ -649,7 +674,7 @@ router.get('/imdb/:type/:id', async (req, res) => {
     let dataReturned = false;
     if (cachedData) {
       const dataToSend = type === 'tv' ? cleanTvCacheData(cachedData) : cachedData;
-      res.json(dataToSend);
+      await respondWithFrenchStreamSources(req, res, dataToSend, type);
       dataReturned = true;
     }
 
@@ -764,7 +789,7 @@ router.get('/imdb/:type/:id', async (req, res) => {
           } else if (responseData.message === 'Contenu non disponible') {
             res.status(200).json(responseData);
           } else {
-            res.json(responseData);
+            await respondWithFrenchStreamSources(req, res, responseData, type);
           }
         }
 

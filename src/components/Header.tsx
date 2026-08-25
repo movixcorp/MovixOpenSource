@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import Snowfall from 'react-snowfall';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
-import { Film, Search, Menu, X, Star, Tv2, Users, Clapperboard, Bell, Tv, Lightbulb, Network, List, Radio, Unlock, ChevronDown, ExternalLink, LayoutGrid, Settings, Dices, Sparkles, HelpCircle, Github } from 'lucide-react';
+import { Film, Search, Menu, X, Star, Tv2, Users, Clapperboard, Bell, Tv, Lightbulb, Network, List, Radio, Unlock, ChevronDown, ExternalLink, LayoutGrid, Settings, Dices, Sparkles, HelpCircle, Github, CalendarDays } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ProfileMenu from './ProfileMenu';
 import NotificationsPopup from './NotificationsPopup';
@@ -11,9 +12,12 @@ import { encodeId } from '../utils/idEncoder';
 
 import { useSearch } from '../context/SearchContext';
 import { isUserVip } from '../utils/authUtils';
+import { checkVipStatus } from '../utils/vipUtils';
 import { useTranslation } from 'react-i18next';
 import { SquareBackground } from './ui/square-background';
 import { APRIL_FOOLS_ADMIN_PATH, isAprilFoolsAdminEnabled } from '../utils/aprilFools';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 // Couleurs pour les cards du mega menu
 const cardColors: Record<string, { bg: string; text: string; border: string }> = {
@@ -87,6 +91,7 @@ const Header: React.FC = () => {
     fetchAutocompleteSuggestions,
     clearAutocompleteSuggestions
   } = useSearch();
+  const { items: ageFilteredAutocomplete } = useAgeRestrictedContent(autocompleteSuggestions);
 
   // 4 items principaux visibles dans le header
   const mainNavItems = useMemo(() => [
@@ -96,35 +101,41 @@ const Header: React.FC = () => {
     { name: t('nav.search'), path: '/search', icon: <Search size={16} />, isActive: location.pathname === '/search' },
   ], [t, location.pathname]);
 
-  // Groupes du mega menu — 4 colonnes équilibrées, tout sur 1 ligne
+  // Groupes du mega menu — rangés par intention plutôt que par type de contenu :
+  // ce que je cherche à voir / avec qui / ce qui passe maintenant / le reste.
   const exploreGroups: ExploreGroup[] = useMemo(() => [
     {
-      title: t('nav.movies'),
+      // Trouver quoi regarder, du plus dirigé au plus sérendipitaire.
+      title: t('nav.groupDiscover'),
       items: [
         { name: t('nav.collections'), path: '/collections', icon: <Film size={20} />, color: 'purple', desc: t('nav.collectionsDesc') },
         { name: t('nav.top10'), path: '/top10', icon: <Star size={20} />, color: 'yellow', desc: t('nav.top10Desc') },
+        { name: t('nav.suggestions'), path: '/suggestion', icon: <Sparkles size={20} />, color: 'pink', desc: t('nav.suggestionsDesc') },
         { name: t('nav.roulette'), path: '/roulette', icon: <Dices size={20} />, color: 'red', desc: t('roulette.navDesc') },
         { name: t('nav.cinegraph'), path: '/cinegraph', icon: <Network size={20} />, color: 'blue', desc: t('nav.cinegraphDesc') },
       ]
     },
     {
-      title: t('nav.social'),
+      // Tout ce qui implique d'autres utilisateurs — Watch Party compris.
+      title: t('nav.groupCommunity'),
       items: [
+        { name: t('nav.watchParty'), path: '/watchparty/list', icon: <Users size={20} />, color: 'orange', desc: t('nav.watchPartyDesc') },
         { name: t('nav.sharedLists'), path: '/list-catalog', icon: <List size={20} />, color: 'indigo', desc: t('nav.sharedListsDesc') },
-        { name: t('nav.suggestions'), path: '/suggestion', icon: <Star size={20} />, color: 'pink', desc: t('nav.suggestionsDesc') },
         { name: t('nav.greenlight'), path: '/wishboard', icon: <Lightbulb size={20} />, color: 'green', desc: t('nav.greenlightDesc') },
       ]
     },
     {
-      title: t('nav.live'),
+      // Ce qui passe en ce moment, puis ce qui arrive bientôt.
+      title: t('nav.groupLive'),
       items: [
-        { name: t('nav.watchParty'), path: '/watchparty/list', icon: <Users size={20} />, color: 'orange', desc: t('nav.watchPartyDesc') },
         { name: t('nav.liveTV'), path: '/live-tv', icon: <Tv size={20} />, color: 'red', desc: t('nav.liveTVDesc') },
         ...(isVip ? [{ name: t('nav.francetv'), path: '/ftv', icon: <Radio size={20} />, color: 'sky' as const, desc: t('nav.francetvDesc') }] : []),
+        { name: t('nav.calendar'), path: '/calendar', icon: <CalendarDays size={20} />, color: 'green', desc: t('nav.calendarDesc') },
       ]
     },
     {
-      title: t('nav.more'),
+      // Outils du compte d'abord, liens externes en dernier.
+      title: t('nav.groupTools'),
       items: [
         ...(isVip ? [{ name: t('nav.debrid'), path: '/debrid', icon: <Unlock size={20} />, color: 'yellow' as const, desc: t('nav.debridDesc') }] : []),
         { name: t('nav.settings'), path: '/settings', icon: <Settings size={20} />, color: 'gray', desc: t('nav.settingsDesc') },
@@ -137,6 +148,8 @@ const Header: React.FC = () => {
 
   // Auth
   useEffect(() => {
+    let mounted = true;
+
     const checkAuth = () => {
       const auth = localStorage.getItem('auth');
       const discordAuth = localStorage.getItem('discord_auth');
@@ -149,7 +162,19 @@ const Header: React.FC = () => {
     };
     checkAuth();
     window.addEventListener('storage', checkAuth);
-    return () => window.removeEventListener('storage', checkAuth);
+    window.addEventListener('vipStatusChanged', checkAuth);
+
+    if (localStorage.getItem('access_code')) {
+      void checkVipStatus().then(() => {
+        if (mounted) checkAuth();
+      });
+    }
+
+    return () => {
+      mounted = false;
+      window.removeEventListener('storage', checkAuth);
+      window.removeEventListener('vipStatusChanged', checkAuth);
+    };
   }, []);
 
   // Notifications
@@ -206,34 +231,78 @@ const Header: React.FC = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showNotifications, isExploreOpen]);
 
-  // Bloquer le scroll (html + body + Lenis) quand le menu fullscreen est ouvert
+  // Overlay du menu fullscreen mobile : c'est lui le scroller (cf. le JSX).
+  const exploreOverlayRef = useRef<HTMLDivElement>(null);
+
+  // Bloquer le scroll (html + body + Lenis) quand le menu fullscreen est ouvert.
+  // body en position:fixed avec top:-scrollY (technique body-scroll-lock) :
+  // iOS ignore overflow:hidden sur body, et un fixed sans top compensé fait
+  // sauter la page en haut derrière le menu + perd la position au retour.
   useEffect(() => {
-    const lenis = (window as any).lenis;
     const isMobile = window.innerWidth < 1024;
-    if (isExploreOpen && isMobile) {
-      document.documentElement.style.overflow = 'hidden';
-      document.body.style.overflow = 'hidden';
-      document.body.style.position = 'fixed';
-      document.body.style.inset = '0';
-      document.body.style.width = '100%';
-      if (lenis) lenis.destroy();
-    } else {
-      document.documentElement.style.overflow = '';
-      document.body.style.overflow = '';
-      document.body.style.position = '';
-      document.body.style.inset = '';
-      document.body.style.width = '';
-      // Réinitialiser Lenis si nécessaire
-      if (!lenis && isMobile) {
-        window.dispatchEvent(new CustomEvent('settings_smooth_scroll_changed'));
-      }
+    if (!(isExploreOpen && isMobile)) return;
+
+    const lenis = (window as any).lenis;
+    const scrollY = window.scrollY;
+    const lockedPath = window.location.pathname;
+
+    document.documentElement.style.overflow = 'hidden';
+    document.documentElement.style.overscrollBehavior = 'none';
+    document.body.style.overflow = 'hidden';
+    document.body.style.overscrollBehavior = 'none';
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${scrollY}px`;
+    document.body.style.left = '0';
+    document.body.style.right = '0';
+    document.body.style.width = '100%';
+    if (lenis) {
+      lenis.destroy();
+      // Sans ce delete, window.lenis pointe vers une instance détruite : le
+      // test !window.lenis à la fermeture ne passe jamais et le smooth scroll
+      // n'est jamais réinitialisé pour les utilisateurs qui l'ont activé.
+      delete (window as any).lenis;
     }
+
+    // Anti-chaînage iOS/WKWebView, sans preventDefault. Quand un geste démarre
+    // pile sur un bord du scroller (scrollTop 0, ou fond atteint), WebKit
+    // décide dès le premier touchmove de transférer le pan à l'ancêtre — ici
+    // le document verrouillé ou l'UIScrollView du WKWebView — et le geste
+    // entier est consommé sans rien faire : « des fois on ne peut pas
+    // scroller ». On décolle donc le scroller du bord d'un pixel avant que la
+    // décision soit prise.
+    //
+    // La version précédente preventDefault-ait ces gestes : c'était pire, un
+    // simple tremblement de 1px vers le bas en haut de liste tuait le geste
+    // entier puisque WebKit ne réévalue pas sa décision ensuite.
+    const overlay = exploreOverlayRef.current;
+    const nudgeOffEdges = () => {
+      const el = exploreOverlayRef.current;
+      if (!el) return;
+      const max = el.scrollHeight - el.clientHeight;
+      if (max <= 2) return; // rien à faire défiler : le chaînage est sans effet
+      if (el.scrollTop <= 0) el.scrollTop = 1;
+      else if (el.scrollTop >= max) el.scrollTop = max - 1;
+    };
+    nudgeOffEdges();
+    overlay?.addEventListener('touchstart', nudgeOffEdges, { passive: true });
+
     return () => {
+      overlay?.removeEventListener('touchstart', nudgeOffEdges);
       document.documentElement.style.overflow = '';
+      document.documentElement.style.overscrollBehavior = '';
       document.body.style.overflow = '';
+      document.body.style.overscrollBehavior = '';
       document.body.style.position = '';
-      document.body.style.inset = '';
+      document.body.style.top = '';
+      document.body.style.left = '';
+      document.body.style.right = '';
       document.body.style.width = '';
+      // Restaure la position uniquement si on est resté sur la même page :
+      // une navigation via un lien du menu doit laisser le scroll-to-top de
+      // la nouvelle route gagner.
+      if (window.location.pathname === lockedPath) {
+        window.scrollTo({ top: scrollY, left: 0, behavior: 'instant' as ScrollBehavior });
+      }
       if (!(window as any).lenis) {
         window.dispatchEvent(new CustomEvent('settings_smooth_scroll_changed'));
       }
@@ -356,7 +425,12 @@ const Header: React.FC = () => {
 
   return (
     <>
-      <header className="!fixed inset-x-0 top-0 w-full z-[11000] transition-all duration-300">
+      {/* max-lg:pointer-events-none quand le menu fullscreen est ouvert : le
+          header (z-11000) reste au-dessus de l'overlay (z-10999) pour montrer
+          la croix — sans ça, tout geste de scroll qui démarre dans la bande
+          des ~64px du header est avalé par lui et le menu ne bouge pas. Le
+          bouton burger/croix garde pointer-events-auto pour rester cliquable. */}
+      <header className={`!fixed inset-x-0 top-0 w-full z-[11000] transition-all duration-300 ${isExploreOpen ? 'max-lg:pointer-events-none' : ''}`}>
         <div className="absolute inset-0 pointer-events-none z-0 bg-gradient-to-b from-black/90 via-black/70 to-transparent" aria-hidden="true" />
         <div className="relative z-10">
           <div className="max-w-[1400px] 2xl:max-w-[1600px] mx-auto">
@@ -521,7 +595,7 @@ const Header: React.FC = () => {
 
                 {/* Mobile/Tablet: Burger → ouvre fullscreen explore */}
                 <motion.button
-                  className="lg:hidden p-1.5 text-gray-400 hover:text-white transition-colors"
+                  className="lg:hidden p-1.5 text-gray-400 hover:text-white transition-colors pointer-events-auto"
                   whileTap={{ scale: 0.9 }}
                   onClick={() => setIsExploreOpen(!isExploreOpen)}
                   data-explore-trigger
@@ -587,52 +661,73 @@ const Header: React.FC = () => {
       </header>
 
       {/* Fullscreen Explore Menu (Mobile/Tablet) */}
-      <AnimatePresence>
-        {isExploreOpen && (
-          <motion.div
-            className="lg:hidden fixed inset-0 z-[10999]"
-            style={{ touchAction: 'pan-y' }}
-            initial={{ opacity: 0, y: 40 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 40 }}
-            transition={{ duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
-          >
-            <SquareBackground
-              squareSize={48}
-              borderColor="rgba(239, 68, 68, 0.2)"
-              className="h-full bg-black"
+      {/* Porté dans la racine de surcouches (enfant direct de <body>) plutôt
+          que rendu sur place. Sur place, la chaîne d'ancêtres du menu est
+          #movix-fullscreen-host (`relative overflow-clip`) → #root
+          (`overflow-x: clip`) → body (`position: relative; overflow-x: clip`).
+          C'est la configuration connue pour casser `position: fixed` sur iOS
+          WebKit : l'overlay est clippé ou mal dimensionné de façon
+          intermittente selon l'état de la barre d'outils, et son scroller
+          interne se retrouve avec scrollHeight == clientHeight — le menu
+          s'affiche mais ne défile plus. Le portail sort des deux `clip`
+          intérieurs et rend le dimensionnement de nouveau relatif au viewport. */}
+      {createPortal(
+        <AnimatePresence>
+          {isExploreOpen && (
+            // L'overlay EST le scroller. L'ancienne structure empilait
+            // fixed inset-0 → SquareBackground (`overflow-hidden`, h-full) →
+            // wrapper h-full → scroller h-full : quatre maillons de
+            // height:100% dont WebKit résout parfois un maillon en `auto`, ce
+            // qui rendait le scroller aussi haut que son contenu (donc plus
+            // rien à faire défiler). Sans chaîne, plus de maillon à casser.
+            // Opacity seule : une transform sur un ancêtre du scroller pendant
+            // le mount laisse parfois sa région tactile obsolète dans l'arbre
+            // de scroll asynchrone de WebKit.
+            <motion.div
+              ref={exploreOverlayRef}
+              data-lenis-prevent
+              className="lg:hidden fixed inset-0 z-[10999] overflow-y-auto bg-black"
+              style={{ touchAction: 'pan-y', overscrollBehavior: 'contain' }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
             >
-              {/* Glow effects — radial-gradient au lieu de blur-[100px].
-                  Le blur 100px sur un 400×400 coûte ~3-5ms/frame en composit GPU
-                  tant que le menu est ouvert (coût ∝ rayon²). Le radial-gradient
-                  donne visuellement le même halo doux sans toucher au filter
-                  pipeline → ~0ms. */}
-              <div
-                className="absolute top-0 left-1/2 -translate-x-1/2 w-[600px] h-[600px] pointer-events-none"
-                style={{
-                  background:
-                    'radial-gradient(circle, rgba(220, 38, 38, 0.18) 0%, rgba(220, 38, 38, 0.08) 35%, transparent 70%)',
-                }}
-              />
-              <div className="absolute bottom-0 left-0 right-0 h-[200px] bg-gradient-to-t from-red-950/15 to-transparent pointer-events-none" />
-
-              {/* Contenu scrollable */}
-              {/* max-h borne la hauteur du scroller au viewport. h-full seul =
-                  chaîne de height:100% sur 4 niveaux depuis fixed inset-0 :
-                  Safari/WebKit résout un maillon en `auto` → le scroller prend
-                  la hauteur du contenu, scrollHeight==clientHeight, plus rien à
-                  scroller (overflow clippé par le overflow-hidden de
-                  SquareBackground). 100dvh gère aussi la barre d'outils iOS ;
-                  max-h-screen (100vh) = fallback WebKit sans dvh. */}
-              <div
-                data-lenis-prevent
-                className="relative h-full max-h-screen overflow-y-auto"
-                style={{ maxHeight: '100dvh', WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain' }}
+              {/* Décor en couche `fixed` derrière le contenu : il ne défile pas
+                  et n'entre plus dans la chaîne de hauteur du scroller. */}
+              <SquareBackground
+                squareSize={48}
+                borderColor="rgba(239, 68, 68, 0.2)"
+                className="fixed inset-0 bg-black pointer-events-none"
               >
+                {/* Glow effects — radial-gradient au lieu de blur-[100px].
+                    Le blur 100px sur un 400×400 coûte ~3-5ms/frame en composit GPU
+                    tant que le menu est ouvert (coût ∝ rayon²). Le radial-gradient
+                    donne visuellement le même halo doux sans toucher au filter
+                    pipeline → ~0ms. */}
+                <div
+                  className="absolute top-0 left-1/2 -translate-x-1/2 w-[600px] h-[600px] pointer-events-none"
+                  style={{
+                    background:
+                      'radial-gradient(circle, rgba(220, 38, 38, 0.18) 0%, rgba(220, 38, 38, 0.08) 35%, transparent 70%)',
+                  }}
+                />
+                <div className="absolute bottom-0 left-0 right-0 h-[200px] bg-gradient-to-t from-red-950/15 to-transparent pointer-events-none" />
+              </SquareBackground>
+
+              <div className="relative">
                 {/* Spacer pour le header */}
                 <div className="h-20" />
 
-                <div className="px-5 pb-12 pt-2">
+                {/* Slide d'entrée ici (et pas sur l'overlay) : cf. commentaire
+                    au-dessus du motion.div overlay. */}
+                <motion.div
+                  className="px-5 pb-12 pt-2"
+                  initial={{ y: 40 }}
+                  animate={{ y: 0 }}
+                  exit={{ y: 40 }}
+                  transition={{ duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
+                >
                   {/* Items principaux en haut */}
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
                     {mainNavItems.map((item) => (
@@ -656,12 +751,13 @@ const Header: React.FC = () => {
                   <div className="grid grid-cols-2 gap-4">
                     {allExploreItems.map((item) => renderExploreCard(item))}
                   </div>
-                </div>
+                </motion.div>
               </div>
-            </SquareBackground>
-          </motion.div>
-        )}
-      </AnimatePresence>
+            </motion.div>
+          )}
+        </AnimatePresence>,
+        getOverlayPortalRoot(),
+      )}
 
       {/* Mobile Search Overlay */}
       <AnimatePresence>
@@ -699,7 +795,7 @@ const Header: React.FC = () => {
 
       {/* Autocomplete dropdown (shared between desktop & mobile search) */}
       <AnimatePresence>
-        {showAutocomplete && autocompleteSuggestions.length > 0 && (
+        {showAutocomplete && ageFilteredAutocomplete.length > 0 && (
           <motion.div
             ref={autocompleteRef}
             className="bg-black/95 border border-white/15 rounded-xl shadow-2xl z-[12000] overflow-hidden"
@@ -716,7 +812,7 @@ const Header: React.FC = () => {
                 </div>
               ) : (
                 <ul>
-                  {autocompleteSuggestions.map((item: any) => (
+                  {ageFilteredAutocomplete.map((item: any) => (
                     <li key={item.id} className="px-2">
                       <button
                         className="w-full flex items-center py-2 px-3 hover:bg-white/5 rounded-lg transition-colors"

@@ -7,6 +7,7 @@ import { useSafeRemarkGfm } from '../utils/markdownPlugins';
 import remarkEmoji from 'remark-emoji';
 import { useTranslation } from 'react-i18next';
 import EmojiAutocomplete from './EmojiAutocomplete';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 interface MarkdownToolbarProps {
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -167,7 +168,7 @@ const MarkdownHelpModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({
         </motion.div>
       )}
     </AnimatePresence>,
-    document.body
+    getOverlayPortalRoot()
   );
 };
 

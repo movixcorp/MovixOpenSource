@@ -1,5 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
+import { ADMIN_BYPASS_TOKEN, resolveTurnstileBypass } from '../utils/turnstileBypass';
+
 const TURNSTILE_INVISIBLE_SITEKEY = import.meta.env.VITE_TURNSTILE_INVISIBLE_SITEKEY;
 const TOKEN_REFRESH_MS = 250_000;
 const TURNSTILE_WAIT_TIMEOUT_MS = 10_000;
@@ -138,13 +140,20 @@ export const TurnstileProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     cleanupWidget();
   }, [cleanupWidget]);
 
-  const getValidToken = useCallback((): Promise<string> => {
+  const getValidToken = useCallback(async (): Promise<string> => {
+    // Dispense admin : aucun challenge, et le widget invisible n'est même pas
+    // construit. Le serveur tranche de son côté sur le JWT qu'il vérifie ; ce
+    // jeton n'est qu'un marqueur d'interface (`utils/turnstileBypass.ts`).
+    if (await resolveTurnstileBypass() === 'bypass') {
+      return ADMIN_BYPASS_TOKEN;
+    }
+
     if (!TURNSTILE_INVISIBLE_SITEKEY) {
-      return Promise.resolve('');
+      return '';
     }
 
     if (token && tokenTimestamp.current && Date.now() - tokenTimestamp.current < TOKEN_REFRESH_MS) {
-      return Promise.resolve(token);
+      return token;
     }
 
     return new Promise<string>((resolve) => {

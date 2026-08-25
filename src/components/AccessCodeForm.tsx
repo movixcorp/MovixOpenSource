@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Crown } from 'lucide-react';
 import { useVipModal } from '../context/VipModalContext';
@@ -18,7 +17,6 @@ const AccessCodeForm: React.FC<AccessCodeFormProps> = ({ isModal = false, hideNo
   const { t } = useTranslation();
   const [code, setCode] = useState('');
   const { checkAccessCode, error } = useAuth();
-  const navigate = useNavigate();
   const [showVipInfo, setShowVipInfo] = useState(false);
   const [isClosingVipInfo, setIsClosingVipInfo] = useState(false);
   const { closeVipModal } = useVipModal();
@@ -62,7 +60,8 @@ const AccessCodeForm: React.FC<AccessCodeFormProps> = ({ isModal = false, hideNo
           closeVipModal();
         }
         
-        navigate('/');
+        // Conserver la page en cours (film, lecteur, rÃ©glagesâ€¦) aprÃ¨s
+        // l'activation : seule la modal VIP se ferme si elle Ã©tait ouverte.
       }
     } catch (error) {
       console.error('Error checking access code:', error);

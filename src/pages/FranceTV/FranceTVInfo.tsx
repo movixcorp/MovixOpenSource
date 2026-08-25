@@ -4,7 +4,7 @@ import { ArrowLeft, Clock, Film, Tv2, Users, Award, ChevronDown, Loader2, AlertC
 import { useParams, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { isUserVip } from '../../utils/authUtils';
-import { MAIN_API, buildProxyUrl } from '../../config/runtime';
+import { MAIN_API } from '../../config/runtime';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../../components/ui/select';
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
@@ -31,6 +31,8 @@ interface EpisodeInfo {
   program: string;
   description: string;
   url: string;
+  // Jeton signé émis par l'API : c'est lui qu'on transporte, pas l'URL.
+  url_token?: string | null;
   thumbnail: string | null;
   season: number | null;
   episode: number | null;
@@ -124,8 +126,9 @@ const FranceTVInfo: React.FC = () => {
       setLoading(true);
       setError(null);
       try {
-        const decodedUrl = decodeURIComponent(atob(encoded));
-        const res = await fetch(`${MAIN_API}/api/ftv/info?url=${encodeURIComponent(decodedUrl)}`);
+        // `encoded` est le jeton signé remis par l'API : on le rend tel quel,
+        // le serveur y retrouve l'URL qu'il avait lui-même émise.
+        const res = await fetch(`${MAIN_API}/api/ftv/info?token=${encodeURIComponent(encoded)}`);
         if (!res.ok) throw new Error(t('francetv.errorGeneric', { status: res.status }));
         const data = await res.json();
         if (!data.success) throw new Error(data.error || t('francetv.dataUnavailable'));
@@ -139,9 +142,8 @@ const FranceTVInfo: React.FC = () => {
     fetchInfo();
   }, [encoded]);
 
-  const navigateToPlayer = (url: string) => {
-    const enc = btoa(encodeURIComponent(url));
-    navigate(`/ftv/watch/${enc}`);
+  const navigateToPlayer = (token?: string | null) => {
+    if (token) navigate(`/ftv/watch/${token}`);
   };
 
   // ─── Loading state ────────────────────────────────────────────────────────
@@ -191,7 +193,7 @@ const FranceTVInfo: React.FC = () => {
           {data.thumbnail && (
             <>
               <img
-                src={buildProxyUrl(data.thumbnail)}
+                src={data.thumbnail}
                 alt=""
                 className="absolute inset-0 w-full h-full object-cover"
               />
@@ -263,7 +265,7 @@ const FranceTVInfo: React.FC = () => {
               {/* Watch button */}
               {encoded && (
                 <button
-                  onClick={() => navigateToPlayer(decodeURIComponent(atob(encoded)))}
+                  onClick={() => navigateToPlayer(encoded)}
                   className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 rounded-xl text-white font-semibold transition-colors cursor-pointer"
                 >
                   <Play className="w-5 h-5" fill="white" />
@@ -318,7 +320,7 @@ const FranceTVInfo: React.FC = () => {
           {data.thumbnail && (
             <>
               <img
-                src={buildProxyUrl(data.thumbnail)}
+                src={data.thumbnail}
                 alt=""
                 className="absolute inset-0 w-full h-full object-cover"
               />
@@ -466,13 +468,13 @@ const FranceTVInfo: React.FC = () => {
                   transition={{ delay: i * 0.03 }}
                   className="group flex gap-4 p-3 rounded-xl bg-zinc-900/50 border border-zinc-800/50 
                     hover:border-zinc-700/50 hover:bg-zinc-800/50 transition-all cursor-pointer"
-                  onClick={() => navigateToPlayer(ep.url)}
+                  onClick={() => navigateToPlayer(ep.url_token)}
                 >
                   {/* Thumbnail */}
                   <div className="relative flex-shrink-0 w-40 md:w-48 aspect-video rounded-lg overflow-hidden bg-zinc-800">
                     {ep.thumbnail ? (
                       <img
-                        src={buildProxyUrl(ep.thumbnail!)}
+                        src={ep.thumbnail!}
                         alt={ep.title}
                         className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                         loading="lazy"

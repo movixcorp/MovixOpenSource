@@ -66,7 +66,6 @@ Ce n'est pas un simple duo "frontend + backend". Une feature peut très vite tra
 | `API/Mainapi/` | Backend principal clusterisé | [Main API](API/Mainapi/README.md) |
 | `API/watchpartyAPI/` | Service temps réel WatchParty | [WatchParty API](API/watchpartyAPI/README.md) |
 | `API/proxiesembed/` | Proxy aiohttp pour embeds, flux et DRM | [Proxies Embed](API/proxiesembed/README.md) |
-| `API/miscs/` | Micro-service Flask pour certains 403 | [bypass403](API/miscs/README.md) |
 | `extension/` + `userscript/` | Outils navigateur Movix | [Movix OS](README_MOVIX_OS.md) |
 | `app/` | App mobile React Native (Android OK, iOS non testé) | [App mobile](app/README.md) |
 | `wasm/watchparty-sync/` | Moteur Rust/WASM de la Sync Pro | [WatchParty Sync WASM](wasm/watchparty-sync/README.md) |
@@ -81,16 +80,14 @@ movix-main/
 |-- API/
 |   |-- Mainapi/                # Backend actif
 |   |-- watchpartyAPI/          # Temps réel WatchParty
-|   |-- proxiesembed/           # Proxy Python haute charge
-|   `-- miscs/                  # Micro-services annexes
+|   `-- proxiesembed/           # Proxy Python haute charge
 |-- extension/                  # Extension Chrome / Firefox
 |-- userscript/                 # Variante Tampermonkey
 |-- app/                        # App mobile React Native (Android/iOS)
 |-- wasm/watchparty-sync/       # Sync Pro en Rust/WASM
 |-- cloudflareproxy/            # Worker Cloudflare
 |-- functions/                  # Handlers serverless annexes
-|-- PreMid/                     # Présence PreMiD
-`-- RivestreamCloudflareProxy/  # Variante de worker pour Rivestream
+`-- PreMid/                     # Présence PreMiD
 ```
 
 ## Démarrage rapide
@@ -133,19 +130,7 @@ cp API/watchpartyAPI/.env.example API/watchpartyAPI/.env
 
 # Proxy embed
 cp API/proxiesembed/.env.example API/proxiesembed/.env
-
-# bypass403
-cp API/miscs/.env.example API/miscs/.env
 ```
-
-Initialise ensuite le schéma de l'API principale avant de démarrer les services :
-
-```bash
-cd API/Mainapi
-npm run db:init
-```
-
-Sur une base existante, la commande demande confirmation ; elle en demande une seconde pour les modifications des tables Wrapped, qui peuvent être longues si elles sont volumineuses.
 
 ### Lancer le minimum utile en local
 
@@ -174,13 +159,6 @@ pip install -r requirements.txt
 python server.py
 ```
 
-```bash
-# bypass403
-cd API/miscs
-pip install flask requests python-dotenv
-python bypass403.py
-```
-
 ## Configuration
 
 Les fichiers d'exemple ou de config existants sont déjà dans le repo :
@@ -189,9 +167,8 @@ Les fichiers d'exemple ou de config existants sont déjà dans le repo :
 - API principale : `API/Mainapi/.env.example`
 - WatchParty : `API/watchpartyAPI/.env.example`
 - Proxy embed : `API/proxiesembed/.env.example`
-- bypass403 : `API/miscs/.env.example`
 
-Les variables frontend les plus importantes sont `VITE_MAIN_API`, `VITE_WATCHPARTY_API`, `VITE_PROXY_BASE_URL`, `VITE_API_PROXY_BASE_URL`, `VITE_PROXIES_EMBED_API` et `VITE_SITE_URL`.
+Les variables frontend les plus importantes sont `VITE_MAIN_API`, `VITE_WATCHPARTY_API`, `VITE_PROXIES_EMBED_API` et `VITE_SITE_URL`.
 
 Pour un premier lancement local, configure au minimum :
 
@@ -223,7 +200,6 @@ Pour un premier lancement local, configure au minimum :
 - [Main API](API/Mainapi/README.md)
 - [WatchParty API](API/watchpartyAPI/README.md)
 - [Proxies Embed](API/proxiesembed/README.md)
-- [bypass403](API/miscs/README.md)
 - [Movix OS](README_MOVIX_OS.md)
 - [Extension navigateur](extension/README.md)
 - [Userscript Tampermonkey](userscript/README.md)

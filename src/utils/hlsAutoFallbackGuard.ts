@@ -29,8 +29,6 @@ const DIRECT_WATCH_SOURCE_TYPES = new Set([
   'nexus_hls',
   'nexus_file',
   'm3u8',
-  'rivestream',
-  'rivestream_hls',
   'bravo',
 ]);
 

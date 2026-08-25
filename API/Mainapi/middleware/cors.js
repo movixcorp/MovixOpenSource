@@ -7,18 +7,25 @@ const cors = require("cors");
 const { getOAuthAllowedCorsOrigins } = require('../utils/oauthClients');
 
 const STATIC_ALLOWED_DOMAINS = [
-  'movix.date',
-  'movix.chat',
-  'movix.cloud',
-  'movix.cash',
-  'movix.blog',
-  'movix.rodeo',
-  'movix.club',
-  'movix.site',
-  'movix11.pages.dev',
-  'nakios.site',
-  'cinezo.site',
-  'filmib.cc'
+    'localhost:3000',
+    'movix.blog',
+    'movix.rodeo',
+    'movix.club',
+    'movix.site',
+    'movix11.pages.dev',
+    'nakios.site',
+    'cinezo.site',
+    'cinezo.online',
+    'filmib.cc',
+    'movix.llc',
+    'movix.cash',
+    'movix.tax',
+    'movix.cloud',
+    'movix.golf',
+    'movix.chat',
+    'movix.date',
+    'movix.show',
+    'movix.fun'
 ];
 
 function isAllowedStaticOrigin(origin) {
@@ -67,6 +74,7 @@ const corsMiddleware = cors({
     "sentry-trace",
     "x-profile-id",
     "x-access-key",
+    "x-movix-client-id",
   ],
   credentials: true,
   optionsSuccessStatus: 204,

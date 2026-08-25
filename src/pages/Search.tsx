@@ -17,6 +17,7 @@ import { getCountries } from '../data/countries';
 import CustomSlider from '../components/CustomSlider';
 import { SearchGridCard, SearchListCard } from '../components/SearchCard';
 import ReactCountryFlag from 'react-country-flag';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 type ViewType = 'grid' | 'list';
 
@@ -249,6 +250,9 @@ const Search: React.FC = () => {
         }
         return filtered;
     }, [autocompleteSuggestions, filterUnreleased, filterNoContent, minRating]);
+
+    const { items: ageFilteredResults, isFiltering: isFilteringResultsByAge } = useAgeRestrictedContent(filteredResults);
+    const { items: ageFilteredAutocomplete } = useAgeRestrictedContent(filteredAutocompleteSuggestions);
 
     // Handle clicks outside suggestion dropdowns
     useEffect(() => {
@@ -639,7 +643,7 @@ const Search: React.FC = () => {
 
                                     {/* Autocomplete Dropdown */}
                                     <AnimatePresence>
-                                        {showAutocomplete && filteredAutocompleteSuggestions.length > 0 && (
+                                        {showAutocomplete && ageFilteredAutocomplete.length > 0 && (
                                             <motion.div
                                                 ref={autocompleteRef}
                                                 initial={{ opacity: 0, y: -10 }}
@@ -655,7 +659,7 @@ const Search: React.FC = () => {
                                                     </div>
                                                 ) : (
                                                     <div>
-                                                        {filteredAutocompleteSuggestions.map((item) => (
+                                                        {ageFilteredAutocomplete.map((item) => (
                                                             <div
                                                                 key={`${item.id}-${item.media_type}`}
                                                                 onClick={() => handleSelectAutocomplete(item)}
@@ -1231,7 +1235,7 @@ const Search: React.FC = () => {
                     transition={{ delay: 0.7 }}
                     className="px-4 md:px-6"
                 >
-                    {loading ? (
+                    {loading || isFilteringResultsByAge ? (
                         <motion.div
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
@@ -1241,7 +1245,7 @@ const Search: React.FC = () => {
                         >
                             <GridSkeleton />
                         </motion.div>
-                    ) : filteredResults.length === 0 ? (
+                    ) : ageFilteredResults.length === 0 ? (
                         <div className="flex flex-col items-center justify-center py-20">
                             <Film className="w-16 h-16 text-white opacity-10 mb-4" />
                             <p className="text-white/40">{t('search.noResults')}</p>
@@ -1259,7 +1263,7 @@ const Search: React.FC = () => {
                                     {/* Results controls bar */}
                                     <div className="flex items-center justify-between flex-wrap gap-4 mb-6">
                                         <p className="text-sm text-white/40">
-                                            {t('search.pageXOfY', { current: Math.max(page > 1 ? page - 1 : 1, 1), total: maxPages })} ({filteredResults.length} {t('search.results')})
+                                            {t('search.pageXOfY', { current: Math.max(page > 1 ? page - 1 : 1, 1), total: maxPages })} ({ageFilteredResults.length} {t('search.results')})
                                             {totalPages > 500 && <span className="text-xs ml-2">({t('search.limitedToPages')})</span>}
                                         </p>
 
@@ -1302,7 +1306,7 @@ const Search: React.FC = () => {
                             {/* Grid View */}
                             {viewType === 'grid' && (
                                 <div className={`grid ${getGridClasses()} gap-3`}>
-                                    {filteredResults.map((item, index) => (
+                                    {ageFilteredResults.map((item, index) => (
                                         <SearchGridCard
                                             key={`${item.id}-${item.media_type}-${index}`}
                                             item={item}
@@ -1317,7 +1321,7 @@ const Search: React.FC = () => {
                             {/* List View */}
                             {viewType === 'list' && (
                                 <div className="flex flex-col gap-3">
-                                    {filteredResults.map((item, index) => (
+                                    {ageFilteredResults.map((item, index) => (
                                         <SearchListCard
                                             key={`${item.id}-${item.media_type}-${index}`}
                                             item={item}
@@ -1333,7 +1337,7 @@ const Search: React.FC = () => {
                             )}
 
                             {/* Bottom pagination */}
-                            {filteredResults.length > 0 && (
+                            {ageFilteredResults.length > 0 && (
                                 <div className="mt-8 text-center">
                                     <p className="text-sm text-white/40 mb-2">
                                         {t('search.pageXOfY', { current: Math.max(page > 1 ? page - 1 : 1, 1), total: maxPages })}

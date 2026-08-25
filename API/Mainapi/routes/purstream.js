@@ -14,9 +14,14 @@ const router = express.Router();
 const { generateCacheKey, CACHE_DIR } = require('../utils/cacheManager');
 const { fetchTmdbDetails, fetchTmdbImages } = require('../utils/tmdbCache');
 const { pickRandomProxy, getProxyAgent } = require('../utils/proxyManager');
+const { buildSignedProxyUrl, signingConfigured } = require('../utils/mediaSigning');
 
-const PURSTREAM_BASE = 'https://api.purstream.cc/api/v1';
+// Repli statique si `/api/status` est injoignable. `api.purstream.cc` est mort
+// (404) : le repli ne servait plus qu'à masquer la panne.
+const PURSTREAM_BASE = 'https://api.purstream.id/api/v1';
+const PURSTREAM_STATUS_URL = 'https://purstream.wiki/api/status';
 const PURSTREAM_CACHE_DIR = CACHE_DIR.PURSTREAM;
+const PURSTREAM_STATUS_TTL_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Dependencies injected via configure()
@@ -29,6 +34,10 @@ let getFromCacheNoExpiration;
 let saveToCache;
 let shouldUpdateCache;
 
+let purstreamApiBase = PURSTREAM_BASE;
+let purstreamApiBaseCheckedAt = 0;
+let purstreamApiBaseLoading = null;
+
 function configure(deps) {
   if (deps.TMDB_API_KEY) TMDB_API_KEY = deps.TMDB_API_KEY;
   if (deps.TMDB_API_URL) TMDB_API_URL = deps.TMDB_API_URL;
@@ -39,12 +48,82 @@ function configure(deps) {
   if (deps.shouldUpdateCache) shouldUpdateCache = deps.shouldUpdateCache;
 }
 
+/** Appel interne PurStream status endpoint */
+async function purstreamStatusRequest() {
+  return axios({
+    url: PURSTREAM_STATUS_URL,
+    method: 'get',
+    timeout: 10000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+      'Accept': 'application/json'
+    }
+  });
+}
+
+function normalizePurstreamDomain(domain) {
+  const trimmed = domain.trim();
+  const withoutProtocol = trimmed.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+
+  // `/api/status` renvoie le domaine nu du service (« purstream.id »), pas
+  // l'hôte de son API — celle-ci vit sur le sous-domaine `api.`. Servi tel
+  // quel, `https://purstream.id/api/v1/...` répond 200 avec le HTML du site :
+  // axios ne lève rien, `data.type` reste undefined, et toute recherche paraît
+  // sans résultat avant de se figer en négatif caché. On préfixe donc, sauf si
+  // le statut a déjà donné un hôte `api.`.
+  const host = withoutProtocol.split('/')[0];
+  const path = withoutProtocol.slice(host.length);
+  const apiHost = /^api\./i.test(host) ? host : `api.${host}`;
+
+  return `https://${apiHost}${path}/api/v1`;
+}
+
+async function resolvePurstreamApiBase(force = false) {
+  const now = Date.now();
+  if (!force && purstreamApiBase && now - purstreamApiBaseCheckedAt < PURSTREAM_STATUS_TTL_MS) {
+    return purstreamApiBase;
+  }
+
+  if (purstreamApiBaseLoading) {
+    await purstreamApiBaseLoading;
+    return purstreamApiBase;
+  }
+
+  purstreamApiBaseLoading = (async () => {
+    try {
+      const response = await purstreamStatusRequest();
+      const domain = typeof response?.data?.domain === 'string' ? response.data.domain.trim() : '';
+      if (domain) {
+        purstreamApiBase = normalizePurstreamDomain(domain);
+      } else {
+        console.warn('[PURSTREAM] Réponse status invalide: domaine manquant, fallback base statique');
+        purstreamApiBase = PURSTREAM_BASE;
+      }
+    } catch (err) {
+      purstreamApiBase = purstreamApiBase || PURSTREAM_BASE;
+      console.warn('[PURSTREAM] Impossible de récupérer le statut pour la résolution d\'API, fallback:', err.message);
+    } finally {
+      purstreamApiBaseCheckedAt = Date.now();
+      purstreamApiBaseLoading = null;
+    }
+  })();
+
+  await purstreamApiBaseLoading;
+  return purstreamApiBase;
+}
+
 /** Wrap une URL m3u8 dans le proxy cinep si VIP et PROXY_SERVER_URL configuré */
 function wrapSourceUrl(url, isVip) {
   if (isVip && PROXY_SERVER_URL && url) {
-    // PROXY_SERVER_URL = "https://proxy.movix.cloud/proxy" → on veut la base sans /proxy
+    // PROXY_SERVER_URL pointe sur proxiesembed (.../proxy) → on veut la base sans /proxy
     const serverBase = PROXY_SERVER_URL.replace(/\/proxy\/?$/, '').replace(/\/+$/, '');
-    return `${serverBase}/cinep-proxy?url=${encodeURIComponent(url)}`;
+    // /cinep-proxy n'accepte plus qu'une URL signée : sans signature le player
+    // recevrait un 403 à la lecture.
+    if (!signingConfigured()) {
+      console.error('[PURSTREAM] MEDIA_SIGNING_SECRET absent — URL non proxifiable');
+      return url;
+    }
+    return buildSignedProxyUrl(serverBase, '/cinep-proxy', url);
   }
   return url;
 }
@@ -53,9 +132,10 @@ function wrapSourceUrl(url, isVip) {
 async function purstreamRequest(urlPath) {
   const proxy = pickRandomProxy();
   const agent = proxy ? getProxyAgent(proxy) : null;
+  const apiBase = await resolvePurstreamApiBase();
 
   return axios({
-    url: `${PURSTREAM_BASE}${urlPath}`,
+    url: `${apiBase}${urlPath}`,
     method: 'get',
     timeout: 10000,
     headers: {
@@ -84,6 +164,11 @@ async function resolvePurstreamId(tmdbId, type) {
       if (stale) {
         backgroundUpdateMapping(tmdbId, type, cacheKey).catch(() => {});
       }
+      // Sans cette ligne, un négatif en cache se rejoue en silence : la route
+      // répond 404 sans qu'aucune trace ne dise d'où vient l'absence.
+      console.warn(
+        `[PURSTREAM] ${type}:${tmdbId} absent (négatif en cache${stale ? ', rafraîchissement en tâche de fond' : ''})`
+      );
       return null;
     }
     const stale = await shouldUpdateCache(PURSTREAM_CACHE_DIR, cacheKey);
@@ -147,6 +232,17 @@ async function fetchAndCacheMapping(tmdbId, type, cacheKey) {
             allItems.push(item);
           }
         }
+      } else {
+        // Un 200 qui n'est pas la réponse attendue (page HTML servie par le
+        // site quand la base d'API est mal résolue, page d'erreur d'un CDN…)
+        // n'est PAS une absence de résultat : le compter comme tel graverait
+        // un négatif en cache pour un titre qui existe.
+        searchError = true;
+        console.warn(
+          `[PURSTREAM] Réponse inattendue pour "${query}" via ${purstreamApiBase} ` +
+          `(HTTP ${response.status}, ${response.headers?.['content-type'] || 'content-type inconnu'}, ` +
+          `type=${response.data?.type ?? 'absent'})`
+        );
       }
     } catch (err) {
       searchError = true;
@@ -156,10 +252,16 @@ async function fetchAndCacheMapping(tmdbId, type, cacheKey) {
 
   // Erreur réseau/429/5xx → ne PAS cacher (résultat temporaire)
   if (allItems.length === 0 && searchError) {
+    console.warn(
+      `[PURSTREAM] Recherche indisponible pour ${type}:${tmdbId} "${tmdbTitle}" — non caché, réessai au prochain appel`
+    );
     return null;
   }
 
   if (allItems.length === 0) {
+    console.warn(
+      `[PURSTREAM] Aucun résultat de recherche pour ${type}:${tmdbId} (requêtes: ${searchQueries.join(' | ')})`
+    );
     await saveToCache(PURSTREAM_CACHE_DIR, cacheKey, NOT_FOUND_MARKER);
     return null;
   }
@@ -266,6 +368,7 @@ router.get('/movie/:tmdbId/stream', async (req, res) => {
 
     const mapping = await resolvePurstreamId(tmdbId, 'movie');
     if (!mapping) {
+      console.warn(`[PURSTREAM] 404 /movie/${tmdbId}/stream — aucun mapping TMDB → PurStream`);
       return res.status(404).json({ error: 'Film non trouvé sur PurStream' });
     }
 
@@ -338,6 +441,9 @@ router.get('/tv/:tmdbId/stream', async (req, res) => {
 
     const mapping = await resolvePurstreamId(tmdbId, 'tv');
     if (!mapping) {
+      console.warn(
+        `[PURSTREAM] 404 /tv/${tmdbId}/stream s${season}e${episode} — aucun mapping TMDB → PurStream`
+      );
       return res.status(404).json({ error: 'Série non trouvée sur PurStream' });
     }
 

@@ -406,7 +406,7 @@ html {
 }
 
 body {
-  overflow-x: hidden;
+  overflow-x: clip;
   width: 100vw;
   position: relative;
   background-color: var(--background-dark);
@@ -415,7 +415,7 @@ body {
 }
 
 #root {
-  overflow-x: hidden;
+  overflow-x: clip;
   width: 100%;
 }
 
@@ -1436,4 +1436,101 @@ body,
 .square-corners *::before,
 .square-corners *::after {
   border-radius: 0 !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Plein écran du lecteur porté par le conteneur racine de l'app
+   (#movix-fullscreen-host, voir utils/playerFullscreenPersistence.ts).
+
+   L'élément plein écran doit survivre au remontage du lecteur d'un
+   épisode à l'autre — sinon le navigateur quitte le plein écran, et
+   le rétablir exigerait une nouvelle activation utilisateur, que
+   Firefox n'accorde que dans un vrai gestionnaire d'événement.
+   L'hôte étant la racine de l'app, c'est au lecteur d'occuper
+   lui-même tout l'écran.
+   ═══════════════════════════════════════════════════════════════ */
+#movix-fullscreen-host:fullscreen {
+  /* Le lecteur est en position: fixed ; rien ne doit le rogner. */
+  overflow: visible;
+  background: #000;
+}
+
+/* Anciens moteurs : un sélecteur inconnu invalide toute la règle, d'où les
+   déclarations séparées plutôt qu'une liste de sélecteurs. */
+#movix-fullscreen-host:-webkit-full-screen {
+  overflow: visible;
+  background: #000;
+}
+
+#movix-fullscreen-host:-moz-full-screen {
+  overflow: visible;
+  background: #000;
+}
+
+.video-container.player-fullscreen-fill {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border-radius: 0;
+  background: #000;
+  /* Au-dessus des overlays de la page lecteur (z-index max ~10002). */
+  z-index: 2147483000;
+}
+
+.video-container.player-fullscreen-fill video {
+  width: 100%;
+  height: 100%;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Racine des portails (menus, listes de sélection, modales)
+
+   Voir utils/overlayPortal.ts : un élément en plein écran est seul
+   peint, avec sa descendance. Les surcouches portées dans `body`
+   restaient donc invisibles. Elles partagent maintenant cette
+   racine, que le module déplace dans l'élément plein écran.
+
+   Hors plein écran, `display: contents` ne génère aucune boîte :
+   les enfants se comportent comme s'ils étaient dans `body`, donc
+   rien ne change pour l'affichage habituel.
+   ═══════════════════════════════════════════════════════════════ */
+#movix-overlay-root {
+  display: contents;
+}
+
+#movix-overlay-root[data-fullscreen='true'] {
+  display: block;
+  position: fixed;
+  inset: 0;
+  /* Au-dessus du lecteur, qui monte déjà à 2147483000 en plein écran. */
+  z-index: 2147483647;
+  /* Sinon la racine, qui couvre l'écran, avalerait les clics sur les
+     contrôles du lecteur même sans surcouche ouverte. */
+  pointer-events: none;
+}
+
+#movix-overlay-root[data-fullscreen='true'] > * {
+  pointer-events: auto;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Titres de section — lisibilité de la sélection
+
+   Ces titres sont un dégradé découpé sur le texte
+   (`background-clip: text` + `color: transparent`). Sélectionnés,
+   il ne restait qu'un rectangle de surlignage vide : le texte était
+   bien copié, mais invisible pendant la sélection. On lui redonne
+   une couleur pleine. Posé ici, et non dans le bloc de styles d'une
+   page, parce que la même classe sert sur l'accueil, Films, Animés
+   et les pages fournisseur.
+   ═══════════════════════════════════════════════════════════════ */
+.section-title::selection,
+.section-title *::selection {
+  color: #ffffff;
+  -webkit-text-fill-color: #ffffff;
+  background: rgba(239, 68, 68, 0.45);
 }

@@ -1,4 +1,4 @@
-const express = require("express");
+﻿﻿const express = require("express");
 const router = express.Router();
 const fs = require("fs").promises;
 const path = require("path");
@@ -9,6 +9,14 @@ const { verifyAccessKey } = require("./checkVip");
 // Réutiliser l'instance Redis partagée au lieu d'en créer une nouvelle (évite les fuites mémoire)
 const { redis } = require("./config/redis");
 const { verifyTurnstileFromRequest } = require("./utils/turnstile");
+// Signalement d'une proposition de sequence deposee depuis le lecteur : elle
+// n'a rien d'un commentaire, mais elle se modere au meme endroit, avec les
+// memes etats et les memes notifications. Voir `target_type = 'segment'`.
+const {
+  deleteSubmissionAsModerator,
+  ensureReportSchema: ensureSegmentReportSchema,
+  getSubmissionRow: getSegmentSubmissionRow,
+} = require("./services/mediaSegments/communityStore");
 const webpush = require("web-push");
 
 // === Web Push VAPID config ===
@@ -121,6 +129,18 @@ function decodeHtmlEntities(text) {
   });
 }
 
+// Champs internes jamais exposés au public (fuite de données perso).
+// Les routes /admin/* gardent l'accès brut (bannissement par IP).
+const PRIVATE_ROW_FIELDS = ["ip_address"];
+
+// Retire les champs privés d'une ligne SQL avant de la renvoyer au client.
+function stripPrivateFields(row) {
+  if (!row || typeof row !== "object") return row;
+  const safe = { ...row };
+  for (const field of PRIVATE_ROW_FIELDS) delete safe[field];
+  return safe;
+}
+
 // Decode legacy escaped content before returning it to the frontend.
 function formatContentForResponse(text) {
   let formatted = normalizeCommentContent(text);
@@ -136,12 +156,7 @@ function formatContentForResponse(text) {
   return formatted;
 }
 
-// ZZAPI Configuration for content moderation
-const ZZAPI_API_KEY = process.env.ZZAPI_API_KEY;
-const ZZAPI_API_URL = "https://zzapi.cc/v1/chat/completions";
-const ZZAPI_MODEL = "claude-haiku-4-5-20251001";
-
-// OpenRouter Fallback Configuration
+// OpenRouter API Configuration for content moderation (using DeepSeek V4 Flash)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "deepseek/deepseek-v4-flash";
@@ -168,61 +183,31 @@ Critères de modération (s'appliquent au pseudo ET au commentaire). Ne flag QUE
 Réponds UNIQUEMENT avec ce format JSON (sans markdown, sans backticks):
 {"flagged": true/false, "reason": "INSULTES" ou "EROTIQUE" ou "DEMANDE_AJOUT" ou "PSEUDO_INAPPROPRIE" ou null, "details": "explication courte"}`;
 
-    let responseText = "";
-    try {
-      // Primary API: ZZAPI
-      const response = await axios.post(
-        ZZAPI_API_URL,
-        {
-          model: ZZAPI_MODEL,
-          messages: [
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-          max_tokens: 500,
-          temperature: 0.1,
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${ZZAPI_API_KEY}`,
-            "HTTP-Referer": FRONTEND_BASE_URL,
-            "X-Title": "Movix Comment Moderation",
+    const response = await axios.post(
+      OPENROUTER_API_URL,
+      {
+        model: OPENROUTER_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
           },
-          timeout: 15000,
+        ],
+        max_tokens: 500,
+        temperature: 0.1,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "HTTP-Referer": FRONTEND_BASE_URL,
+          "X-Title": "Movix Comment Moderation",
         },
-      );
-      responseText = response.data?.choices?.[0]?.message?.content || "";
-    } catch (primaryError) {
-      console.warn("⚠️ ZZAPI failed for moderation, falling back to OpenRouter:", primaryError.message);
-      // Fallback API: OpenRouter
-      const response = await axios.post(
-        OPENROUTER_API_URL,
-        {
-          model: OPENROUTER_MODEL,
-          messages: [
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-          max_tokens: 500,
-          temperature: 0.1,
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-            "HTTP-Referer": FRONTEND_BASE_URL,
-            "X-Title": "Movix Comment Moderation",
-          },
-          timeout: 15000,
-        },
-      );
-      responseText = response.data?.choices?.[0]?.message?.content || "";
-    }
+        timeout: 15000,
+      },
+    );
+
+    const responseText = response.data?.choices?.[0]?.message?.content || "";
 
     // Parser la réponse JSON
     let moderationResult;
@@ -330,13 +315,7 @@ const requireAuth = async (req, res, next) => {
     };
     next();
   } catch (error) {
-    if (error instanceof jwt.JsonWebTokenError) {
-      return res.status(401).json({ error: "Token invalide" });
-    }
-    // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
-    // sinon le front déconnecte l'utilisateur.
-    console.error("[comments][requireAuth] Vérif session impossible:", error.message);
-    return res.status(503).json({ error: "Service temporairement indisponible" });
+    return res.status(401).json({ error: "Token invalide" });
   }
 };
 
@@ -778,6 +757,17 @@ async function getReportNotificationTarget(report) {
           contentType: "shared_list",
           contentId: String(sharedList.share_code || sharedList.id || report.target_id),
           targetId: Number(sharedList.id) || Number(report.target_id) || 0,
+        };
+      }
+    } else if (report.target_type === "segment") {
+      const submission = await getSegmentSubmissionRow(report.target_id);
+      if (submission) {
+        // Le contenu vise, pas la proposition : la notification renvoie le
+        // signaleur sur la fiche du film ou de la serie.
+        return {
+          contentType: submission.media_type,
+          contentId: String(submission.tmdb_id),
+          targetId: Number(report.target_id) || 0,
         };
       }
     }
@@ -1727,7 +1717,7 @@ router.get("/:commentId/replies", async (req, res) => {
         }
 
         return {
-          ...reply,
+          ...stripPrivateFields(reply),
           content: formatContentForResponse(reply.content),
           username: userData.username,
           avatar: userData.avatar,
@@ -1993,7 +1983,7 @@ router.post("/:commentId/replies", requireAuth, writeRateLimit, async (req, res)
     );
 
     res.status(201).json({
-      ...newReply,
+      ...stripPrivateFields(newReply),
       content: formatContentForResponse(newReply.content),
       reactions: 0,
       userReaction: null,
@@ -2058,7 +2048,7 @@ router.put("/replies/:id", requireAuth, writeRateLimit, async (req, res) => {
     );
 
     res.json({
-      ...updatedReply,
+      ...stripPrivateFields(updatedReply),
       content: formatContentForResponse(updatedReply.content),
     });
   } catch (error) {
@@ -3147,8 +3137,47 @@ const VALID_REPORT_REASONS = [
   "unmarked_spoiler",
   "impersonation",
   "other",
+  // Bornes fantaisistes sur une proposition de sequence : c'est le seul motif
+  // qui vaille pour un relevé, et il n'a pas de sens ailleurs.
+  "wrong_timestamp",
 ];
-const VALID_TARGET_TYPES = ["comment", "reply", "shared_list"];
+const VALID_TARGET_TYPES = ["comment", "reply", "shared_list", "segment"];
+
+/** Millisecondes en `h:mm:ss.mmm`, pour lire un relevé d'un coup d'oeil. */
+function formatSegmentMs(totalMs) {
+  const clamped = Math.max(0, Math.round(Number(totalMs) || 0));
+  const ms = clamped % 1000;
+  const totalSeconds = Math.floor(clamped / 1000);
+  const pad = (value, size = 2) => String(value).padStart(size, "0");
+  return `${Math.floor(totalSeconds / 3600)}:${pad(Math.floor(totalSeconds / 60) % 60)}:${pad(totalSeconds % 60)}.${pad(ms, 3)}`;
+}
+
+/**
+ * Proposition de sequence mise en forme pour le panneau d'administration.
+ *
+ * `content_type` / `content_id` sont renseignes avec le contenu vise : c'est ce
+ * couple que le panneau utilise pour aller chercher l'affiche TMDB, exactement
+ * comme pour un commentaire.
+ */
+function formatSegmentTarget(row) {
+  const episode = row.season >= 0 && row.episode >= 0
+    ? ` · S${row.season}E${row.episode}`
+    : "";
+  return {
+    id: Number(row.id),
+    content: `${row.segment_type} · ${formatSegmentMs(row.start_ms)} → ${formatSegmentMs(row.end_ms)}${episode}`,
+    content_type: row.media_type,
+    content_id: String(row.tmdb_id),
+    segment_type: row.segment_type,
+    start_ms: Number(row.start_ms),
+    end_ms: Number(row.end_ms),
+    season: Number(row.season),
+    episode: Number(row.episode),
+    score: Number(row.score),
+    user_id: String(row.author_user_id),
+    created_at: row.created_at instanceof Date ? row.created_at.getTime() : row.created_at,
+  };
+}
 
 // POST /api/comments/report - Créer un signalement
 router.post("/report", requireAuth, reportRateLimit, async (req, res) => {
@@ -3227,6 +3256,33 @@ router.post("/report", requireAuth, reportRateLimit, async (req, res) => {
         return res
           .status(400)
           .json({ error: "Vous ne pouvez pas signaler votre propre liste" });
+      }
+    } else if (targetType === "segment") {
+      // Identifiant strictement numerique : la colonne est un BIGINT, et une
+      // chaine quelconque y serait silencieusement convertie en 0 par MySQL.
+      if (!/^[1-9]\d{0,18}$/.test(String(targetId))) {
+        return res.status(400).json({ error: "targetId invalide" });
+      }
+      // Elargit l'ENUM `target_type` si ce n'est pas encore fait. Volontairement
+      // ici et nulle part ailleurs : cette DDL prend un verrou sur `reports` et
+      // n'a rien a faire sur le chemin de lecture des segments.
+      if (!(await ensureSegmentReportSchema())) {
+        return res
+          .status(503)
+          .json({ error: "Signalement de séquence indisponible" });
+      }
+      const submission = await getSegmentSubmissionRow(targetId);
+      if (!submission)
+        return res.status(404).json({ error: "Proposition non trouvée" });
+      // Le profil ne compte pas ici : une proposition appartient au compte, pas
+      // au profil qui regardait ce soir-là.
+      if (
+        String(submission.author_user_id) === String(userId) &&
+        String(submission.author_user_type) === String(userType)
+      ) {
+        return res.status(400).json({
+          error: "Vous ne pouvez pas signaler votre propre proposition",
+        });
       }
     }
 
@@ -3365,6 +3421,28 @@ router.get("/admin/reports", requireAuth, async (req, res) => {
             } else {
               targetData = { deleted: true };
             }
+          } else if (report.target_type === "segment") {
+            const submission = await getSegmentSubmissionRow(report.target_id);
+            if (submission) {
+              let authorData = { username: "Inconnu", avatar: null };
+              try {
+                authorData = await getUserData(
+                  submission.author_user_id,
+                  submission.author_user_type,
+                );
+              } catch {
+                /* fallback */
+              }
+              targetData = {
+                ...formatSegmentTarget(submission),
+                authorUsername: authorData.username,
+                authorAvatar: authorData.avatar,
+              };
+            } else {
+              // Deja supprimee — par un vote negatif, son auteur ou une autre
+              // resolution. Le signalement reste listable, sans sa cible.
+              targetData = { deleted: true };
+            }
           }
         } catch (err) {
           console.error("Erreur enrichissement report:", err.message);
@@ -3389,7 +3467,8 @@ router.get("/admin/reports", requireAuth, async (req, res) => {
         IFNULL(SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END), 0) as resolved,
         IFNULL(SUM(CASE WHEN status = 'dismissed' THEN 1 ELSE 0 END), 0) as dismissed,
         IFNULL(SUM(CASE WHEN target_type = 'comment' OR target_type = 'reply' THEN 1 ELSE 0 END), 0) as comments,
-        IFNULL(SUM(CASE WHEN target_type = 'shared_list' THEN 1 ELSE 0 END), 0) as lists
+        IFNULL(SUM(CASE WHEN target_type = 'shared_list' THEN 1 ELSE 0 END), 0) as lists,
+        IFNULL(SUM(CASE WHEN target_type = 'segment' THEN 1 ELSE 0 END), 0) as segments
       FROM reports
     `);
 
@@ -3416,6 +3495,7 @@ router.get("/admin/reports", requireAuth, async (req, res) => {
         dismissed: Number(statsResult?.dismissed) || 0,
         comments: Number(statsResult?.comments) || 0,
         lists: Number(statsResult?.lists) || 0,
+        segments: Number(statsResult?.segments) || 0,
       },
       total,
       hasMore: offset + limitNum < total,
@@ -3462,6 +3542,10 @@ router.put("/admin/reports/:id/resolve", requireAuth, async (req, res) => {
           "DELETE FROM shared_lists WHERE share_code = ? OR id = ?",
           [report.target_id, report.target_id],
         );
+      } else if (report.target_type === "segment") {
+        // Les votes suivent la proposition (ON DELETE CASCADE) : rien a
+        // nettoyer de plus, et le consensus la perd au prochain calcul.
+        await deleteSubmissionAsModerator(report.target_id);
       }
     }
 
@@ -3648,7 +3732,7 @@ router.get("/:contentType/:contentId", async (req, res) => {
         }
 
         return {
-          ...comment,
+          ...stripPrivateFields(comment),
           content: formatContentForResponse(comment.content),
           username: userData.username,
           avatar: userData.avatar,
@@ -3844,7 +3928,7 @@ router.post("/", requireAuth, writeRateLimit, async (req, res) => {
     );
 
     res.status(201).json({
-      ...newComment,
+      ...stripPrivateFields(newComment),
       content: formatContentForResponse(newComment.content),
       repliesCount: 0,
       reactions: 0,
@@ -3917,7 +4001,7 @@ router.put("/:id", requireAuth, writeRateLimit, async (req, res) => {
     ]);
 
     res.json({
-      ...updatedComment,
+      ...stripPrivateFields(updatedComment),
       content: formatContentForResponse(updatedComment.content),
     });
   } catch (error) {

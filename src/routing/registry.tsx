@@ -26,6 +26,7 @@ export const ROUTES: RouteEntry[] = [
   { path: '/vip/invoices',            loader: lz(() => import('../pages/VipInvoicesPage')),         fallback: <GridSkeleton /> },
   { path: '/ftv',                     loader: lz(() => import('../pages/FranceTV/FranceTVBrowse')), fallback: <GridSkeleton /> },
   { path: '/top10',                   loader: lz(() => import('../pages/Top10Page')),               fallback: <GridSkeleton /> },
+  { path: '/calendar',                loader: lz(() => import('../pages/CalendarPage')) },
 
   // Provider catalogs
   { path: '/provider/:providerId',                          loader: lz(() => import('../pages/ProviderContent')),       fallback: <GridSkeleton /> },

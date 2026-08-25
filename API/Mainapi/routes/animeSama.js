@@ -15,6 +15,46 @@ const writeFileAtomic = require('write-file-atomic');
 
 const { ANIME_SAMA_CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
 const { memoryCache } = require('../config/redis');
+const { buildM3u8Map } = require('../utils/embedExtraction');
+
+// Anime-Sama est le seul catalogue dont les lecteurs sont des chaînes brutes
+// (`players: ["https://…"]`) et non des objets : impossible d'y greffer un
+// champ `m3u8Url` sans casser la forme de la réponse. On joint donc à l'épisode
+// une table `m3u8ByPlayer` en parallèle, que le client consulte par lien.
+//
+// La résolution ne porte que sur l'épisode désigné par `?season=&episode=` :
+// le client n'envoie que des identifiants, jamais d'URL, et le catalogue
+// entier n'est jamais extrait.
+async function respondWithAnimeSources(req, res, animes) {
+  if (String(req.query.resolve || '') !== '1') return res.json(animes);
+
+  const seasonNum = Number.parseInt(req.query.season, 10);
+  const episodeNum = Number.parseInt(req.query.episode, 10);
+  if (!Number.isInteger(seasonNum) || !Number.isInteger(episodeNum)) return res.json(animes);
+
+  const accessKey = req.headers['x-access-key'] || null;
+
+  try {
+    const { verifyAccessKey } = require('../checkVip');
+    const vipStatus = await verifyAccessKey(accessKey);
+    if (!vipStatus?.vip) return res.json(animes);
+
+    // `season`/`episode` sont des rangs 1-based côté client.
+    const episode = animes?.[0]?.seasons?.[seasonNum - 1]?.episodes?.[episodeNum - 1];
+    if (!episode || !Array.isArray(episode.streaming_links)) return res.json(animes);
+
+    const urls = episode.streaming_links.flatMap((link) =>
+      Array.isArray(link.players) ? link.players : []
+    );
+
+    episode.m3u8ByPlayer = await buildM3u8Map(urls, { accessKey });
+    return res.json(animes);
+  } catch (error) {
+    // L'extraction est un bonus : le catalogue reste servi si elle échoue.
+    console.error(`[ANIME-SAMA] Extraction S${seasonNum}E${episodeNum} échouée: ${error.message}`);
+    return res.json(animes);
+  }
+}
 
 // ---- Lazy-bound dependencies injected via configure() ----
 let deps = {
@@ -158,6 +198,20 @@ const isValidPlayerUrl = (url) => {
   if (invalidPatterns.some(pattern => url.includes(pattern))) return false;
   return true;
 };
+
+// Gabarits d'embed sans identifiant : anime-sama les emet quand un lecteur est
+// annonce mais vide. Le test porte sur un motif et non sur une URL exacte, car
+// ces hebergeurs font tourner leurs TLD — une liste en dur laissait passer le
+// meme gabarit sur un nouveau domaine (vidmoly.org apres vidmoly.to).
+const EMPTY_PLAYER_PATTERNS = [
+  /sibnet\.[a-z0-9-]+\/shell\.php\?videoid=$/i,
+  /vidmoly\.[a-z0-9-]+\/embed-\.html$/i,
+  /sendvid\.[a-z0-9-]+\/embed\/$/i,
+  /vk\.[a-z0-9-]+\/video_ext\.php\?oid=&hd=3$/i,
+];
+
+const isEmptyPlayerUrl = (url) =>
+  typeof url === 'string' && EMPTY_PLAYER_PATTERNS.some((re) => re.test(url));
 
 // ---- Classes ----
 
@@ -815,12 +869,6 @@ router.get('/search/:query', async (req, res) => {
     }));
 
     // --- Filtering unwanted URLs before response ---
-    const unwantedUrls = [
-      'https://video.sibnet.ru/shell.php?videoid=',
-      'https://vidmoly.to/embed-.html',
-      'https://sendvid.com/embed/',
-      'https://vk.com/video_ext.php?oid=&hd=3'
-    ];
     animesWithSeasons.forEach(anime => {
       if (anime.seasons && Array.isArray(anime.seasons)) {
         anime.seasons.forEach(season => {
@@ -829,7 +877,7 @@ router.get('/search/:query', async (req, res) => {
               if (ep.streaming_links && Array.isArray(ep.streaming_links)) {
                 ep.streaming_links.forEach(linkObj => {
                   if (linkObj.players && Array.isArray(linkObj.players)) {
-                    linkObj.players = linkObj.players.filter(url => !unwantedUrls.includes(url));
+                    linkObj.players = linkObj.players.filter(url => !isEmptyPlayerUrl(url));
                   }
                 });
               }
@@ -848,7 +896,7 @@ router.get('/search/:query', async (req, res) => {
       }
     });
 
-    res.json(animesWithSeasons);
+    await respondWithAnimeSources(req, res, animesWithSeasons);
     dataReturned = true;
 
     // --- Background update ---
@@ -956,12 +1004,6 @@ router.get('/search/:query', async (req, res) => {
 
           if (shouldUpdate) {
             try {
-              const unwantedUrlsForCache = [
-                'https://video.sibnet.ru/shell.php?videoid=',
-                'https://vidmoly.to/embed-.html',
-                'https://sendvid.com/embed/',
-                'https://vk.com/video_ext.php?oid=&hd=3'
-              ];
               const episodesData = cachedEpisodes.map(episode => ({
                 name: episode.name,
                 serie_name: episode.serie_name || episode.serieName,
@@ -970,7 +1012,7 @@ router.get('/search/:query', async (req, res) => {
                 streaming_links: (episode.streaming_links || []).map(linkObj => ({
                   language: linkObj.language,
                   players: Array.isArray(linkObj.players)
-                    ? linkObj.players.filter(url => !unwantedUrlsForCache.includes(url))
+                    ? linkObj.players.filter(url => !isEmptyPlayerUrl(url))
                     : linkObj.players
                 }))
               }));

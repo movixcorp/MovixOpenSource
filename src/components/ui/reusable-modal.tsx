@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X } from 'lucide-react';
+import { getOverlayPortalRoot } from '../../utils/overlayPortal';
 
 interface ReusableModalProps {
     isOpen: boolean;
@@ -94,7 +95,7 @@ const ReusableModal: React.FC<ReusableModalProps> = ({
         </AnimatePresence>
     );
 
-    return createPortal(modalContent, document.body);
+    return createPortal(modalContent, getOverlayPortalRoot());
 };
 
 export default ReusableModal;

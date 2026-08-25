@@ -8,6 +8,7 @@ const { createRedisRateLimitStore } = require('../utils/redisRateLimitStore');
 const { verifyTurnstileFromRequest } = require('../utils/turnstile');
 const {
   createVipInvoice,
+  handleCryptoGateWebhook,
   handlePaygateCallback,
   fetchInvoiceByPublicId,
   fetchInvoiceByGiftToken,
@@ -83,6 +84,31 @@ const invoiceCheckRateLimit = rateLimit({
   }
 });
 
+const cryptoGateWebhookRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  store: createRedisRateLimitStore({ prefix: 'rate-limit:vip:cryptogate-webhook:' }),
+  passOnStoreError: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: getRateLimitKey,
+  validate: { xForwardedForHeader: false, ip: false },
+  message: 'temporary failure'
+});
+
+const cryptoGateWebhookBodyParser = express.json({
+  limit: '64kb',
+  verify(req, res, buffer) {
+    req.rawBody = Buffer.from(buffer);
+  }
+});
+
+// Mounted by app.js before the global 8 MB parser, in this exact order.
+const cryptoGateWebhookIngress = [
+  cryptoGateWebhookRateLimit,
+  cryptoGateWebhookBodyParser
+];
+
 const giftUnsealRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -136,6 +162,29 @@ router.post('/vip/invoices', setNoStore, createInvoiceRateLimit, async (req, res
       success: false,
       error: error.message || 'Impossible de créer l\'invoice VIP'
     });
+  }
+});
+
+router.post('/vip/cryptogate/webhook', setNoStore, async (req, res) => {
+  try {
+    const pool = getPool();
+    await handleCryptoGateWebhook(pool, {
+      rawBody: req.rawBody,
+      signature: req.headers['x-webhook-signature'],
+      webhookId: req.headers['x-webhook-id']
+    });
+    return res.status(200).type('text/plain').send('ok');
+  } catch (error) {
+    const statusCode = Number(error?.statusCode);
+    const safeStatus = statusCode >= 400 && statusCode <= 599 ? statusCode : 500;
+    console.error('VIP CryptoGate webhook rejected', {
+      code: error?.code || 'CRYPTOGATE_WEBHOOK_ERROR',
+      statusCode: safeStatus
+    });
+    return res
+      .status(safeStatus)
+      .type('text/plain')
+      .send(safeStatus >= 500 ? 'temporary failure' : 'invalid webhook');
   }
 });
 
@@ -424,5 +473,6 @@ router.post('/admin/vip-invoices/:id/cancel', isAdmin, async (req, res) => {
 
 module.exports = {
   router,
-  ensureVipDonationsTables
+  ensureVipDonationsTables,
+  cryptoGateWebhookIngress
 };

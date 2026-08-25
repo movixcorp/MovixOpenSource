@@ -21,6 +21,15 @@ const {
   makeWiflixSearchRequest,
 } = require("../utils/proxyManager");
 const { acquireRedisLock } = require("../utils/redisLock");
+const { respondWithResolvedSources } = require("../utils/embedExtraction");
+
+// Wiflix range la map de langues à même l'épisode (`{ vf: [], vostfr: [] }`),
+// sans enveloppe `languages` — d'où `languageKey: null`.
+const respondWithEpisodeSources = (req, res, payload) =>
+  respondWithResolvedSources(req, res, payload, { languageKey: null, label: "WIFLIX TV" });
+
+const respondWithMovieSources = (req, res, payload) =>
+  respondWithResolvedSources(req, res, payload, { movieMapKey: "players", label: "WIFLIX MOVIE" });
 const {
   fetchTmdbDetails,
   fetchTmdbSeason,
@@ -32,7 +41,8 @@ const { fetchCinestreamMovieData } = require("./cinestream");
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
 const TMDB_API_URL = "https://api.themoviedb.org/3";
-const WIFLIX_BASE_URL = "https://flemmix.men";
+// Source rotates domains (flemmix.fast -> ...). Override via env, no code change.
+const WIFLIX_BASE_URL = process.env.WIFLIX_BASE_URL || "https://flemmix.fast";
 
 // === Cache helpers (local, since getFromCacheNoExpiration is not yet in cacheManager) ===
 const getFromCacheNoExpiration = async (cacheDir, key) => {
@@ -656,7 +666,7 @@ router.get("/movie/:tmdbId", async (req, res) => {
         }
       } catch (e) {}
 
-      res.status(200).json({ ...cachedData, next_update_in: nextUpdateIn });
+      await respondWithMovieSources(req, res, { ...cachedData, next_update_in: nextUpdateIn });
       dataReturned = true;
 
       if (!shouldSkipUpdate)
@@ -716,7 +726,7 @@ router.get("/tv/:tmdbId/:season", async (req, res) => {
         }
       } catch (e) {}
 
-      res.json({ ...cachedData, next_update_in: nextUpdateIn });
+      await respondWithEpisodeSources(req, res, { ...cachedData, next_update_in: nextUpdateIn });
       dataReturned = true;
 
       if (!shouldSkipUpdate)

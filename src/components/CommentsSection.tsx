@@ -11,6 +11,9 @@ import ReactMarkdown from 'react-markdown';
 import { useSafeRemarkGfm } from '../utils/markdownPlugins';
 import remarkEmoji from 'remark-emoji';
 import MarkdownToolbar from './MarkdownToolbar';
+import { useTurnstileBypass } from '../hooks/useTurnstileBypass';
+import { ADMIN_BYPASS_TOKEN } from '../utils/turnstileBypass';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY;
@@ -1019,6 +1022,8 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
   const [turnstileToken, setTurnstileToken] = useState('');
   const turnstileRef = useRef<HTMLDivElement>(null);
   const widgetIdRef = useRef<string | null>(null);
+  // Dispense admin : pas de challenge du tout. Voir `utils/turnstileBypass.ts`.
+  const turnstileBypass = useTurnstileBypass();
 
   const observerRef = useRef<IntersectionObserver | null>(null);
   const lastCommentRef = useRef<HTMLDivElement | null>(null);
@@ -1086,6 +1091,13 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
   }, []);
 
   useEffect(() => {
+    if (turnstileBypass === 'bypass') {
+      setTurnstileToken(ADMIN_BYPASS_TOKEN);
+      return;
+    }
+    // Statut encore inconnu : on n'affiche rien plutôt qu'un challenge à
+    // retirer juste après.
+    if (turnstileBypass === 'unknown') return;
     if (!isAuthenticated || !TURNSTILE_SITE_KEY) return;
 
     const timer = setTimeout(() => {
@@ -1111,14 +1123,18 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
         setTurnstileToken('');
       }
     };
-  }, [isAuthenticated, renderTurnstile]);
+  }, [isAuthenticated, renderTurnstile, turnstileBypass]);
 
   const resetTurnstile = useCallback(() => {
+    // Un dispensé n'a rien à réinitialiser : effacer le marqueur rebloquerait
+    // le bouton après le premier commentaire.
+    if (turnstileBypass !== 'challenge') return;
+
     setTurnstileToken('');
     if (widgetIdRef.current && window.turnstile) {
       window.turnstile.reset(widgetIdRef.current);
     }
-  }, []);
+  }, [turnstileBypass]);
 
   // Charger les commentaires
   const loadComments = useCallback(async (pageNum: number = 1) => {
@@ -1935,8 +1951,8 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
                 </div>
               )}
 
-              {/* Widget Turnstile */}
-              {TURNSTILE_SITE_KEY && (
+              {/* Widget Turnstile — masqué pour les dispensés */}
+              {TURNSTILE_SITE_KEY && turnstileBypass === 'challenge' && (
                 <div className="mt-4">
                   <p className="text-xs text-gray-400 mb-2">{t('comments.turnstileNotice')}</p>
                   <div className="overflow-hidden w-full" style={{ maxWidth: '100%' }}>
@@ -2155,7 +2171,7 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
           </motion.div>
         )}
       </AnimatePresence>,
-      document.body
+      getOverlayPortalRoot()
     )}
     {/* Modal de signalement */}
     {createPortal(
@@ -2233,7 +2249,7 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
           </motion.div>
         )}
       </AnimatePresence>,
-      document.body
+      getOverlayPortalRoot()
     )}
     </>
   );

@@ -17,6 +17,7 @@ import ShinyText from '../../components/ui/shiny-text';
 import AnimatedBorderCard from '../../components/ui/animated-border-card';
 import { SquareBackground } from '../../components/ui/square-background';
 import { getTmdbLanguage } from '../../i18n';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 interface TmdbResult {
     id: number;
@@ -144,7 +145,7 @@ const SeasonSelectorModal: React.FC<SeasonSelectorModalProps> = memo(({
         </div>
     );
 
-    return createPortal(modalContent, document.body);
+    return createPortal(modalContent, getOverlayPortalRoot());
 });
 
 SeasonSelectorModal.displayName = 'SeasonSelectorModal';

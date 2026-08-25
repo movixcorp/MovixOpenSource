@@ -14,6 +14,7 @@ const { ipKeyGenerator } = require('express-rate-limit');
 const { isAdmin, isUploaderOrAdmin } = require('../middleware/auth');
 const { getPool } = require('../mysqlPool');
 const { verifyAccessKey, invalidateVipCache } = require('../checkVip');
+const { buildM3u8Map } = require('../utils/embedExtraction');
 const { ANIME_SAMA_CACHE_DIR } = require('../utils/cacheManager');
 const { createRedisRateLimitStore } = require('../utils/redisRateLimitStore');
 const { logDownloadLinkAction } = require('../utils/downloadLinksHistory');
@@ -159,11 +160,43 @@ router.get('/links/:type/:id', async (req, res) => {
       };
     });
 
-    res.json({
+    const payload = {
       success: true,
       type,
       data: type === 'movie' ? result[0] : result
-    });
+    };
+
+    // Résolution serveur des m3u8, sur demande explicite (`?resolve=1`) et pour
+    // un VIP seulement. Ces liens sont soumis par les uploaders et stockés en
+    // base : ils viennent donc du serveur, pas du client, au même titre que les
+    // catalogues scrapés.
+    //
+    // Une entrée peut être une chaîne nue ou un objet {url, label, ...} : on ne
+    // peut pas greffer un champ sur les premières, d'où la table parallèle
+    // `m3u8ByPlayer` (même convention qu'Anime-Sama).
+    //
+    // Pour une série sans `season`+`episode`, la requête ci-dessus renvoie TOUS
+    // les épisodes : on ne résout pas, sous peine d'extraire une saison entière
+    // pour une seule lecture.
+    const cibleUnique = type === 'movie' || (season && episode);
+    if (String(req.query.resolve || '') === '1' && cibleUnique) {
+      try {
+        const accessKey = req.headers['x-access-key'] || null;
+        const vipStatus = await verifyAccessKey(accessKey);
+        if (vipStatus?.vip) {
+          const urls = result.flatMap(row =>
+            (Array.isArray(row.links) ? row.links : [])
+              .map(lien => (typeof lien === 'string' ? lien : lien?.url))
+          );
+          payload.m3u8ByPlayer = await buildM3u8Map(urls, { accessKey });
+        }
+      } catch (extractionError) {
+        // Bonus : les liens restent servis si la résolution échoue.
+        console.error(`[LINKS] Extraction ${type}/${id} échouée: ${extractionError.message}`);
+      }
+    }
+
+    res.json(payload);
 
   } catch (error) {
     console.error('Error fetching streaming links:', error);

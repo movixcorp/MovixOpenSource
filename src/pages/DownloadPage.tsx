@@ -8,6 +8,7 @@ import { toast } from 'sonner';
 import { getTmdbLanguage } from '../i18n';
 import { motion, AnimatePresence } from 'framer-motion';
 import { findDarkiWorldTitleId } from '@/utils/darkiWorldResultMatch';
+import { useAgeRestrictedContent } from '../hooks/useAgeRestrictedContent';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -831,6 +832,9 @@ const DownloadPage: React.FC = () => {
   };
   
   const [tmdbDetails, setTmdbDetails] = useState<TMDBDetails | null>(null);
+  const { items: ageAllowedDetails, isFiltering: isFilteringDetailsByAge } = useAgeRestrictedContent(
+    tmdbDetails && type ? [{ ...tmdbDetails, media_type: type }] : [],
+  );
   const [seasons, setSeasons] = useState<Season[]>([]);
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [selectedSeason, setSelectedSeason] = useState<number>(1);
@@ -1478,6 +1482,16 @@ const DownloadPage: React.FC = () => {
       </div>
     );
   }
+
+  if (tmdbDetails && isFilteringDetailsByAge) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-red-500" />
+      </div>
+    );
+  }
+
+  if (tmdbDetails && ageAllowedDetails.length === 0) return null;
 
   return (
     <div className="min-h-screen bg-black text-white pt-20 pb-24">

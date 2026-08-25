@@ -49,6 +49,11 @@ const caches = {
     sibnet: new TTLCache(500, 7200000),
     uqload: new TTLCache(500, 7200000),
     doodstream: new TTLCache(500, 3600000),
+    lulustream: new TTLCache(500, 3600000),
+    veev: new TTLCache(500, 3600000),
+    // Vidara's token is IP-bound and short-lived: cache briefly or we hand back
+    // a URL that is already dead.
+    vidara: new TTLCache(500, 900000),
     seekstreaming: new TTLCache(500, 300000),
 };
 
@@ -484,6 +489,41 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
     return null;
 }
 
+/**
+ * PURPOSE: Fetch an embed page the way a browser would, and only that way.
+ *
+ * LuluStream classifies its clients: a request from Chromium's own fetch is
+ * served a working token, while the very same headers coming from another HTTP
+ * stack — curl, okhttp, undici — get a token its CDN then refuses with a flat
+ * 403. Routing this through the mobile app's native stack therefore broke the
+ * app while the browser extension kept working. So there is no native path
+ * here: extraction always runs in the page's engine, on every platform.
+ *
+ * Returns { ok, status, url, text }.
+ */
+const LULUSTREAM_RULE_DOMAINS = [
+    'lulustream.com', 'luluvdo.com', 'luluvdoo.com', 'luluvid.com', 'lulu.st',
+    'streamhihi.com', 'cdn1.site', 'd00ds.site', '732eg54de642sa.sbs',
+];
+const VEEV_RULE_DOMAINS = ['veev.to', 'veev.pro', 'poophq.com', 'doods.to'];
+
+// Le CDN LuluStream/Veev lie son jeton à l'`Accept-Language` de la requête qui
+// l'a obtenu. Brave, Shields activés, réduit celui des requêtes de la page
+// (`fr-FR,fr;q=0.5`) sans toucher au `fetch` de l'extension, resté complet :
+// les deux valeurs divergent et le manifeste répond 403. On épingle donc la
+// même valeur des deux côtés — celle qu'émet aussi le proxy serveur.
+const CLUSTER_ACCEPT_LANGUAGE = 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7';
+
+async function fetchIpBoundPage(url, { headers, signal }) {
+    const resp = await fetch(url, { headers, redirect: 'follow', signal });
+    return {
+        ok: resp.ok,
+        status: resp.status,
+        url: resp.url || url,
+        text: resp.ok ? await resp.text() : '',
+    };
+}
+
 function extractFsvidVidzyM3u8FromHtml(html, embedUrl) {
     const direct = extractM3u8UrlFromDecodedScript(html, embedUrl);
     if (direct) return direct;
@@ -625,13 +665,61 @@ function rot13(str) {
     });
 }
 
+// VOE stacks the same transforms every time (ROT13 -> strip markers -> base64
+// -> shift -3 -> reverse -> base64 -> JSON), but regenerates the marker list on
+// every deploy and ships it in the player bundle next to the payload. Reading
+// it from the bundle is what keeps this extractor working across rotations;
+// VOE_LEGACY_MARKERS only covers pages still served by an older player.
+const VOE_LEGACY_MARKERS = ['@$', '^^', '~@', '%?', '*~', '!!', '#&'];
+const VOE_PAYLOAD_PATTERN = /json">\s*\[\s*"([^"]+)"\s*\]\s*<\/script>\s*<script[^>]*src="([^"]+)"/i;
+const VOE_MARKER_TABLE_PATTERN = /(\[(?:'\W{2}'[,\]]){1,9})/;
+// VOE stores the stream under one of these keys depending on player version.
+const VOE_SOURCE_KEYS = ['source', 'file', 'direct_access_url'];
+
+/**
+ * Marker list to strip, read from the player bundle shipped with the page.
+ */
+function parseVoeMarkerTable(bundleJs) {
+    const match = String(bundleJs || '').match(VOE_MARKER_TABLE_PATTERN);
+    if (!match) return null;
+    // `['@$','^^']` -> ['@$', '^^']
+    return match[1].slice(2, -2).split("','").filter(Boolean);
+}
+
+/**
+ * Stream URL of a decrypted VOE player config, HLS first.
+ */
+function pickVoeSource(decrypted) {
+    if (!decrypted || typeof decrypted !== 'object') return null;
+    const candidates = VOE_SOURCE_KEYS
+        .map(key => decrypted[key])
+        .filter(value => typeof value === 'string' && value.startsWith('http'));
+    if (candidates.length === 0) return null;
+    return candidates.find(url => url.includes('.m3u8')) || candidates[0];
+}
+
+/**
+ * Stream URL of a VOE page that does not use the encrypted stack.
+ */
+function extractVoePlainSource(html) {
+    const content = String(html || '');
+    for (const pattern of [/["']hls["']\s*:\s*["']([^"']+)["']/i, /["']mp4["']\s*:\s*["']([^"']+)["']/i]) {
+        const match = content.match(pattern);
+        if (match) {
+            const candidate = match[1].replace(/\\\//g, '/');
+            if (candidate.startsWith('http')) return candidate;
+        }
+    }
+    return null;
+}
+
 /**
  * Decrypt VOE data
  */
-function decryptVoeData(encrypted) {
+function decryptVoeData(encrypted, markers) {
     try {
         let step1 = rot13(encrypted);
-        const symbols = ['@$', '^^', '~@', '%?', '*~', '!!', '#&'];
+        const symbols = Array.isArray(markers) && markers.length ? markers : VOE_LEGACY_MARKERS;
         for (const sym of symbols) {
             step1 = step1.split(sym).join('');
         }
@@ -726,30 +814,42 @@ async function extractVoe(voeUrl) {
         const { html, finalUrl } = await fetchWithRedirects(voeUrl, headers, 3, 3000);
         console.log(`[EXT-VOE] Fetched ${html.length} chars, final URL: ${finalUrl}`);
 
-        const jsonContent = extractJsonFromHtml(html);
-
-        if (!jsonContent || !Array.isArray(jsonContent) || jsonContent.length === 0) {
-            console.error('[EXT-VOE] JSON content not found in HTML');
-            console.log('[EXT-VOE] HTML snippet:', html.substring(0, 500));
-            return { success: false, error: 'VOE: JSON content not found' };
+        let decrypted = null;
+        const payload = html.match(VOE_PAYLOAD_PATTERN);
+        if (payload) {
+            let markers = null;
+            try {
+                const bundleUrl = new URL(payload[2], finalUrl || voeUrl).href;
+                const bundleResp = await fetch(bundleUrl, {
+                    headers: { ...headers, Referer: finalUrl || voeUrl },
+                });
+                if (bundleResp.ok) markers = parseVoeMarkerTable(await bundleResp.text());
+            } catch (e) {
+                console.warn('[EXT-VOE] Player bundle unreachable, falling back to legacy markers:', e);
+            }
+            // If the bundle moved or changed shape, the frozen list still covers
+            // pages served by the previous player.
+            decrypted = decryptVoeData(payload[1], markers) || decryptVoeData(payload[1]);
         }
 
-        console.log(`[EXT-VOE] Found JSON array with ${jsonContent.length} element(s), first element length: ${jsonContent[0].length}`);
-
-        const decrypted = decryptVoeData(jsonContent[0]);
         if (!decrypted) {
-            return { success: false, error: 'VOE: Decryption failed' };
+            const jsonContent = extractJsonFromHtml(html);
+            if (jsonContent && Array.isArray(jsonContent) && jsonContent.length > 0) {
+                decrypted = decryptVoeData(jsonContent[0]);
+            }
         }
 
-        console.log('[EXT-VOE] Decrypted keys:', Object.keys(decrypted));
-
-        const sourceUrl = decrypted.source || '';
-        if (!sourceUrl.includes('.m3u8')) {
-            console.error('[EXT-VOE] No M3U8 in source:', sourceUrl.substring(0, 100));
+        const sourceUrl = pickVoeSource(decrypted) || extractVoePlainSource(html);
+        if (!sourceUrl) {
+            // Pas une erreur : un embed sans flux jouable est un résultat
+            // ordinaire, l'appelant le traite en essayant la source suivante.
+            // Le remonter en `error` noyait les vraies pannes d'extraction.
+            console.log('[EXT-VOE] No playable source found');
+            console.log('[EXT-VOE] HTML snippet:', html.substring(0, 500));
             return { success: false, error: 'VOE: No M3U8 source found' };
         }
 
-        console.log(`[EXT-VOE] M3U8 found: ${sourceUrl.substring(0, 80)}...`);
+        console.log(`[EXT-VOE] Source found: ${sourceUrl.substring(0, 80)}...`);
 
         // Return the direct URL - extension handles CORS via DNR
         const result = { hlsUrl: sourceUrl, success: true, source: 'voe' };
@@ -823,7 +923,8 @@ async function extractFsvid(fsvidUrl) {
         const m3u8Url = await extractFsvidVidzyM3u8(html, embedUrl, 'fsvid');
 
         if (!m3u8Url) {
-            console.error('[EXT-FSVID] No safe M3U8 URL found in page');
+            // Résultat ordinaire, pas une panne : voir la note côté VOE.
+            console.log('[EXT-FSVID] No safe M3U8 URL found in page');
             return { success: false, error: 'Fsvid: M3U8 not found in page' };
         }
 
@@ -911,7 +1012,7 @@ async function extractVidmoly(vidmolyUrl) {
 
         // Try multiple patterns
         const patterns = [
-            /sources:\s*\[\s*\{\s*file:\s*["']([^"']+)["']/i,
+            /sources\s*:\s*\[\s*\{\s*file\s*:\s*["']([^"']+)["']/i,
             /file:\s*["']([^"']+\.m3u8[^"']*)["']/i,
             /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i
         ];
@@ -924,6 +1025,10 @@ async function extractVidmoly(vidmolyUrl) {
                 break;
             }
         }
+
+        // Vidmoly's MPD is not playable by our players — reject rather than
+        // hand back a URL that will fail downstream.
+        if (sourceUrl && sourceUrl.split('?')[0].endsWith('.mpd')) sourceUrl = null;
 
         if (!sourceUrl) return { success: false, error: 'Vidmoly: M3U8 not found' };
 
@@ -938,7 +1043,28 @@ async function extractVidmoly(vidmolyUrl) {
 }
 
 /**
- * Extract MP4 from Sibnet embed
+ * Sibnet player URL for any shape of link.
+ *
+ * Sibnet exposes the same video through `/shell.php?videoid=N` and through
+ * `/videoN-Title.html` permalinks. Only the former serves the player, so
+ * normalize instead of depending on what the catalogue happened to scrape.
+ */
+function normalizeSibnetUrl(rawUrl) {
+    let parsed;
+    try {
+        parsed = new URL(String(rawUrl || '').trim());
+    } catch {
+        return null;
+    }
+    const fromQuery = parsed.searchParams.get('videoid');
+    const videoId = /^\d+$/.test(fromQuery || '')
+        ? fromQuery
+        : (parsed.pathname.match(/\/video(\d+)/) || [])[1];
+    return videoId ? `https://video.sibnet.ru/shell.php?videoid=${videoId}` : null;
+}
+
+/**
+ * Extract the media URL from a Sibnet embed
  */
 async function extractSibnet(sibnetUrl) {
     console.log(`[EXT-SIBNET] Extracting from: ${sibnetUrl}`);
@@ -951,23 +1077,32 @@ async function extractSibnet(sibnetUrl) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 3000);
 
+        const playerUrl = normalizeSibnetUrl(sibnetUrl);
+        if (!playerUrl) {
+            clearTimeout(timer);
+            return { success: false, error: 'Sibnet: invalid URL' };
+        }
+
         const headers = {
             'accept': 'text/html,*/*',
             'referer': 'https://video.sibnet.ru/',
             'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
         };
 
-        const resp = await fetch(sibnetUrl, { headers, signal: controller.signal });
+        const resp = await fetch(playerUrl, { headers, signal: controller.signal });
         if (!resp.ok) return { success: false, error: `Sibnet: HTTP ${resp.status}` };
         const html = await resp.text();
 
-        // Find mp4 URL in player.src pattern
-        const mp4Match = html.match(/player\.src\(\[\{\s*src:\s*["']([^"']+\.mp4[^"']*)["']/);
-        if (!mp4Match) return { success: false, error: 'Sibnet: MP4 not found' };
+        // The source lives in a `src: "…"` of the player script. Sibnet serves
+        // MP4 today but nothing in the page guarantees it, so relay whatever
+        // extension it hands back instead of requiring `.mp4`.
+        const mp4Match = html.match(/player\.src\(\s*\[\s*\{\s*src:\s*["']([^"']+)["']/)
+            || html.match(/\bsrc:\s*["'](\/[^"']+)["']/);
+        if (!mp4Match) return { success: false, error: 'Sibnet: source not found' };
 
         let mp4Url = mp4Match[1];
         if (!mp4Url.startsWith('http')) {
-            mp4Url = `https://video.sibnet.ru${mp4Url}`;
+            mp4Url = new URL(mp4Url, 'https://video.sibnet.ru').href;
         }
 
         // Follow the 302 redirect to get the final CDN URL (e.g. dv97.sibnet.ru)
@@ -1061,6 +1196,14 @@ async function extractUqload(uqloadUrl) {
     }
 }
 
+// `dsplayer.hotkeys … '<pass_md5 path>'`: the recent player builds the stream
+// URL there instead of hardcoding it in the page.
+const DOODSTREAM_MAKEPLAY_PATTERN = /dsplayer\.hotkeys[^']+'(\/[^']+)'/;
+const DOODSTREAM_PASS_PATTERN = /\/pass_md5\/[\w-]+\/(?<token>[\w-]+)/;
+// The token appears verbatim in makePlay(); it no longer always matches the
+// last segment of the pass_md5 path.
+const DOODSTREAM_TOKEN_PATTERN = /[?&]token=([\w-]+)/;
+
 /**
  * Extract video URL from DoodStream embed
  */
@@ -1075,19 +1218,49 @@ async function extractDoodStream(doodUrl) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 3000);
 
+        // DoodStream checks the Referer against the domain it served, so it has
+        // to follow the mirror rather than stay pinned to d0000d.com.
+        const embedOrigin = new URL(doodUrl).origin;
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://d0000d.com/',
+            'Referer': `${embedOrigin}/`,
         };
 
         // Step 1: Fetch the embed page
         const resp = await fetch(doodUrl, { headers, redirect: 'follow', signal: controller.signal });
         if (!resp.ok) { clearTimeout(timer); return { success: false, error: `DoodStream: HTTP ${resp.status}` }; }
-        const html = await resp.text();
+        let html = await resp.text();
+        let playerUrl = resp.url || doodUrl;
 
-        // Step 2: Extract pass_md5 URL and token
-        const passMatch = html.match(/\/pass_md5\/[\w-]+\/(?<token>[\w-]+)/);
-        if (!passMatch) {
+        // A `/d/<id>` link serves a shell page whose iframe holds the real
+        // player — without that hop there is no pass_md5 to find.
+        if (!DOODSTREAM_MAKEPLAY_PATTERN.test(html) && !DOODSTREAM_PASS_PATTERN.test(html)) {
+            const iframe = html.match(/<iframe[^>]*\ssrc="([^"]+)"/i);
+            const nextUrl = iframe
+                ? new URL(iframe[1], playerUrl).href
+                : (playerUrl.includes('/d/') ? playerUrl.replace('/d/', '/e/') : null);
+            if (nextUrl && nextUrl !== playerUrl) {
+                try {
+                    const nextResp = await fetch(nextUrl, {
+                        headers: { ...headers, Referer: playerUrl },
+                        redirect: 'follow',
+                        signal: controller.signal,
+                    });
+                    if (nextResp.ok) {
+                        html = await nextResp.text();
+                        playerUrl = nextResp.url || nextUrl;
+                    }
+                } catch { /* keep the shell page and let the patterns below decide */ }
+            }
+        }
+
+        // Step 2: Extract pass_md5 URL and token. The recent player publishes
+        // the token inside makePlay(), separately from the pass_md5 path; the
+        // older one reuses the path's last segment.
+        const passMatch = html.match(DOODSTREAM_PASS_PATTERN);
+        const makePlay = html.match(DOODSTREAM_MAKEPLAY_PATTERN);
+        const passMd5Url = passMatch ? passMatch[0] : (makePlay ? makePlay[1] : null);
+        if (!passMd5Url) {
             clearTimeout(timer);
             return {
                 success: false,
@@ -1096,29 +1269,41 @@ async function extractDoodStream(doodUrl) {
             };
         }
 
-        const parsedUrl = new URL(doodUrl);
+        const parsedUrl = new URL(playerUrl);
         const domain = `${parsedUrl.protocol}//${parsedUrl.host}`;
-        const passMd5Url = passMatch[0];
-        const token = passMatch.groups?.token || passMatch[0].split('/').pop();
+        const tokenMatch = html.match(DOODSTREAM_TOKEN_PATTERN);
+        const token = tokenMatch
+            ? tokenMatch[1]
+            : passMd5Url.replace(/\/+$/, '').split('/').pop();
 
         // Step 3: Call pass_md5 endpoint
         const passHeaders = {
-            'Referer': domain,
+            'Referer': playerUrl,
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
         };
 
-        const passResp = await fetch(`${domain}${passMd5Url}`, { headers: passHeaders, signal: controller.signal });
-        const baseUrl = await passResp.text();
+        const passUrl = passMd5Url.startsWith('http') ? passMd5Url : `${domain}${passMd5Url}`;
+        const passResp = await fetch(passUrl, { headers: passHeaders, signal: controller.signal });
+        const baseUrl = (await passResp.text()).trim();
         clearTimeout(timer);
 
-        // Step 4: Build final video URL
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-        let randomStr = '';
-        for (let i = 0; i < 10; i++) {
-            randomStr += chars.charAt(Math.floor(Math.random() * chars.length));
+        if (!baseUrl.startsWith('http')) {
+            return { success: false, error: 'DoodStream: unexpected pass_md5 payload' };
         }
-        const expiry = Date.now();
-        const videoUrl = `${baseUrl}${randomStr}?token=${token}&expiry=${expiry}`;
+
+        // Step 4: Build final video URL. Files served from Cloudflare R2 come
+        // back already signed — appending a suffix and token would break them.
+        let videoUrl;
+        if (baseUrl.includes('cloudflarestorage.')) {
+            videoUrl = baseUrl;
+        } else {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let randomStr = '';
+            for (let i = 0; i < 10; i++) {
+                randomStr += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            videoUrl = `${baseUrl}${randomStr}?token=${token}&expiry=${Date.now()}`;
+        }
 
         const result = { m3u8Url: videoUrl, success: true, source: 'doodstream' };
         caches.doodstream.set(cacheKey, result);
@@ -1127,6 +1312,293 @@ async function extractDoodStream(doodUrl) {
     } catch (e) {
         console.error('[EXT-DOODSTREAM] Error:', e);
         return { success: false, error: e.message || 'DoodStream extraction failed' };
+    }
+}
+
+/**
+ * Extract M3U8 from a LuluStream embed (luluvdo, streamhihi, cdn1.site…)
+ */
+async function extractLuluStream(luluUrl) {
+    console.log(`[EXT-LULUSTREAM] Extracting from: ${luluUrl}`);
+
+    const cacheKey = md5Hash(luluUrl);
+    const cached = caches.lulustream.get(cacheKey);
+    if (cached) return { ...cached, fromCache: true };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+
+    try {
+        const parsed = new URL(luluUrl);
+        const mediaId = (parsed.pathname.split('/').filter(Boolean).pop() || '').replace(/\.html$/i, '');
+        if (!/^[0-9a-zA-Z]+$/.test(mediaId)) {
+            return { success: false, error: 'LuluStream: invalid URL' };
+        }
+
+        const embedUrl = `${parsed.origin}/e/${mediaId}`;
+        const headers = {
+            'Accept': 'text/html,*/*',
+            'Referer': `${parsed.origin}/`,
+            'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0',
+        };
+
+        const resp = await fetchIpBoundPage(embedUrl, { headers, signal: controller.signal });
+        if (!resp.ok) return { success: false, error: `LuluStream: HTTP ${resp.status}` };
+        const html = resp.text;
+
+        // Most mirrors ship the player inside a Dean Edwards packer, so search
+        // the unpacked script first and fall back to the raw page.
+        let sourceUrl = null;
+        for (const candidate of [decodePackedScriptFromHtml(html), html]) {
+            if (!candidate) continue;
+            const match = candidate.match(/sources\s*:\s*\[\s*\{\s*file\s*:\s*["']([^"']+)["']/i)
+                || candidate.match(/https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*/i);
+            if (match) {
+                sourceUrl = (match[1] || match[0]).replace(/\\\//g, '/');
+                break;
+            }
+        }
+
+        if (!sourceUrl) return { success: false, error: 'LuluStream: M3U8 not found' };
+
+        const result = { m3u8Url: sourceUrl, success: true, source: 'lulustream' };
+        caches.lulustream.set(cacheKey, result);
+        return result;
+    } catch (e) {
+        console.error('[EXT-LULUSTREAM] Error:', e);
+        return { success: false, error: e.message || 'LuluStream extraction failed' };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// ===== Veev =====
+// Veev's page carries no stream URL: it carries a challenge (`ch`) that has to
+// be decoded to query /dl, whose answer is itself encoded with an order of
+// operations derived from that same challenge.
+const VEEV_CHALLENGE_PATTERN = /[.\s'](?:fc|_vvto\[[^\]]*)(?:['\]]*)?\s*[:=]\s*['"]([^'"]+)['"]/g;
+const VEEV_UTF8_PADDING = 'dXRmOA==';
+// A healthy payload fits well under this; past it we are on a corrupted or
+// booby-trapped page and decoding would only burn CPU.
+const VEEV_MAX_PAYLOAD = 200000;
+
+/** LZW decompression as implemented by the Veev player. */
+function veevLzwDecode(encoded) {
+    const text = String(encoded || '');
+    if (!text) return '';
+
+    const result = [text[0]];
+    const lut = new Map();
+    let nextCode = 256;
+    let current = text[0];
+
+    for (const char of text.slice(1)) {
+        const code = char.charCodeAt(0);
+        const next = code < 256 ? char : (lut.get(code) ?? current + current[0]);
+        result.push(next);
+        lut.set(nextCode, current + next[0]);
+        nextCode += 1;
+        current = next;
+    }
+
+    return result.join('');
+}
+
+/** `parseInt` the JS way: a non-digit is 0, not an error. */
+function veevJsInt(value) {
+    return /^\d+$/.test(value) ? parseInt(value, 10) : 0;
+}
+
+/** Decode the `ch` key into the sequence of operations to replay on the URL. */
+function veevBuildArray(challenge) {
+    const groups = [];
+    const chars = String(challenge || '').split('');
+    if (chars.length === 0) return groups;
+
+    let count = veevJsInt(chars.shift());
+    while (count) {
+        const current = [];
+        for (let i = 0; i < count; i++) {
+            if (chars.length === 0) return groups;
+            current.unshift(veevJsInt(chars.shift()));
+        }
+        groups.push(current);
+        if (chars.length === 0) break;
+        count = veevJsInt(chars.shift());
+    }
+
+    return groups;
+}
+
+/** Replay the hex passes (and the optional reversal) on the encoded URL. */
+function veevDecodeUrl(encoded, operations) {
+    let decoded = String(encoded || '');
+    if (!decoded || decoded.length > VEEV_MAX_PAYLOAD) return null;
+
+    try {
+        for (const operation of operations) {
+            if (operation === 1) decoded = [...decoded].reverse().join('');
+            const bytes = decoded.match(/.{2}/g);
+            if (!bytes || bytes.length * 2 !== decoded.length) return null;
+            decoded = new TextDecoder('utf-8', { fatal: true }).decode(
+                new Uint8Array(bytes.map(b => parseInt(b, 16)))
+            );
+            decoded = decoded.split(VEEV_UTF8_PADDING).join('');
+        }
+    } catch {
+        return null;
+    }
+
+    return decoded.startsWith('http') ? decoded : null;
+}
+
+/** Candidate `ch` keys of a Veev page, newest first. */
+function extractVeevChallenges(html) {
+    const challenges = [];
+    const matches = [...String(html || '').matchAll(VEEV_CHALLENGE_PATTERN)].map(m => m[1]);
+    for (const raw of matches.reverse()) {
+        if (raw.length > VEEV_MAX_PAYLOAD) continue;
+        const decoded = veevLzwDecode(raw);
+        // An uncompressed payload decodes to itself: not a challenge.
+        if (decoded && decoded !== raw) challenges.push(decoded);
+    }
+    return challenges;
+}
+
+/**
+ * Extract the video URL from a Veev embed (veev.to, poophq, doods.to)
+ */
+async function extractVeev(veevUrl) {
+    console.log(`[EXT-VEEV] Extracting from: ${veevUrl}`);
+
+    const cacheKey = md5Hash(veevUrl);
+    const cached = caches.veev.get(cacheKey);
+    if (cached) return { ...cached, fromCache: true };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+
+    try {
+        const parsed = new URL(veevUrl);
+        let mediaId = parsed.pathname.split('/').filter(Boolean).pop() || '';
+        if (!/^[0-9a-zA-Z]+$/.test(mediaId)) {
+            return { success: false, error: 'Veev: invalid URL' };
+        }
+
+        const embedUrl = `${parsed.origin}/e/${mediaId}`;
+        const headers = {
+            'Accept': 'text/html,*/*',
+            'Referer': embedUrl,
+            'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0',
+        };
+
+        const resp = await fetchIpBoundPage(embedUrl, { headers, signal: controller.signal });
+        if (!resp.ok) return { success: false, error: `Veev: HTTP ${resp.status}` };
+        const html = resp.text;
+
+        // A redirect changes the file code: restart from the one actually served.
+        const finalId = new URL(resp.url || embedUrl).pathname.split('/').filter(Boolean).pop() || '';
+        if (/^[0-9a-zA-Z]+$/.test(finalId)) mediaId = finalId;
+
+        let sourceUrl = null;
+        for (const challenge of extractVeevChallenges(html)) {
+            const params = new URLSearchParams({
+                op: 'player_api',
+                cmd: 'gi',
+                file_code: mediaId,
+                ch: challenge,
+                ie: '1',
+            });
+            let payload;
+            try {
+                // Même sortie que la page d'embed : c'est cet appel qui obtient
+                // le lien signé, il doit partir de la même adresse.
+                const apiResp = await fetchIpBoundPage(
+                    `${parsed.origin}/dl?${params}`,
+                    { headers, signal: controller.signal },
+                );
+                payload = JSON.parse(apiResp.text);
+            } catch {
+                continue;
+            }
+
+            const fileInfo = payload?.file;
+            if (fileInfo?.file_status !== 'OK') continue;
+
+            const encoded = Array.isArray(fileInfo.dv) ? fileInfo.dv[0]?.s : null;
+            const operations = veevBuildArray(challenge);
+            if (!encoded || operations.length === 0) continue;
+
+            sourceUrl = veevDecodeUrl(veevLzwDecode(encoded), operations[0]);
+            if (sourceUrl) break;
+        }
+
+        if (!sourceUrl) {
+            return { success: false, error: 'Veev: video unavailable', reason: 'deleted' };
+        }
+
+        const result = { m3u8Url: sourceUrl, success: true, source: 'veev' };
+        caches.veev.set(cacheKey, result);
+        return result;
+    } catch (e) {
+        console.error('[EXT-VEEV] Error:', e);
+        return { success: false, error: e.message || 'Veev extraction failed' };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * Extract the HLS master from a Vidara embed.
+ *
+ * Vidara answers `POST /api/stream` with the master playlist directly. Its
+ * token encodes the IP that called the API, so extraction and playback must
+ * share an egress — which they do here, both running in the user's browser.
+ */
+async function extractVidara(vidaraUrl) {
+    console.log(`[EXT-VIDARA] Extracting from: ${vidaraUrl}`);
+
+    const cacheKey = md5Hash(vidaraUrl);
+    const cached = caches.vidara.get(cacheKey);
+    if (cached) return { ...cached, fromCache: true };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+
+    try {
+        const parsed = new URL(vidaraUrl);
+        const filecode = parsed.pathname.split('/').filter(Boolean).pop() || '';
+        if (!/^[0-9a-zA-Z]+$/.test(filecode)) {
+            return { success: false, error: 'Vidara: invalid URL' };
+        }
+
+        const resp = await fetch(`${parsed.origin}/api/stream`, {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json, */*',
+                'Content-Type': 'application/json',
+                'Referer': `${parsed.origin}/e/${filecode}`,
+                'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0',
+            },
+            body: JSON.stringify({ filecode, device: 'web' }),
+            signal: controller.signal,
+        });
+        if (!resp.ok) return { success: false, error: `Vidara: HTTP ${resp.status}` };
+
+        const payload = await resp.json();
+        const sourceUrl = payload?.streaming_url;
+        if (typeof sourceUrl !== 'string' || !sourceUrl.startsWith('http')) {
+            return { success: false, error: 'Vidara: video unavailable', reason: 'deleted' };
+        }
+
+        const result = { hlsUrl: sourceUrl, success: true, source: 'vidara' };
+        caches.vidara.set(cacheKey, result);
+        return result;
+    } catch (e) {
+        console.error('[EXT-VIDARA] Error:', e);
+        return { success: false, error: e.message || 'Vidara extraction failed' };
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -1316,22 +1788,62 @@ async function extractSeekStreaming(seekUrl) {
 
 // ===== Detection =====
 
+// VOE rotates its exit domains roughly monthly; this mirrors the alias list
+// maintained in src/utils/hosterRegistry.ts and ResolveURL's voesx plugin.
+const VOE_DOMAIN_PATTERN = new RegExp(
+    'voe\\.|(?:v-?o-?e)?-?un-?bl[o0]?c?k\\d{0,2}(?:-?voe)?\\.|(?:'
+    + '19turanosephantasia|20demidistance9elongations|30sensualizeexpression|321naturelikefurfuroid'
+    + '|35volitantplimsoles5|449unceremoniousnasoseptal|745mingiestblissfully|adrianmissionminute'
+    + '|alleneconomicmatter|antecoxalbobbing1010|anthonysaline|apinchcaseation|audaciousdefaulthouse'
+    + '|auraleanline|availedsmallest|bigclatterhomesguideservice|boonlessbestselling244|bradleyviewdoctor'
+    + '|brittneystandardwestern|brucevotewithin|caseyimpactstation|charlestoughrace|christopheruntilpoint'
+    + '|chromotypic|chuckle-tube|cindyeyefinal|claudiosepulchral|conscientiousedu|counterclockwisejacky'
+    + '|crownmakermacaronicism|crystaltreatmenteast|cyamidpulverulence530|dianaavoidthey|diananatureforeign'
+    + '|donaldlineelse|edwardarriveoften|effortlessexperim|ellenpoliticalfollow|erikcoldperson|figeterpiazine'
+    + '|fittingcentermondaysunday|fraudclatterflyingcar|gamoneinterrupted|garylargeavailable|generatesnitrosate'
+    + '|goofy-banana|graceaddresscommunity|greaseball6eventual20|guidon40hyporadius9|heatherdiscussionwhen'
+    + '|housecardsummerbutton|ianrequireadult|jamessoundcost|jamiesamewalk|jasminetesttry|jayservicestuff'
+    + '|jeanprofessorcentral|jefferycontrolmodel|jennifercertaindevelopment|jennifereconomicgive|jessicachoosemake'
+    + '|jessicayeahcatch|jilliandescribecompany|johnalwayssame|johnbeyondnation|jonathansociallike'
+    + '|josephseveralconcern|juliewomanwish|kathleenmemberhistory|kellywhatcould|kennethofficialitem|kinoger'
+    + '|kristiesoundsimply|lancewhosedifficult|launchreliantcleaverriver|lauradaydo|letsupload|lisatrialidea'
+    + '|loriwithinfamily|lukecomparetwo|lukesitturn|mariatheserepublican|marissasharecareer|matriculant401merited'
+    + '|matthewhotelscience|maxfinishseveral|metagnathtuggers|michaelapplysome|mikaylaarealike|nathanfromsubject'
+    + '|nectareousoverelate|nonesnanking|ogladaj|pamelachangemission|paulkitchendark|preferciseaccurate'
+    + '|prepareddare|ralphysuccessfull|realfinanceblogcenter|rebeccaneverbase|rebeccapracticeloss'
+    + '|reputationsheriffkennethsand|richardsignfish|roberteachfinal|robertordercharacter|robertplacespace'
+    + '|sandratableother|sandrataxeight|scatch176duplicities|sethniceletter|shannonpersonalcost'
+    + '|simpulumlamerop|smoki|stevenfamilyedge|stevenimaginelittle|strawberriesporail|telyn610zoanthropy'
+    + '|timberwoodanotia|timmaybealready|toddpartneranimal|toxitabellaeatrebates306|tracylocalschool'
+    + '|uptodatefinishconferenceroom|valeronevijao|walterprettytheir|wolfdyslectic|yodelswartlike)\\.',
+    'i'
+);
+
+const DOODSTREAM_DOMAIN_PATTERN = new RegExp(
+    'do*0*o*0*ds?(?:tream|ter|cdn)?\\.(?:com|to|so|sh|cx|la|ws|pm|wf|re|yt|li|work|stream|io|net|pro)'
+    + '|ds[2v](?:play|video)\\.com|(?:my)?vid(?:pla?y|e0)\\.(?:com|net)|vvide0\\.com'
+    + '|all3do\\.com|do7go\\.com|doply\\.net|d-s\\.io|playmogo\\.com',
+    'i'
+);
+
+const LULUSTREAM_DOMAIN_PATTERN =
+    /(?:lulu(?:stream|vi?do?o?)?|streamhihi|d00ds|cdn1|732eg54de642sa)\.(?:com|sbs|site|st)/i;
+
+const VEEV_DOMAIN_PATTERN = /\b(?:veev|poophq|doods)\.(?:to|com|pro)\b/i;
+
 const EMBED_PATTERNS = {
-    voe: url => {
-        const voeDomains = ['voe.sx', 'voe.st', 'voe.gx', 'ralphysuccessfull.org', 'claudiosepulchral.org',
-            'anthonysaline.org', 'auraleanline.org', 'letsupload.io'];
-        return voeDomains.some(d => url.toLowerCase().includes(d));
-    },
+    voe: url => VOE_DOMAIN_PATTERN.test(url),
     fsvid: url => url.toLowerCase().includes('fsvid'),
     vidzy: url => url.toLowerCase().includes('vidzy'),
     vidmoly: url => url.toLowerCase().includes('vidmoly'),
     sibnet: url => url.toLowerCase().includes('sibnet.ru'),
     uqload: url => /\buqload\.[a-z]{2,24}(?=[/:?#]|$)/i.test(url),
-    doodstream: url => {
-        const lower = url.toLowerCase();
-        return lower.includes('d0000d.com') || lower.includes('doodstream.com') || lower.includes('dood.')
-            || lower.includes('myvidplay.com') || lower.includes('dsvplay.com') || lower.includes('doply.net');
-    },
+    // Veev shares `doods.to` with the DoodStream cluster but speaks a different
+    // protocol — it must stay ABOVE doodstream, whose pattern also matches it.
+    veev: url => VEEV_DOMAIN_PATTERN.test(url),
+    doodstream: url => DOODSTREAM_DOMAIN_PATTERN.test(url),
+    lulustream: url => LULUSTREAM_DOMAIN_PATTERN.test(url),
+    vidara: url => /\bvidara\.(?:to|so)\b/i.test(url),
     seekstreaming: url => Boolean(parseSeekStreamingEmbedUrl(url)),
 };
 
@@ -1342,13 +1854,16 @@ const EXTRACT_FN = {
     vidmoly: extractVidmoly,
     sibnet: extractSibnet,
     uqload: extractUqload,
+    veev: extractVeev,
     doodstream: extractDoodStream,
+    lulustream: extractLuluStream,
+    vidara: extractVidara,
     seekstreaming: extractSeekStreaming,
 };
 
 const PRIORITIES = {
-    voe: 1, fsvid: 1, vidzy: 1, vidmoly: 1, sibnet: 1, seekstreaming: 1,
-    uqload: 2, doodstream: 2,
+    voe: 1, fsvid: 1, vidzy: 1, vidmoly: 1, sibnet: 1, seekstreaming: 1, vidara: 1,
+    uqload: 2, doodstream: 2, lulustream: 2, veev: 2,
 };
 
 /**
@@ -1479,6 +1994,17 @@ async function setupHeadersForService(type, url, referer) {
         sibnet: { 'Referer': 'https://video.sibnet.ru/', 'Origin': 'https://video.sibnet.ru' },
         uqload: uqloadHeaders,
         doodstream: { 'Referer': referer || 'https://d0000d.com/', 'Origin': referer ? new URL(referer).origin : 'https://d0000d.com' },
+        lulustream: {
+            'Referer': 'https://lulustream.com/',
+            'Origin': 'https://lulustream.com',
+            'Accept-Language': CLUSTER_ACCEPT_LANGUAGE,
+        },
+        veev: {
+            'Referer': 'https://veev.to/',
+            'Origin': 'https://veev.to',
+            'Accept-Language': CLUSTER_ACCEPT_LANGUAGE,
+        },
+        vidara: { 'Referer': 'https://vidara.to/', 'Origin': 'https://vidara.to' },
         seekstreaming: seekHeaders,
         cinep: { 'Referer': 'https://purstream.mx/', 'Origin': 'https://purstream.mx' },
         kisskh: { 'Referer': 'https://kisskh.nl/', 'Origin': 'https://kisskh.nl' },
@@ -1501,15 +2027,35 @@ async function setupHeadersForService(type, url, referer) {
             domainPattern = getSeekStreamingPlaybackRulePattern(url);
         } else if (type === 'sibnet') {
             domainPattern = '*://*.sibnet.ru/*';
-        } else if (type === 'vidzy') {
-            // Same referer on the apex and on every sub-host, so one rule covers both.
+        } else if (type === 'vidzy' || type === 'vidara' || type === 'lulustream') {
+            // Same referer on the apex and on every sub-host, so one rule covers
+            // both. Vidara and LuluStream spread their segments over numbered
+            // CDN siblings (s25-wyl2.s1q2105.com…), which an exact-host rule
+            // would leave unmatched.
             domainPattern = `*://*${registrable}/*`;
         } else if (type === 'fsvid' && parsedUrl.hostname !== registrable) {
             // The fsvid apex needs the fs13.lol referer, so only widen the CDN hosts.
             domainPattern = `*://*.${registrable}/*`;
         }
         if (!domainPattern) return null;
-        return { domainPattern, headers: hdrs };
+        // La règle d'extraction doit couvrir toute la grappe : un 301 fait
+        // passer la requête de lulustream.com à luluvdo.com, et un motif calculé
+        // sur l'URL de départ laisserait la cible du 301 sans règle.
+        //
+        // Mais `requestDomains` filtre l'hôte DEMANDÉ, pas l'initiateur : posé
+        // sur l'URL média (dylri5nnnaos.tnmr.org…), qui n'appartient pas à la
+        // grappe, il ne peut jamais correspondre et rend la règle de lecture
+        // inerte — le lecteur repart alors sans Origin/Referer ni
+        // Accept-Language épinglé. On ne le pose donc que sur la page d'embed.
+        const clusterDomains =
+            type === 'lulustream' ? LULUSTREAM_RULE_DOMAINS
+            : type === 'veev' ? VEEV_RULE_DOMAINS
+            : [];
+        const removeDomains = clusterDomains.some(
+            (domain) => parsedUrl.hostname === domain
+                || parsedUrl.hostname.endsWith(`.${domain}`),
+        ) ? clusterDomains : [];
+        return { domainPattern, headers: hdrs, removeHeaders: [], removeDomains };
     } catch (e) {
         console.error(`[EXT-EXTRACT] Failed to setup headers for ${type}:`, e);
         return null;
@@ -1552,6 +2098,9 @@ if (typeof globalThis !== 'undefined') {
         extractSibnet,
         extractUqload,
         extractDoodStream,
+        extractLuluStream,
+        extractVeev,
+        extractVidara,
         extractSeekStreaming,
         extractSingle,
         extractAll,

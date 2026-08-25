@@ -11,7 +11,7 @@ import { useSafeRemarkGfm } from '../utils/markdownPlugins';
 import remarkEmoji from 'remark-emoji';
 import { useTranslation } from 'react-i18next';
 import HLSPlayer, { HLSPlayerRef } from '../components/HLSPlayer';
-import { SocketState, ChatMessage, Participant, PlaybackState, WatchPartyRoom as RoomInfo, getShareLink, ControlRequest, ControlState, PauseTimer, ParticipantSyncStatus, ScheduledPlaybackEvent, SyncMode, SyncProbeResult } from '../utils/watchparty';
+import { SocketState, ChatMessage, Participant, PlaybackState, WatchPartyRoom as RoomInfo, getShareLink, ControlRequest, ControlState, PauseTimer, ParticipantSyncStatus, ScheduledPlaybackEvent, SyncMode, SyncProbeResult, getRoomToken, storeRoomToken, clearRoomToken } from '../utils/watchparty';
 import { FloatingReactionsContainer, REACTION_EMOJIS, extractReactionEmojis } from '../components/FloatingReaction';
 import { useWrappedTracker } from '../hooks/useWrappedTracker';
 import { WATCHPARTY_API } from '../config/runtime';
@@ -25,6 +25,7 @@ const getHostPositionUpdateInterval = (mode: SyncMode) =>
 interface LocationState {
   nickname?: string;
   roomCode?: string;
+  token?: string;
 }
 
 interface PauseVoteState {
@@ -617,11 +618,24 @@ const WatchPartyRoom: React.FC = () => {
     setError(null); // Clear previous errors on new connection attempt
     setSocketState(SocketState.CONNECTING);
 
+    // Le serveur exige un token de room (délivré par /create ou /join) pour lire
+    // les détails de la room et pour ouvrir la socket. Il arrive via l'état de
+    // navigation, ou depuis sessionStorage après un rafraîchissement.
+    const token = locationState.token || getRoomToken(roomId);
+    if (!token) {
+      setError(t('watchParty.accessTokenMissing'));
+      setSocketState(SocketState.ERROR);
+      return;
+    }
+    if (locationState.token) storeRoomToken(roomId, locationState.token);
+
     try {
       const savedNickname = localStorage.getItem('watchPartyNickname');
       const nickname = locationState.nickname || savedNickname || `Guest${Math.floor(Math.random() * 1000)}`;
 
-      const roomDetailsResponse = await axios.get(`${MAIN_API}/api/watchparty/room/${roomId}`);
+      const roomDetailsResponse = await axios.get(`${MAIN_API}/api/watchparty/room/${roomId}`, {
+        headers: { 'x-watchparty-token': token }
+      });
       if (!mounted) return;
       const fetchedRoomInfo = roomDetailsResponse.data.room as RoomInfo;
       setRoomInfo(fetchedRoomInfo);
@@ -637,7 +651,7 @@ const WatchPartyRoom: React.FC = () => {
       }
 
       const socket = io(`${MAIN_API}/watchparty`, {
-        query: { roomId, nickname },
+        query: { roomId, nickname, token },
         reconnectionAttempts: 3,
         reconnectionDelay: 1000,
         timeout: 5000,
@@ -867,13 +881,22 @@ const WatchPartyRoom: React.FC = () => {
     } catch (err: unknown) {
       if (!mounted) return;
       console.error('Connection setup error:', err);
+      // Token expiré ou révoqué (kick, redémarrage serveur) : on le jette pour
+      // que l'utilisateur repasse par l'écran de code plutôt que de boucler.
+      if (axios.isAxiosError(err) && err.response?.status === 403) {
+        clearRoomToken(roomId);
+        setError(t('watchParty.accessTokenInvalid'));
+        setSocketState(SocketState.ERROR);
+        initialFetchDoneRef.current = true;
+        return;
+      }
       const errorMessage = err instanceof Error ? err.message : t('watchParty.unableToJoinRoom');
       setError(errorMessage);
       setSocketState(SocketState.ERROR);
       initialFetchDoneRef.current = true; // Mark fetch as done even if erroring to allow error display
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, locationState.nickname, navigate]); // Removed userId and isCurrentUserHost to avoid re-triggering connection on their change
+  }, [roomId, locationState.nickname, locationState.token, navigate]); // Removed userId and isCurrentUserHost to avoid re-triggering connection on their change
 
   useEffect(() => {
     connectSocket(); // Initial connection attempt
@@ -1159,6 +1182,8 @@ const WatchPartyRoom: React.FC = () => {
       socketRef.current.on('room:kicked', () => {
         setError(t('watchParty.kickedByHost'));
         setSocketState(SocketState.ERROR);
+        // Le serveur a révoqué le token : inutile de le garder côté client.
+        if (roomId) clearRoomToken(roomId);
         if (socketRef.current) socketRef.current.disconnect();
         setTimeout(() => navigate('/'), 5000);
       });
@@ -1169,7 +1194,7 @@ const WatchPartyRoom: React.FC = () => {
         socketRef.current.off('room:kicked');
       }
     };
-  }, [socketRef.current, navigate]);
+  }, [socketRef.current, navigate, roomId]);
 
   // useCallback so ChatMessageItem (memoized) doesn't see a fresh function on every
   // root re-render — keeps the per-message memo bail-out effective. — perf
@@ -1267,7 +1292,6 @@ const WatchPartyRoom: React.FC = () => {
       nightflixSources: [],
       nexusSources: [],
       mp4Sources: [],
-      rivestreamSources: [],
       captions: [],
     });
     setShowChangeMediaModal(false);
@@ -1608,17 +1632,6 @@ const WatchPartyRoom: React.FC = () => {
                   })) || []}
                   purstreamSources={bravoSources}
                   mp4Sources={mp4Sources}
-                  rivestreamSources={roomInfo.media?.rivestreamSources?.map(rsSource => ({
-                    url: rsSource.url,
-                    label: rsSource.label,
-                    quality: rsSource.quality,
-                    service: rsSource.service,
-                    category: rsSource.category
-                  })) || []}
-                  rivestreamCaptions={roomInfo.media?.captions?.map(caption => ({
-                    label: caption.label,
-                    file: caption.file
-                  })) || []}
                   onPlayerPlay={handlePlayerPlay}
                   onPlayerPause={handlePlayerPause}
                   onPlayerTimeUpdate={handlePlayerTimeUpdate}
@@ -2005,6 +2018,8 @@ const WatchPartyRoom: React.FC = () => {
       </div>
 
       {/* Floating chat button - shown when chat is hidden */}
+      {/* z-[45] : au-dessus de la barre de controles du lecteur (z-40), sinon le bouton
+          passe dessous et devient incliquable ; reste sous les modales (z-50). */}
       {!showChatPanel && (
         <motion.button
           initial={{ scale: 0, opacity: 0 }}
@@ -2013,7 +2028,7 @@ const WatchPartyRoom: React.FC = () => {
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}
           onClick={() => setShowChatPanel(true)}
-          className="fixed bottom-6 right-6 z-30 p-4 bg-red-600 hover:bg-red-700 rounded-full shadow-lg transition-colors"
+          className="fixed bottom-6 right-6 z-[45] p-4 bg-red-600 hover:bg-red-700 rounded-full shadow-lg transition-colors"
           title={t('watchParty.openChat')}
         >
           <MessageSquare size={24} className="text-white" />
@@ -2087,7 +2102,7 @@ const WatchPartyRoom: React.FC = () => {
             initial={{ x: 300, opacity: 0 }}
             animate={{ x: 0, opacity: 1 }}
             exit={{ x: 300, opacity: 0 }}
-            className="fixed bottom-4 right-4 z-40 bg-black/90 border border-white/10 rounded-xl shadow-2xl p-4 max-w-xs w-full backdrop-blur-md"
+            className="fixed bottom-4 right-4 z-[46] bg-black/90 border border-white/10 rounded-xl shadow-2xl p-4 max-w-xs w-full backdrop-blur-md"
           >
             <h4 className="text-sm font-semibold mb-3 flex items-center gap-2 text-yellow-400">
               <Hand size={16} /> {t('watchParty.controlRequests')}

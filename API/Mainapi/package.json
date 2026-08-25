@@ -4,12 +4,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
-    "test": "npm run test:paygate",
-    "test:paygate": "node --test utils/__tests__/vipPaygate.test.js utils/__tests__/vipDonations.paygate.test.js tests/smoke/vipPaygateRoutes.test.js",
-    "test:all": "node --test \"utils/__tests__/*.test.js\" \"tests/smoke/*.test.js\"",
-    "db:init": "node scripts/init-db.js",
-    "test:db-init": "node --test \"db/__tests__/*.test.js\""
+    "dev": "node server.js"
   },
   "dependencies": {
     "@fastify/compress": "^8.3.1",

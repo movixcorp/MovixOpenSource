@@ -11,6 +11,8 @@ import {
   getPendingAuthAction,
   persistResolvedSession,
 } from '../utils/accountAuth';
+import { getSessionCreationHeaders } from '../utils/sessionClientId';
+import { useTurnstileBypass } from '../hooks/useTurnstileBypass';
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY;
@@ -54,7 +56,14 @@ const CreateAccount: React.FC<CreateAccountProps> = ({ mode = 'create' }) => {
   const [turnstileToken, setTurnstileToken] = useState('');
   const turnstileRef = useRef<HTMLDivElement>(null);
   const widgetIdRef = useRef<string | null>(null);
-  const isTurnstileEnabled = typeof TURNSTILE_SITE_KEY === 'string' && TURNSTILE_SITE_KEY.trim().length > 0;
+  // Dispense admin. Elle ne joue que pour une session déjà ouverte — se
+  // connecter ou créer un compte se fait avant que le serveur ne sache qui
+  // frappe, donc le challenge reste entier dans le cas courant. Voir
+  // `utils/turnstileBypass.ts`.
+  const turnstileBypass = useTurnstileBypass();
+  const isTurnstileEnabled = typeof TURNSTILE_SITE_KEY === 'string'
+    && TURNSTILE_SITE_KEY.trim().length > 0
+    && turnstileBypass !== 'bypass';
   const pendingAction = getPendingAuthAction();
   const hasValidLinkAction = pendingAction?.type === 'link' && pendingAction.provider === 'bip39';
   const stateReturnTo = typeof location.state === 'object' && location.state && 'returnTo' in location.state && typeof location.state.returnTo === 'string'
@@ -203,6 +212,7 @@ const CreateAccount: React.FC<CreateAccountProps> = ({ mode = 'create' }) => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...getSessionCreationHeaders(),
         },
         body: JSON.stringify({
           mnemonic,

@@ -11,12 +11,88 @@ const router = express.Router();
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
+const {
+  encodeSignedToken,
+  decodeSignedToken,
+  signingConfigured,
+} = require('../utils/mediaSigning');
 
 // ===========================================================================================
 // ===== FRANCE.TV (FTV) SOURCE — Recherche + épisodes d'une série/collection =====
 // ===========================================================================================
 
 const FTV_BASE = 'https://www.france.tv';
+
+// ===========================================================================
+//  Jetons France.tv
+// ===========================================================================
+// Les adresses de pages France.tv font un aller-retour par le navigateur :
+// il les reçoit ici, puis les redonne à /episodes, /info et à l'extraction DRM.
+// Les confier en clair reviendrait à laisser le client choisir la cible — c'est
+// exactement la faille SSRF que le reste du projet vient de fermer.
+//
+// Chaque URL sort donc emballée dans un jeton signé (`token`), et les endpoints
+// n'acceptent plus que ce jeton. Le client transporte, il ne fabrique pas.
+//
+// Le middleware ci-dessous enveloppe `res.json` une fois pour toutes : il
+// couvre les sept endroits qui émettent une `url`, réponses en cache comprises.
+
+const FTV_TOKEN_ROUTE = 'ftv';
+const FTV_TOKEN_MAX_DEPTH = 8;
+
+/** Vrai si l'URL vise bien France Télévisions. */
+function isFranceTvUrl(value) {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return false;
+    const hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    return hostname === 'france.tv' || hostname.endsWith('.france.tv');
+  } catch {
+    return false;
+  }
+}
+
+/** Emballe une URL France.tv dans un jeton signé, ou null si elle est hors périmètre. */
+function signFtvUrl(url) {
+  if (!isFranceTvUrl(url) || !signingConfigured()) return null;
+  return encodeSignedToken(FTV_TOKEN_ROUTE, url);
+}
+
+/** Déballe un jeton et vérifie que la cible reste une URL France.tv. */
+function resolveFtvToken(token) {
+  const url = decodeSignedToken(FTV_TOKEN_ROUTE, token);
+  return isFranceTvUrl(url) ? url : null;
+}
+
+/** Ajoute un `token` à côté de chaque `url` France.tv de la charge utile. */
+function attachFtvTokens(payload, depth = 0) {
+  if (!payload || typeof payload !== 'object' || depth > FTV_TOKEN_MAX_DEPTH) return payload;
+
+  if (Array.isArray(payload)) {
+    return payload.map((item) => attachFtvTokens(item, depth + 1));
+  }
+
+  const out = {};
+  for (const [key, value] of Object.entries(payload)) {
+    out[key] = attachFtvTokens(value, depth + 1);
+  }
+
+  for (const field of ['url', 'program_url']) {
+    if (typeof payload[field] === 'string' && !out[`${field}_token`]) {
+      const token = signFtvUrl(payload[field]);
+      if (token) out[`${field}_token`] = token;
+    }
+  }
+
+  return out;
+}
+
+router.use((req, res, next) => {
+  const sendJson = res.json.bind(res);
+  res.json = (payload) => sendJson(attachFtvTokens(payload));
+  next();
+});
 
 // --- FTV: Cache du next-action hash (TTL 30 min) ---
 let ftvNextActionHash = null;
@@ -308,9 +384,12 @@ router.post('/search', async (req, res) => {
 // ---------------------------------------------------------------------------
 router.get('/episodes', async (req, res) => {
   try {
-    const { url } = req.query;
-    if (!url || !url.includes('france.tv')) {
-      return res.status(400).json({ success: false, error: 'URL france.tv requise' });
+    // Jeton uniquement : l'ancien `?url=` se contentait d'un
+    // `url.includes('france.tv')`, que `https://interne.exemple/france.tv`
+    // satisfaisait — le client pouvait donc désigner n'importe quelle cible.
+    const url = resolveFtvToken(req.query.token);
+    if (!url) {
+      return res.status(400).json({ success: false, error: 'Jeton France.tv invalide ou expiré' });
     }
 
     // Check cache (4h expiration for episodes)
@@ -493,9 +572,10 @@ async function fetchSeasonEpisodesViaDeepPage(seasonPath, seasonNum) {
 // ---------------------------------------------------------------------------
 router.get('/info', async (req, res) => {
   try {
-    const { url } = req.query;
-    if (!url || !url.includes('france.tv')) {
-      return res.status(400).json({ success: false, error: 'URL france.tv requise' });
+    // Jeton uniquement — voir /episodes.
+    const url = resolveFtvToken(req.query.token);
+    if (!url) {
+      return res.status(400).json({ success: false, error: 'Jeton France.tv invalide ou expiré' });
     }
 
     // Check cache (4h expiration for info)

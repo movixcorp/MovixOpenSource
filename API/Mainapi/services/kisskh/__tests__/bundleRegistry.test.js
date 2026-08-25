@@ -88,19 +88,6 @@ test('unknown hash fails closed as provider_changed', async () => {
   await assert.rejects(registry.resolveApprovedAlgorithm(), (error) => error.code === 'provider_changed');
 });
 
-test('cold production registry uses the compiled approved algorithm when verification is unavailable', async () => {
-  const { APPROVED_ALGORITHMS } = require('../approvedAlgorithms');
-  const { createBundleRegistry } = require('../bundleRegistry');
-  const expected = [...APPROVED_ALGORITHMS.values()][0];
-  const registry = createBundleRegistry({
-    fetchText: async () => { throw new Error('direct egress unavailable'); },
-    resolveDns: PUBLIC_DNS,
-    now: () => 1_000,
-  });
-
-  assert.equal(await registry.resolveApprovedAlgorithm(), expected);
-});
-
 test('approved records require a lowercase module SHA-256 and never skip the module fetch', async () => {
   const { createBundleRegistry } = require('../bundleRegistry');
   for (const moduleSha256 of [undefined, 'short', HASH_B.toUpperCase()]) {

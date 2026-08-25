@@ -122,6 +122,52 @@ test('iOS media proxy policy and its XCTest suite are compiled by their targets'
   assert.doesNotMatch(policy, /length != 96 \|\| bytes\[8\] == 0/);
 });
 
+// Ces deux-là ne peuvent pas être vérifiés autrement depuis un poste sans
+// Xcode : le compilateur ne passera jamais ici, donc au minimum on vérifie que
+// les fichiers sont bien compilés par la cible et que le nom du schéma est le
+// même des trois côtés (Swift, patch WebView, script injecté). Une divergence
+// de nom ne se verrait qu'à l'exécution, par un média qui ne charge pas.
+test('iOS media proxy journal is compiled by the app target', async () => {
+  const [project, journal] = await Promise.all([
+    text('../ios/Movix.xcodeproj/project.pbxproj'),
+    text('../ios/Movix/Proxy/MediaProxyJournal.swift'),
+  ]);
+
+  // Deux occurrences : la déclaration PBXBuildFile et l'entrée de la phase
+  // Sources — même compte que pour MediaProxyPolicy.swift.
+  assert.equal(project.match(/MediaProxyJournal\.swift in Sources/g)?.length, 2);
+  assert.match(project, /MediaProxyJournal\.swift \*\/ = \{isa = PBXFileReference/);
+  // Parité de format avec MediaProxyJournal.kt : mêmes préfixes de ligne, sans
+  // quoi les journaux des deux plateformes ne se comparent plus.
+  for (const prefix of ['  ~ ', '  > ', '  < ', '  corps: ', '  erreur: ']) {
+    assert.ok(journal.includes(prefix), `préfixe de journal attendu : ${prefix}`);
+  }
+});
+
+test('iOS custom media scheme is compiled, registered, and named identically everywhere', async () => {
+  const [project, handler, webviewPatch, runtime, browser] = await Promise.all([
+    text('../ios/Movix.xcodeproj/project.pbxproj'),
+    text('../ios/Movix/Proxy/MediaProxySchemeHandler.swift'),
+    text('../patches/react-native-webview+13.16.1.patch'),
+    text('../src/injection/bridge-runtime.ts'),
+    text('../src/components/WebViewBrowser.tsx'),
+  ]);
+
+  assert.equal(
+    project.match(/MediaProxySchemeHandler\.swift in Sources/g)?.length,
+    2,
+  );
+  // Le fichier est compilé dans l'app, mais la classe est instanciée depuis les
+  // Pods par NSClassFromString : le nom exposé à l'Objective-C fait le lien.
+  assert.match(handler, /@objc\(MovixMediaSchemeHandler\)/);
+  assert.match(handler, /WKURLSchemeHandler/);
+  assert.match(webviewPatch, /NSClassFromString\(@"MovixMediaSchemeHandler"\)/);
+  assert.match(webviewPatch, /setURLSchemeHandler:handler forURLScheme:@"movix-media"/);
+  assert.match(handler, /static let scheme = "movix-media"/);
+  assert.match(runtime, /__MOVIX_MEDIA_PROXY_SCHEME__/);
+  assert.match(browser, /mediaProxyScheme: Platform\.OS === 'ios' \? 'movix-media' : null/);
+});
+
 test('iOS HLS playlist rewriter and its XCTest suite are compiled by their targets', async () => {
   const [project, rewriter, tests] = await Promise.all([
     text('../ios/Movix.xcodeproj/project.pbxproj'),

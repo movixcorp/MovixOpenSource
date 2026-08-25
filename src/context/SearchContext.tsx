@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import axios from 'axios';
 import i18n from '../i18n';
+import { searchIndexedMedia, type IndexedMedia } from '../utils/mediaSearchIndex';
 import { getTmdbLanguage } from '../i18n';
 import { TmdbKeyword, fetchTmdbMediaKeywordIds, searchTmdbKeywords } from '../utils/tmdbKeywords';
 
@@ -149,6 +150,21 @@ const GENRES_FR: Record<number, string> = {
   10767: 'Talk-show',
   10768: 'Guerre & Politique'
 };
+
+/** Une entrée du catalogue local, au format des résultats TMDB. */
+const toSearchResult = (entry: IndexedMedia): SearchResult => ({
+  id: entry.id,
+  media_type: entry.mediaType,
+  title: entry.mediaType === 'movie' ? entry.title : undefined,
+  name: entry.mediaType === 'tv' ? entry.title : undefined,
+  poster_path: entry.posterPath || '',
+  backdrop_path: entry.backdropPath || undefined,
+  release_date: entry.mediaType === 'movie' ? entry.date : undefined,
+  first_air_date: entry.mediaType === 'tv' ? entry.date : undefined,
+  vote_average: entry.voteAverage ?? 0,
+  genre_ids: entry.genreIds ?? [],
+  overview: entry.overview,
+});
 
 export const SearchProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [query, setQuery] = useState('');
@@ -745,6 +761,22 @@ export const SearchProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           else if (endpoint === 'discover/tv') tmdbResults = tmdbResults.map((result: any) => ({ ...result, media_type: 'tv' }));
           searchResults = tmdbResults;
         }
+      }
+
+      // Le catalogue local prolonge TMDB là où il est aveugle : mots-clés,
+      // titres alternatifs, thèmes et personnages des fiches déjà ouvertes.
+      // Uniquement en première page, et derrière les résultats de TMDB — ce
+      // sont des repêchages, pas des réponses plus pertinentes.
+      if (isNewSearch && query) {
+        const alreadyThere = new Set(searchResults.map((result) => `${result.media_type}:${result.id}`));
+        const fromIndex = searchIndexedMedia(query)
+          .filter((entry) => !alreadyThere.has(`${entry.mediaType}:${entry.id}`))
+          .filter((entry) => selectedType === 'all' || entry.mediaType === selectedType)
+          .filter((entry) => (entry.voteAverage ?? 0) >= minRating)
+          .filter((entry) => selectedGenres.length === 0
+            || (entry.genreIds ?? []).some((genreId) => selectedGenres.includes(genreId)))
+          .map(toSearchResult);
+        searchResults = [...searchResults, ...fromIndex];
       }
 
       if (isNewSearch) {

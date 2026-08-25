@@ -1,5 +1,24 @@
 # CLAUDE.md - Movix Project Guide
 
+## Model selection — important for agents and subagents
+
+**Don't default to Opus 4.7 for everything.** Opus 4.7 is the most expensive and slowest tier — it should only run on tasks that genuinely need deep reasoning. When you dispatch a subagent (Agent tool) or pick a model for a delegated task, match the model to the work:
+
+| Model | When to pick it |
+|---|---|
+| **`claude-haiku-4-5`** | Fast/cheap. Use for: mechanical rewrites, file moves, single-file edits where the spec is already clear, formatting, search-and-replace, simple lookups, i18n string additions, log/output filtering, dotfile tweaks. |
+| **`claude-sonnet-4-6`** | Balanced default. Use for: most coding tasks (multi-file edits, refactors, new features with a clear spec, bug fixes), code review, exploration agents, writing tests, building React components, wiring contexts/providers. |
+| **`claude-opus-4-7`** | Slow + expensive. Reserve for: architecture decisions, novel system design, debugging gnarly cross-layer bugs, writing long specs, security analysis with multiple unknowns, ambiguous user requirements that need real interpretation. |
+
+**Default rule:** if you can describe the task to a junior dev in under 3 sentences and they'd know what to do, use **Sonnet** or **Haiku**. Reach for Opus only when the task itself is "figure out *what* to build", not just "build *this*".
+
+Concretely for Movix:
+- Adding a settings toggle, an i18n key, a small CSS rule → **Haiku**
+- Implementing a feature with existing patterns (new context, new tool, new route) → **Sonnet**
+- Designing the MCP architecture, deciding OAuth scope structure, debugging the sync race → **Opus**
+
+When in doubt, **start with Sonnet** and escalate to Opus only if the model visibly struggles.
+
 ## Project Overview
 
 Movix is an open-source French streaming platform monorepo. It includes a React frontend, multiple Node.js/Python backend services, browser extensions, a Rust WASM sync engine, Cloudflare Workers, and a Discord Rich Presence integration.
@@ -19,7 +38,6 @@ Movix is an open-source French streaming platform monorepo. It includes a React 
 | Real-time | Socket.IO (client + server) |
 | Backend (Main) | Node.js + Express 5 + MySQL + Redis |
 | Backend (Proxy) | Python + aiohttp (async) |
-| Backend (Misc) | Python + Flask (bypass403) |
 | WASM | Rust (watchparty sync engine) |
 | Extensions | Chrome (MV3) + Firefox (MV2) + Tampermonkey |
 | Edge | Cloudflare Workers |
@@ -56,9 +74,8 @@ movix-main/
 │   │   ├── utils/          # Cache, proxy, concurrency helpers
 │   │   └── config/         # Redis config
 │   ├── watchpartyAPI/      # Socket.IO WatchParty service (port 25566)
-│   ├── proxiesembed/       # Python aiohttp proxy (port 25569)
-│   │   └── drmproxy/       # DRM/embed extractors (30+ services)
-│   └── miscs/              # Flask bypass403 proxy (port 25568)
+│   └── proxiesembed/       # Python aiohttp proxy (port 25569)
+│       └── drmproxy/       # DRM/embed extractors (30+ services)
 ├── extension/
 │   ├── Chrome/             # Manifest V3 extension
 │   └── Firefox/            # Manifest V2 extension
@@ -67,7 +84,6 @@ movix-main/
 │   └── watchparty-sync/    # Rust sync engine -> WebAssembly
 ├── PreMid/                 # Discord Rich Presence (TypeScript)
 ├── cloudflareproxy/        # Cloudflare Worker CORS relay
-├── RivestreamCloudflareProxy/  # Rivestream Worker variant
 ├── functions/              # Serverless edge handlers
 ├── others/                 # Misc (bad domains, redirections)
 └── public/                 # Static assets, service worker, WASM output
@@ -91,7 +107,6 @@ npm run wasm:watchparty-sync:build:dev  # Debug build
 # API/Mainapi: node server.js (cluster mode, port 25565)
 # API/watchpartyAPI: node watchparty.js (port 25566)
 # API/proxiesembed: python server.py (port 25569)
-# API/miscs: python bypass403.py (port 25568)
 ```
 
 ## Environment Variables
@@ -101,14 +116,11 @@ Frontend (`.env`):
 - `VITE_TMDB_API_KEY` - TMDB metadata API key
 - `VITE_SITE_URL` - Site base URL
 - `VITE_WATCHPARTY_API` - WatchParty Socket.IO URL
-- `VITE_PROXY_BASE_URL` - Proxy service URL
-- `VITE_API_PROXY_BASE_URL` - API proxy URL
 - `VITE_PROXIES_EMBED_API` - Python proxy service URL
-- `VITE_RIVESTREAM_PROXIES` - Comma-separated Cloudflare Worker URLs
 - `VITE_TURNSTILE_SITE_KEY` / `VITE_TURNSTILE_INVISIBLE_SITEKEY` - Cloudflare Turnstile
 - `VITE_SUPPORT_TELEGRAM_URL` - Support link
 
-Backend: see `API/Mainapi/.env.example` (~100 variables), `API/proxiesembed/.env.example`, `API/miscs/.env.example`
+Backend: see `API/Mainapi/.env.example` (~100 variables) and `API/proxiesembed/.env.example`
 
 ## Code Conventions
 
@@ -157,7 +169,6 @@ Browser -> Vite Dev Server (3000) -> React SPA
 React SPA -> Main API (25565)      [REST + Socket.IO]
 React SPA -> WatchParty API (25566) [Socket.IO /watchparty namespace]
 React SPA -> Proxies Embed (25569) [HTTP proxy/DRM]
-React SPA -> Bypass403 (25568)     [HTTP header proxy]
 React SPA -> Cloudflare Workers    [CORS relay]
 Main API  -> MySQL, Redis, TMDB, 30+ scraping sources
 ```
@@ -183,7 +194,7 @@ Multiple player implementations depending on source type:
 
 ### Service Worker Fallback Domain
 
-Quand `movix.cash` devient injoignable (blocage FAI), le SW (`public/sw.js`) intercepte les navigations et redirige vers un miroir alive :
+Quand `movix.tax` devient injoignable (blocage FAI), le SW (`public/sw.js`) intercepte les navigations et redirige vers un miroir alive :
 
 1. SW race `fetch(req)` contre timeout 3s
 2. Sur échec réseau (TypeError/AbortError) → load mirrors list
@@ -194,7 +205,7 @@ Complément côté React : `src/services/blockDetection.ts` pose un interceptor 
 
 Admin : éditer la paste rentry pour ajouter/retirer un miroir. Nouveaux clients voient la liste immédiatement ; clients existants après ≤ 24h (TTL cache SW).
 
-Scope : ne sauve QUE les users ayant déjà visité `movix.cash` au moins une fois avant le blocage (sinon SW pas installé). Les nouveaux utilisateurs passent par Telegram `@movix_site` ou les domaines sacrificiels (`baddomain/`).
+Scope : ne sauve QUE les users ayant déjà visité `movix.tax` au moins une fois avant le blocage (sinon SW pas installé). Les nouveaux utilisateurs passent par Telegram `@movix_site`.
 
 ### Deployment
 - Frontend: Cloudflare Pages (uses `CF_PAGES_COMMIT_SHA` for build ID)

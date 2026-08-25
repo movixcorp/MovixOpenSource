@@ -9,6 +9,7 @@ import {
   continueCastRelayDisclosure,
   openCastRelayBatterySettings,
 } from '@/utils/castRelayDisclosure';
+import { getOverlayPortalRoot } from '@/utils/overlayPortal';
 
 export interface CastRelayDisclosureProps {
   open: boolean;
@@ -53,7 +54,7 @@ export function CastRelayDisclosure({
 
   return (
     <DialogPrimitive.Root open={open}>
-      <DialogPrimitive.Portal>
+      <DialogPrimitive.Portal container={getOverlayPortalRoot()}>
         <DialogPrimitive.Overlay className="fixed inset-0 z-[100000] bg-black/80 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0 duration-200 motion-reduce:animate-none" />
         <DialogPrimitive.Content
           aria-describedby="cast-relay-disclosure-description"

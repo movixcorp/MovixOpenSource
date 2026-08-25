@@ -1,13 +1,13 @@
 {
-  "version": "2.5.17",
-  "buildNumber": 26,
+  "version": "2.5.24",
+  "buildNumber": 33,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72577389,
-  "apkSha256": "0593c4d5ea54e1920182ad3f80188fd95f400e98ad138ebbee13c5bbd3f0866e",
+  "apkSizeBytes": 72583649,
+  "apkSha256": "621ff913f0da5d3a5b8272a9ad549eba9299b44f5337f27939284497296901ef",
   "mandatory": false,
-  "releasedAt": "2026-08-24T00:00:00.000Z",
+  "releasedAt": "2026-08-25T00:00:00.000Z",
   "releaseNotes": {
-    "fr": "Uqload fonctionne à nouveau après son changement de domaine.",
-    "en": "Uqload works again after its domain change."
+    "fr": "Ajout du support des nouveau host lulustream, vidara, veev. Ajout d'un journal réseau dans les réglages (Débogage) pour diagnostiquer les sources qui échouent.",
+    "en": "Added support for the new hosts LuluStream, Vidara and Veev. Added a network journal under Settings (Debug) to diagnose failing sources."
   }
 }

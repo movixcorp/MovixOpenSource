@@ -45,15 +45,11 @@ function positiveInteger(value, fallback, label) {
 
 function createKisskhProxyPolicy(deps = {}) {
   const redis = deps.redis || require('../../config/redis').redis;
-  const hasInjectedSelection = Boolean(deps.getProxyCandidates && deps.reserveProxy);
-  const proxyManager = !hasInjectedSelection
+  const proxyManager = !deps.getProxyCandidates || !deps.reserveProxy
     ? require('../../utils/proxyManager')
     : null;
   const getProxyCandidates = deps.getProxyCandidates || proxyManager.getKisskhProxyCandidates;
   const reserveProxy = deps.reserveProxy || proxyManager.reserveKisskhProxy;
-  const isProxyConfigured = deps.isProxyConfigured
-    || proxyManager?.isKisskhProxyConfigured
-    || (() => true);
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   const deadlineNow = deps.deadlineNow || (() => performance.now());
@@ -72,7 +68,6 @@ function createKisskhProxyPolicy(deps = {}) {
   if (quarantineMaxMs < quarantineBaseMs || maxCandidates > MAX_PROXY_CANDIDATES
       || reservationDeadlineMs > MAX_RESERVATION_DEADLINE_MS
       || typeof getProxyCandidates !== 'function' || typeof reserveProxy !== 'function'
-      || typeof isProxyConfigured !== 'function'
       || typeof now !== 'function' || typeof sleep !== 'function' || typeof deadlineNow !== 'function') {
     throw new TypeError('policy proxy KissKH invalide');
   }
@@ -164,14 +159,6 @@ function createKisskhProxyPolicy(deps = {}) {
     return true;
   }
 
-  function allowsDirectTransport() {
-    const configured = isProxyConfigured();
-    if (typeof configured !== 'boolean') {
-      throw new TypeError('configuration proxy KissKH invalide');
-    }
-    return !configured;
-  }
-
   async function reserve() {
     const deadlineAt = deadlineNow() + reservationDeadlineMs;
     const rawCandidates = await runBeforeDeadline(
@@ -251,15 +238,7 @@ function createKisskhProxyPolicy(deps = {}) {
     return expiresAt;
   }
 
-  return Object.freeze({
-    allowsDirectTransport,
-    assertCircuitClosed,
-    record429,
-    recordFailure,
-    recordSuccess,
-    reserve,
-    reserveGlobal,
-  });
+  return Object.freeze({ assertCircuitClosed, record429, recordFailure, recordSuccess, reserve, reserveGlobal });
 }
 
 module.exports = { createKisskhProxyPolicy };

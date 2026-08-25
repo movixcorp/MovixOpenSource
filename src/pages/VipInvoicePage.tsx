@@ -92,9 +92,10 @@ const VipInvoicePage: React.FC = () => {
     [invoice, t]
   );
   const invoiceStatus = invoice?.status;
+  const isCryptoGateInvoice = invoice?.paymentMethod === 'cryptogate';
   const isPaygateInvoice = invoice?.paymentMethod === 'paygate_hosted';
   const isPayblisInvoice = invoice?.paymentMethod === 'payblis';
-  const isHostedCheckoutInvoice = isPaygateInvoice || isPayblisInvoice;
+  const isHostedCheckoutInvoice = isCryptoGateInvoice || isPaygateInvoice || isPayblisInvoice;
   const paymentLabel = invoice
     ? getVipPaymentLabel(t, invoice.paymentMethod, invoice.coin)
     : '';
@@ -597,7 +598,9 @@ const VipInvoicePage: React.FC = () => {
                           shineColor="#ffffff"
                           className="text-3xl font-black"
                         />
-                        <p className="mt-3 text-sm text-white/55">{formatVipFiat(i18n.language, invoice.amountUsd, 'USD')}</p>
+                        {!isCryptoGateInvoice && (
+                          <p className="mt-3 text-sm text-white/55">{formatVipFiat(i18n.language, invoice.amountUsd, 'USD')}</p>
+                        )}
                         <p className="text-sm text-white/40">{t('vipDonations.invoice.checkoutAmountFootnote', { provider: paymentShortLabel })}</p>
                         {isPaygateMinimumApplied && (
                           <p className="mt-2 text-xs text-yellow-200/80">

@@ -13,6 +13,8 @@ export function buildInjectedJavaScript(
     mediaProxyRoutingEnabled?: boolean;
     mediaProxyCapabilityEnabled?: boolean;
     mediaProxyXhrRoutingEnabled?: boolean;
+    journalConsoleEnabled?: boolean;
+    mediaProxyScheme?: string | null;
   } = {},
 ): string {
   const castShim = buildCastShim();
@@ -24,6 +26,8 @@ export function buildInjectedJavaScript(
     mediaProxyRoutingEnabled: options.mediaProxyRoutingEnabled,
     mediaProxyCapabilityEnabled: options.mediaProxyCapabilityEnabled,
     mediaProxyXhrRoutingEnabled: options.mediaProxyXhrRoutingEnabled,
+    journalConsoleEnabled: options.journalConsoleEnabled,
+    mediaProxyScheme: options.mediaProxyScheme,
   });
 
   // Cast shim FIRST — must be on window before any page JS runs.

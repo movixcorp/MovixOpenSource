@@ -23,6 +23,19 @@ const {
 } = require('../utils/cacheManager');
 const axiosHelpers = require('../utils/axiosHelpers');
 const { axiosFStreamRequest } = axiosHelpers;
+const { respondWithResolvedSources } = require('../utils/embedExtraction');
+
+/** Séries : résout les m3u8 de l'épisode demandé (`?episode=N`), pour un VIP. */
+const respondWithEpisodeSources = (req, res, payload, status = 200) =>
+  respondWithResolvedSources(req, res, payload, { status, label: 'FSTREAM TV' });
+
+/** Films : la map de langues vit sous `players`. */
+const respondWithMovieSources = (req, res, payload, status = 200) =>
+  respondWithResolvedSources(req, res, payload, {
+    status,
+    movieMapKey: 'players',
+    label: 'FSTREAM MOVIE',
+  });
 const { PROXIES, DARKINO_PROXIES, getProxyAgent, getDarkinoHttpProxyAgent } = require('../utils/proxyManager');
 
 // === FStream Configuration ===
@@ -1529,7 +1542,7 @@ router.get('/movie/:id', async (req, res) => {
   try {
     const cachedData = await getFStreamFromCache(cacheKey);
     if (cachedData) {
-      res.status(200).json(cachedData);
+      await respondWithMovieSources(req, res, cachedData);
 
       // Background update
       setImmediate(async () => {
@@ -1678,7 +1691,7 @@ router.get('/movie/:id', async (req, res) => {
     });
 
     await saveFStreamToCache(cacheKey, result);
-    res.status(200).json(result);
+    await respondWithMovieSources(req, res, result);
 
   } catch (error) {
     console.error(`[FSTREAM MOVIE] Erreur: ${error.message}`);
@@ -1743,7 +1756,7 @@ router.get('/tv/:id/season/:season', async (req, res) => {
     const cachedData = await getFStreamFromCache(cacheKey);
     const cachedSelectionIsValid = isFStreamCachedSelectionValid(cachedData, season);
     if (cachedData && cachedSelectionIsValid) {
-      res.status(200).json(cachedData);
+      await respondWithEpisodeSources(req, res, cachedData);
 
       // Background update
       setImmediate(async () => {
@@ -2076,7 +2089,7 @@ router.get('/tv/:id/season/:season', async (req, res) => {
     });
 
     await saveFStreamToCache(cacheKey, result);
-    res.status(200).json(result);
+    await respondWithEpisodeSources(req, res, result);
 
   } catch (error) {
     console.error(`[FSTREAM TV] Erreur: ${error.message}`);

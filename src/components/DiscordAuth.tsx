@@ -7,6 +7,7 @@ import {
   getPendingAuthAction,
   persistResolvedSession,
 } from '../utils/accountAuth';
+import { getSessionCreationHeaders } from '../utils/sessionClientId';
 
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 type DiscordAuthWindow = Window & { __discord_verify_done?: boolean };
@@ -74,7 +75,10 @@ const DiscordAuth: React.FC = () => {
         setStep(t('auth.discord.verifying'));
         const verifyResponse = await fetch(`${import.meta.env.VITE_MAIN_API}/api/auth/discord/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...getSessionCreationHeaders(),
+          },
           body: JSON.stringify({ access_token: accessToken }),
         });
 

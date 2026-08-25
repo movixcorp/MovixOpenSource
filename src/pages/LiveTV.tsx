@@ -127,31 +127,24 @@ const readFavoriteIptvCategories = (): FavoriteIptvCategory[] => {
 
 // Catégorie emojis pour les afficher dans les tabs
 const categoryEmojis: { [key: string]: string } = {
-  'matches_football': '⚽', // Football matches
-
-  'wiflix_generaliste': '📺',
-  'wiflix_cinema': '🎥',
-  'wiflix_sport': '⚽',
-  'wiflix_documentaire': '🌍',
-  'wiflix_enfants': '🎈',
-  'wiflix_info': '📰',
-  'wiflix_musique': '🎵',
-
-  'sosplay_chaines': '📡', // Bolaloca
-  'livetv_all': '📅',
-  'livetv_live': '🔴',
-  'livetv_football': '⚽',
-  'livetv_hockey': '🏒',
-  'livetv_basketball': '🏀',
-  'livetv_tennis': '🎾',
-  'livetv_volleyball': '🏐',
-  'livetv_handball': '🤾',
-  'livetv_rugby': '🏉',
-  'livetv_combat': '🥊',
-  'livetv_motorsport': '🏎️',
-  'livetv_winter': '🎿',
-  'livetv_athletics': '🏃',
-  'livetv_other': '🏟️',
+  // Sports FCTV — doit rester aligné sur FCTV_SPORTS (API/Mainapi/liveTvRoutes.js)
+  'matches_all': '🏅',
+  'matches_football': '⚽',
+  'matches_basketball': '🏀',
+  'matches_tennis': '🎾',
+  'matches_baseball': '⚾',
+  'matches_cricket': '🏏',
+  'matches_motorsport': '🏎️',
+  'matches_rugby': '🏉',
+  'matches_american_football': '🏈',
+  'matches_aussie_rules': '🏉',
+  'matches_hockey': '🏒',
+  'matches_badminton': '🏸',
+  'matches_volleyball': '🏐',
+  'matches_fighting': '🥊',
+  'matches_cycling': '🚴',
+  'matches_handball': '🤾',
+  'matches_others': '🏟️',
 
   // Linkzy (FREE source)
   'linkzy_generaliste': '📺',
@@ -182,53 +175,11 @@ const vavooGroupCountry: { [key: string]: string } = {
   'vavoo_russia': 'RU',
 };
 
-const livetvSportEmojis: { [key: string]: string } = {
-  football: '⚽',
-  hockey: '🏒',
-  basketball: '🏀',
-  tennis: '🎾',
-  volleyball: '🏐',
-  handball: '🤾',
-  rugby: '🏉',
-  combat: '🥊',
-  motorsport: '🏎️',
-  winter: '🎿',
-  athletics: '🏃',
-  cricket: '🏏',
-  other: '🏟️',
-};
-
-const livetvSportOrder = [
-  'football',
-  'basketball',
-  'hockey',
-  'tennis',
-  'volleyball',
-  'handball',
-  'rugby',
-  'combat',
-  'motorsport',
-  'winter',
-  'athletics',
-  'other',
-];
-
-const livetvStatusOptions = [
-  { key: 'playable', labelKey: 'liveTV.playableFilter' },
-  { key: 'live', labelKey: 'liveTV.liveFilter' },
-  { key: 'upcoming', labelKey: 'liveTV.upcomingFilter' },
-  { key: 'all', labelKey: 'common.all' },
-] as const;
-
 // Source display names for dropdown
 const sourceDisplayNames: { [key: string]: string } = {
   'northlive': 'Northlive',
   'vavoo': 'Vavoo',
   'fctv': 'FCTV33',
-  'wiflix': 'Landscape',
-  'sosplay': 'Bolaloca',
-  'livetv': 'LiveTV',
-  'daddylive': 'Daddylive',
   'iptv': 'liveTV.iptvWebSource',
 };
 
@@ -237,20 +188,21 @@ const getSourceKey = (catalogId: string): string => {
   if (catalogId.startsWith('northlive_')) return 'northlive';
   if (catalogId.startsWith('vavoo_')) return 'vavoo';
   if (catalogId.startsWith('matches_')) return 'fctv';
-  if (catalogId.startsWith('wiflix_')) return 'wiflix';
-  if (catalogId.startsWith('sosplay_')) return 'sosplay';
-  if (catalogId.startsWith('livetv_')) return 'livetv';
-  if (catalogId.startsWith('daddylive_')) return 'daddylive';
   return 'other';
 };
 
 // Format time remaining for upcoming matches with HH:MM:SS format
-const formatTimeRemaining = (timestamp: number, t: (key: string, params?: Record<string, unknown>) => string): { text: string; isImminent: boolean } => {
+//
+// `isPast` — l'heure annoncée est dépassée. On ne dit pas « en cours » pour
+// autant : c'est le statut renvoyé par l'amont qui fait foi, et une entrée
+// comme « DAZN Transfer by Fabrizio Romano » garde une heure passée tout en
+// étant annoncée « à venir ». L'appelant décide quoi afficher.
+const formatTimeRemaining = (timestamp: number, t: (key: string, params?: Record<string, unknown>) => string): { text: string; isImminent: boolean; isPast: boolean } => {
   const now = Date.now();
   const diff = timestamp - now;
-  
-  if (diff <= 0) return { text: t('liveTV.inProgress'), isImminent: true };
-  
+
+  if (diff <= 0) return { text: '', isImminent: false, isPast: true };
+
   const totalSeconds = Math.floor(diff / 1000);
   const days = Math.floor(totalSeconds / 86400);
   const hours = Math.floor((totalSeconds % 86400) / 3600);
@@ -261,19 +213,20 @@ const formatTimeRemaining = (timestamp: number, t: (key: string, params?: Record
   if (totalSeconds < 300) {
     return {
       text: `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`,
-      isImminent: true
+      isImminent: true,
+      isPast: false,
     };
   }
-  
+
   // Otherwise show relative time
   if (days > 0) {
-    return { text: t('liveTV.inDays', { days, hours }), isImminent: false };
+    return { text: t('liveTV.inDays', { days, hours }), isImminent: false, isPast: false };
   } else if (hours > 0) {
-    return { text: t('liveTV.inHours', { hours, minutes }), isImminent: false };
+    return { text: t('liveTV.inHours', { hours, minutes }), isImminent: false, isPast: false };
   } else if (minutes > 0) {
-    return { text: t('liveTV.inMinutes', { minutes }), isImminent: false };
+    return { text: t('liveTV.inMinutes', { minutes }), isImminent: false, isPast: false };
   } else {
-    return { text: t('liveTV.imminent'), isImminent: true };
+    return { text: t('liveTV.imminent'), isImminent: true, isPast: false };
   }
 };
 
@@ -498,6 +451,10 @@ const TimeRemaining = memo(({ timestamp, t }: { timestamp: number; t: TimeRemain
   }, [timestamp]);
 
   const result = formatTimeRemaining(timestamp, t);
+  // Heure dépassée sans que l'amont ait basculé la rencontre en direct : il
+  // n'y a plus de compte à rebours à montrer, et prétendre « en cours »
+  // serait faux. L'appelant affiche l'horaire à la place.
+  if (result.isPast) return null;
   return (
     <p className={cn('text-[10px] font-mono font-bold mt-1', result.isImminent ? 'text-emerald-400' : 'text-amber-400/70')}>
       {result.text}
@@ -516,10 +473,7 @@ const LiveTV: React.FC = () => {
   const [loadingCatalogs, setLoadingCatalogs] = useState(true);
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [collapsedMatches, setCollapsedMatches] = useState<Record<string, boolean>>({});
   const [searchQuery, setSearchQuery] = useState('');
-  const [livetvStatusFilter, setLivetvStatusFilter] = useState<'playable' | 'live' | 'upcoming' | 'all'>('playable');
-  const [livetvSportFilter, setLivetvSportFilter] = useState<string>('all');
   // Countdown ticking is now per-card via the <TimeRemaining/> component above.
 
   // IPTV Web states
@@ -868,14 +822,10 @@ const LiveTV: React.FC = () => {
         setCatalogs(filteredCatalogs);
 
         // Auto-select source and catalog. northlive (free) wins for everyone so
-        // the page works with no extension/VIP; extension users otherwise land
-        // on sosplay; else the first available catalog.
+        // the page works with no extension/VIP; else the first available catalog.
         if (filteredCatalogs.length > 0) {
           const preferred =
             filteredCatalogs.find(c => getSourceKey(c.id) === 'northlive') ||
-            (isExtensionAvailable()
-              ? filteredCatalogs.find(c => getSourceKey(c.id) === 'sosplay')
-              : null) ||
             filteredCatalogs[0];
           setSelectedCatalog(preferred.id);
           setSelectedSource(getSourceKey(preferred.id));
@@ -1016,86 +966,24 @@ const LiveTV: React.FC = () => {
   const [showAd, setShowAd] = useState(false);
   const [pendingChannel, setPendingChannel] = useState<Channel | null>(null);
 
-  const isTimedEventChannel = (channel: Channel) =>
-    channel.id.startsWith('match_') || channel.id.startsWith('livetv_');
+  const isTimedEventChannel = (channel: Channel) => channel.id.startsWith('match_');
 
+  // Imminent = le coup d'envoi est dans moins de cinq minutes. Le test ne
+  // portait que sur la borne haute : une heure déjà passée donnait un écart
+  // négatif, donc « imminent » pour l'éternité.
   const isImminentEventChannel = (channel: Channel) => {
     if (!channel._timestamp) return false;
-    const now = Date.now();
-    return channel._timestamp - now < 300000;
+    const diff = channel._timestamp - Date.now();
+    return diff > 0 && diff < 300000;
   };
 
+  // Une rencontre n'est cliquable que si l'amont annonce au moins un serveur.
+  // « En direct » ne suffisait pas : un match live sans serveur renvoyait un
+  // 404 (« Flux match introuvable ») que le lecteur s'obstinait à retenter.
   const isPlayableEventChannel = (channel: Channel) =>
-    !isTimedEventChannel(channel)
-    || Boolean(channel._isLive)
-    || isImminentEventChannel(channel)
-    || (channel.id.startsWith('match_') && (channel._serverCount || 0) > 0);
+    !isTimedEventChannel(channel) || (channel._serverCount || 0) > 0;
 
-  useEffect(() => {
-    if (selectedSource !== 'livetv') {
-      setLivetvSportFilter('all');
-      return;
-    }
-
-    setLivetvSportFilter('all');
-  }, [selectedSource, selectedCatalog]);
-
-  const livetvSportOptions = useMemo(() => {
-    if (selectedSource !== 'livetv') return [];
-
-    const sportsMap = new Map<string, { key: string; label: string; emoji: string }>();
-
-    channels.forEach((channel) => {
-      const key = channel._sportKey || 'other';
-      const label = channel._sport || key.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-      const emoji = channel._emoji || livetvSportEmojis[key] || '📺';
-      if (!sportsMap.has(key)) {
-        sportsMap.set(key, { key, label, emoji });
-      }
-    });
-
-    return [
-      { key: 'all', label: t('common.all'), emoji: '📅' },
-      ...Array.from(sportsMap.values()).sort((a, b) => {
-        const orderA = livetvSportOrder.indexOf(a.key);
-        const orderB = livetvSportOrder.indexOf(b.key);
-        const rankA = orderA === -1 ? Number.MAX_SAFE_INTEGER : orderA;
-        const rankB = orderB === -1 ? Number.MAX_SAFE_INTEGER : orderB;
-
-        if (rankA !== rankB) {
-          return rankA - rankB;
-        }
-
-        return a.label.localeCompare(b.label, 'fr', { sensitivity: 'base' });
-      })
-    ];
-  }, [selectedSource, channels]);
-
-  const displayedChannels = useMemo(() => {
-    let result = filteredChannels;
-    const isPlayableForFilter = (channel: Channel) =>
-      (!channel.id.startsWith('match_') && !channel.id.startsWith('livetv_'))
-        || Boolean(channel._isLive)
-        || (Boolean(channel._timestamp) && ((channel._timestamp || 0) - Date.now() < 300000));
-
-    if (selectedSource !== 'livetv') {
-      return result;
-    }
-
-    if (livetvStatusFilter === 'live') {
-      result = result.filter((channel) => Boolean(channel._isLive));
-    } else if (livetvStatusFilter === 'upcoming') {
-      result = result.filter((channel) => !channel._isLive);
-    } else if (livetvStatusFilter === 'playable') {
-      result = result.filter((channel) => isPlayableForFilter(channel));
-    }
-
-    if (livetvSportFilter !== 'all') {
-      result = result.filter((channel) => (channel._sportKey || 'other') === livetvSportFilter);
-    }
-
-    return result;
-  }, [filteredChannels, selectedSource, livetvStatusFilter, livetvSportFilter]);
+  const displayedChannels = filteredChannels;
 
   const favoriteDisplayedChannels = useMemo(
     () => displayedChannels.filter((channel) => isFavoriteDisplayChannel(selectedSource, channel)),
@@ -1319,10 +1207,15 @@ const LiveTV: React.FC = () => {
     if (catalog.id === 'vavoo_all') return t('common.all');
     if (catalog.id.startsWith('vavoo_')) return catalog.name;
 
+    // Idem pour les sports FCTV : le backend renvoie déjà « Football »,
+    // « Sports de combat »… et la traduction par mots-clés ci-dessous les
+    // écraserait tous en « Sport ».
+    if (catalog.id.startsWith('matches_')) return catalog.name;
+
     let name = catalog.name;
 
     // 1. Enlever les préfixes de source connus
-    const prefixes = ['Linkzy', 'Wiflix', 'Sosplay', 'Bolaloca', 'LiveTV', 'FCTV'];
+    const prefixes = ['Linkzy', 'FCTV'];
     for (const prefix of prefixes) {
       if (name.toLowerCase().startsWith(prefix.toLowerCase() + ' ')) {
         name = name.slice(prefix.length + 1);
@@ -1372,10 +1265,7 @@ const LiveTV: React.FC = () => {
     return '📺';
   };
 
-  // Non-ISO buckets that have no country flag -> emoji fallback.
-  const daddyliveBucketEmoji: Record<string, string> = { arabic: '🌐', africa: '🌍', other: '🌎' };
-
-  // Catalog icon: daddylive country catalogs render a flag via react-country-flag.
+  // Catalog icon: vavoo country groups render a flag via react-country-flag.
   const getCatalogIcon = (catalog: Catalog): React.ReactNode => {
     if (catalog.id.startsWith('vavoo_')) {
       const code = vavooGroupCountry[catalog.id];
@@ -1391,20 +1281,6 @@ const LiveTV: React.FC = () => {
       }
       return <Globe className="w-3.5 h-3.5" />; // All, Balkans — no single country
     }
-    if (catalog.id.startsWith('daddylive_')) {
-      const code = catalog.id.slice('daddylive_'.length);
-      if (code.length === 2) {
-        return (
-          <ReactCountryFlag
-            countryCode={code.toUpperCase()}
-            svg
-            style={{ width: '1.15em', height: '1.15em', borderRadius: '2px' }}
-            aria-label={code.toUpperCase()}
-          />
-        );
-      }
-      return <span className="text-base">{daddyliveBucketEmoji[code] || '🌎'}</span>;
-    }
     return <span className="text-base">{getCatalogEmoji(catalog)}</span>;
   };
 
@@ -1412,9 +1288,6 @@ const LiveTV: React.FC = () => {
   const sourceIcons: Record<string, React.ReactNode> = {
     'vavoo': <Radio className="w-3.5 h-3.5" />,
     'fctv': <span className="text-sm leading-none">⚽</span>,
-    'wiflix': <Tv className="w-3.5 h-3.5" />,
-    'sosplay': <Radio className="w-3.5 h-3.5" />,
-    'livetv': <Radio className="w-3.5 h-3.5" />,
     'iptv': <i className="bi bi-globe text-sm" />,
   };
 
@@ -1520,12 +1393,8 @@ const LiveTV: React.FC = () => {
 
   const iptvColumns = useResponsiveIptvColumns();
 
-  const channelGridClassName = cn(
-    'grid gap-3',
-    (selectedCatalog.startsWith('matches_') || selectedCatalog.startsWith('livetv_'))
-      ? 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5'
-      : 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6'
-  );
+  const channelGridClassName =
+    'grid gap-3 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6';
 
   // No per-card framer-motion — at ~3000 cards (e.g. France IPTV category) the
   // animation pipeline + DOM overwhelmed the tab. Plain div + CSS opacity
@@ -1620,197 +1489,33 @@ const LiveTV: React.FC = () => {
     );
   };
 
-  const toggleMatchCollapse = (matchId: string) => {
-    setCollapsedMatches((prev) => ({
-      ...prev,
-      [matchId]: !prev[matchId],
-    }));
-  };
-
-  const renderMatchAccordion = (channel: Channel, index: number) => {
-    const isExpanded = !collapsedMatches[channel.id];
-    const favoriteVariantId = getFavoriteVariantId(selectedSource, channel);
-    const isFavorite = favoriteVariantId !== null;
-    const isLive = Boolean(channel._isLive);
-    const hasServers = (channel._servers && channel._servers.length > 0) || (channel._serverCount || 0) > 0;
-
-    return (
-      <motion.div
-        key={channel.id}
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.2, delay: Math.min(index * 0.015, 0.3) }}
-        className="w-full bg-white/[0.015] border border-white/[0.04] rounded-2xl overflow-hidden backdrop-blur-md transition-all duration-300 hover:border-white/[0.08] hover:bg-white/[0.02]"
-      >
-        {/* Header Block */}
-        <div
-          onClick={() => toggleMatchCollapse(channel.id)}
-          className="flex flex-col sm:flex-row sm:items-center justify-between p-4 sm:p-5 gap-4 cursor-pointer select-none"
-        >
-          {/* Left info: League, status/timer, names */}
-          <div className="flex items-center gap-4 flex-1 min-w-0">
-            {/* Sport/League Logo */}
-            <div className="w-10 h-10 rounded-full bg-white/[0.03] border border-white/[0.08] flex items-center justify-center flex-shrink-0">
-              {channel._leagueLogo ? (
-                <img src={channel._leagueLogo} alt="League" className="w-6 h-6 object-contain" />
-              ) : (
-                <span className="text-xl">⚽</span>
-              )}
-            </div>
-
-            {/* Match info and teams */}
-            <div className="flex-1 min-w-0 space-y-1.5">
-              {/* League & Country */}
-              <div className="flex items-center gap-2 text-white/45 text-[11px] font-medium tracking-wide">
-                {channel._countryLogo && (
-                  <img src={channel._countryLogo} alt="" className="w-3.5 h-2.5 object-cover rounded-[1px]" />
-                )}
-                <span className="truncate">{channel._competition || channel._sport}</span>
-              </div>
-
-              {/* Team Matchup with Logos */}
-              <div className="flex flex-wrap items-center gap-2.5 text-white/95 font-semibold text-sm sm:text-base">
-                {/* Home Team */}
-                <div className="flex items-center gap-2 min-w-0">
-                  {channel._homeLogo && (
-                    <img src={channel._homeLogo} alt="" className="w-5 h-5 object-contain flex-shrink-0" />
-                  )}
-                  <span className="truncate">{channel._homeTeam || channel.name}</span>
-                </div>
-                
-                <span className="text-white/30 text-xs font-normal">vs</span>
-
-                {/* Away Team */}
-                <div className="flex items-center gap-2 min-w-0">
-                  {channel._awayLogo && (
-                    <img src={channel._awayLogo} alt="" className="w-5 h-5 object-contain flex-shrink-0" />
-                  )}
-                  <span className="truncate">{channel._awayTeam || ""}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Right controls: Time/Score, Favorites button, expand/collapse indicator */}
-          <div className="flex items-center justify-between sm:justify-end gap-3 sm:gap-4 border-t border-white/[0.04] pt-3 sm:pt-0 sm:border-0">
-            {/* Live badge or timer */}
-            <div className="flex-shrink-0">
-              {isLive ? (
-                <div className="flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-1 rounded-full text-xs font-semibold">
-                  <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-                  {channel._score ? `LIVE ${channel._score}` : "LIVE"}
-                </div>
-              ) : channel._timestamp ? (
-                <TimeRemaining timestamp={channel._timestamp} t={t} />
-              ) : channel._timeText ? (
-                <span className="text-xs font-medium text-amber-400/80 bg-amber-500/10 px-2.5 py-1 rounded-full border border-amber-500/10">
-                  {channel._timeText}
-                </span>
-              ) : null}
-            </div>
-
-            {/* Favorite and Chevron buttons */}
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <FavoriteChannelButton
-                active={isFavorite}
-                activeLabel={t('liveTV.removeFromFavorites')}
-                inactiveLabel={t('liveTV.addToFavorites')}
-                onToggle={(event) => {
-                  event.stopPropagation();
-                  toggleFavoriteChannel(event, {
-                    source: selectedSource,
-                    id: channel.id,
-                    name: channel.name,
-                    poster: channel.poster,
-                    kind: 'channel',
-                    catalogId: selectedCatalog,
-                  });
-                }}
-              />
-              
-              {/* Chevron icon */}
-              <div className="w-8 h-8 rounded-full bg-white/[0.03] border border-white/[0.06] flex items-center justify-center text-white/50 transition-colors hover:text-white/80">
-                <ChevronDown className={cn("w-4 h-4 transition-transform duration-300", isExpanded ? "rotate-180" : "")} />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Content Block (collapsible accordion) */}
-        <AnimatePresence initial={false}>
-          {isExpanded && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: "auto", opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.2, ease: "easeInOut" }}
-            >
-              <div className="px-5 pb-5 pt-1 border-t border-white/[0.03] bg-white/[0.005] space-y-4">
-                {/* Servers title */}
-                <div className="flex items-center gap-2 text-white/45 text-[11px] font-semibold uppercase tracking-wider">
-                  <Wifi className="w-3.5 h-3.5" />
-                  <span>{t('liveTV.availableServers')}</span>
-                </div>
-
-                {/* Watch action — opens the player picker (Lecteur intégré ⭐ + serveurs natifs) */}
-                {hasServers ? (
-                  <div className="space-y-2">
-                    <button
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        handleChannelClick(channel);
-                      }}
-                      className="w-full sm:w-auto px-5 py-3 rounded-xl text-sm font-semibold bg-emerald-500/15 border border-emerald-500/25 text-emerald-300 hover:bg-emerald-500/25 hover:text-emerald-200 active:scale-95 transition-all duration-200 cursor-pointer flex items-center justify-center gap-2 shadow-sm"
-                    >
-                      <Tv className="w-4 h-4" />
-                      {t('liveTV.watchMatch')}
-                    </button>
-                    {(channel._serverCount || 0) > 0 && (
-                      <p className="text-white/35 text-[11px]">
-                        {t('liveTV.serversAvailable', { count: channel._serverCount })}
-                      </p>
-                    )}
-                  </div>
-                ) : (
-                  <p className="text-white/35 text-xs italic">
-                    {isLive
-                      ? t('liveTV.noServersFound')
-                      : t('liveTV.upcomingServersNote')}
-                  </p>
-                )}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
-    );
-  };
-
   const renderChannelCard = (channel: Channel, index: number) => {
-    const isWiflix = selectedCatalog.startsWith('wiflix_');
-    const isSosplay = selectedCatalog.startsWith('sosplay_');
-    const isLivetv = selectedCatalog.startsWith('livetv_');
     const isMatch = selectedCatalog.startsWith('matches_');
     const isNorthlive = selectedCatalog.startsWith('northlive_');
     const isVavoo = selectedCatalog.startsWith('vavoo_');
     const vavooServers = Array.from(new Set(
       channel._vavooVariants?.map((variant) => variant.server).filter(Boolean) || []
     ));
-    const isEventCard = isMatch || isLivetv;
-    // northlive + vavoo render as name-only landscape cards (no poster loaded).
-    const isNoImage = isWiflix || isSosplay || isEventCard || isNorthlive || isVavoo;
+    const isEventCard = isMatch;
+    // Northlive remains name-only; VAVOO displays its enriched poster when present.
+    // Les matchs suivent la même règle : ni affiche, ni logo de ligue ou
+    // d'équipe — juste l'emoji du sport, comme les cartes northlive.
+    const isNoImage = isEventCard || isNorthlive;
     const isMatchLive = Boolean(channel._isLive);
-    const matchCompetition = channel._competition || channel._sport;
     // timeRemaining display is rendered via <TimeRemaining/> below.
     const isClickableMatch = !isEventCard || isPlayableEventChannel(channel);
-    const livetvEmoji = channel._emoji || livetvSportEmojis[channel._sportKey || ''] || '📺';
     const favoriteVariantId = getFavoriteVariantId(selectedSource, channel);
     const isFavorite = favoriteVariantId !== null;
+    // Le libellé suit le statut réel de la rencontre, pas le fait qu'elle soit
+    // cliquable : un match programmé pour demain mais pourvu d'un serveur
+    // s'affichait « imminent », et « en cours » par-dessus le marché.
     const eventStatusLabel = !isEventCard
       ? t('liveTV.liveTag')
-      : isClickableMatch
-        ? (isMatchLive ? t('liveTV.liveTag') : t('liveTV.imminentTag'))
-        : t('liveTV.upcomingTag');
+      : isMatchLive
+        ? t('liveTV.liveTag')
+        : isImminentEventChannel(channel)
+          ? t('liveTV.imminentTag')
+          : t('liveTV.upcomingTag');
 
 
     return (
@@ -1824,7 +1529,7 @@ const LiveTV: React.FC = () => {
       >
         <div className={cn(
           'relative rounded-xl overflow-hidden border transition-all duration-300',
-          isEventCard ? 'aspect-[4/3]' : isNoImage ? 'aspect-video' : 'aspect-[2/3]',
+          isNoImage ? 'aspect-video' : 'aspect-[2/3]',
           isEventCard && !isClickableMatch
             ? 'bg-white/[0.015] border-white/[0.03] opacity-50'
             : 'bg-white/[0.02] border-white/[0.04] group-hover:border-white/10 group-hover:bg-white/[0.04]'
@@ -1851,28 +1556,29 @@ const LiveTV: React.FC = () => {
             )}>
               {isEventCard ? (
                 <>
-                  <span className="text-xl mb-1">{isLivetv ? livetvEmoji : '⚽'}</span>
-                  <h3 className="text-[10px] sm:text-[11px] font-semibold text-white/80 line-clamp-3 leading-snug break-words w-full">
+                  <span className="text-base mb-0.5 opacity-60">{channel._emoji || '⚽'}</span>
+                  <h3 className="text-xs font-medium text-white/60 line-clamp-2 leading-tight">
                     {channel.name}
                   </h3>
-                  {matchCompetition && (
-                    <p className="text-[10px] text-white/30 line-clamp-2 w-full">{matchCompetition}</p>
-                  )}
                   {isMatchLive ? (
-                    <Badge className="mt-1 text-[9px] bg-emerald-500/20 text-emerald-400 border-emerald-500/20">
-                      {channel._score ? `${t('liveTV.inProgress')} • ${channel._score}` : t('liveTV.inProgress')}
-                    </Badge>
-                  ) : channel._timestamp ? (
-                    <TimeRemaining timestamp={channel._timestamp} t={t} />
-                  ) : channel._timeText ? (
-                    <p className="text-[10px] font-medium mt-1 text-amber-400/70">
-                      {channel._timeText}
-                    </p>
-                  ) : null}
+                    channel._score ? (
+                      <p className="text-[10px] font-medium text-emerald-400/80">{channel._score}</p>
+                    ) : null
+                  ) : (
+                    <>
+                      {/* Compte à rebours tant que le coup d'envoi est devant
+                          nous ; sinon <TimeRemaining/> ne rend rien et
+                          l'horaire prend le relais. */}
+                      {channel._timestamp ? <TimeRemaining timestamp={channel._timestamp} t={t} /> : null}
+                      {(!channel._timestamp || channel._timestamp <= Date.now()) && channel._timeText ? (
+                        <p className="text-[10px] font-medium text-amber-400/70">{channel._timeText}</p>
+                      ) : null}
+                    </>
+                  )}
                 </>
               ) : (
                 <>
-                   <Tv className={cn('w-6 h-6 mb-1', isSosplay ? 'text-emerald-500 opacity-40' : isLivetv ? 'text-amber-500 opacity-40' : isWiflix ? 'text-red-500 opacity-40' : 'text-white opacity-10')} />
+                   <Tv className="w-6 h-6 mb-1 text-white opacity-10" />
                    <h3 className="text-xs font-medium text-white/60 line-clamp-2 leading-tight">{channel.name}</h3>
                    {isVavoo && channel._vavooVariants && channel._vavooVariants.length > 1 && vavooServers.length > 0 && (
                      <div className="mt-1.5 flex max-w-full items-center gap-1 rounded-full border border-white/[0.06] bg-white/[0.03] px-2 py-1 text-[9px] font-medium text-white/35">
@@ -2172,7 +1878,7 @@ const LiveTV: React.FC = () => {
                   )}
                 </div>
               </div>
-            ) : selectedSource !== 'livetv' && filteredCatalogs.length > 1 ? (
+            ) : filteredCatalogs.length > 1 ? (
               /* Regular category chips */
               <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
                 {filteredCatalogs.map((catalog) => {
@@ -2199,62 +1905,6 @@ const LiveTV: React.FC = () => {
         )}
 
         {/* ── LOADING STATE ── */}
-        {!loadingCatalogs && hasAccess && selectedSource === 'livetv' && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ delay: 0.18 }}
-            className="mb-5 space-y-3"
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[11px] uppercase tracking-[0.18em] text-white/30">{t('liveTV.statusLabel')}</span>
-              {livetvStatusOptions.map((option) => {
-                const active = livetvStatusFilter === option.key;
-                return (
-                  <button
-                    key={option.key}
-                    onClick={() => setLivetvStatusFilter(option.key)}
-                    className={cn(
-                      'px-3 py-1.5 rounded-full text-xs border transition-all duration-200',
-                      active
-                        ? 'bg-red-500/15 text-red-400 border-red-500/30'
-                        : 'bg-white/[0.03] text-white/55 border-white/[0.06] hover:bg-white/[0.05] hover:text-white/85'
-                    )}
-                  >
-                    {t(option.labelKey)}
-                  </button>
-                );
-              })}
-              <span className="ml-auto text-[11px] text-white/30 tabular-nums">
-                {displayedChannels.length}/{filteredChannels.length}
-              </span>
-            </div>
-
-            {livetvSportOptions.length > 1 && (
-              <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-                {livetvSportOptions.map((option) => {
-                  const active = livetvSportFilter === option.key;
-                  return (
-                    <button
-                      key={option.key}
-                      onClick={() => setLivetvSportFilter(option.key)}
-                      className={cn(
-                        'flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs whitespace-nowrap border transition-all duration-200 shrink-0',
-                        active
-                          ? 'bg-white/10 text-white border-white/15'
-                          : 'bg-white/[0.03] text-white/55 border-white/[0.06] hover:bg-white/[0.05] hover:text-white/85'
-                      )}
-                    >
-                      <span>{option.emoji}</span>
-                      {option.label}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </motion.div>
-        )}
-
         {loadingCatalogs && <ChannelSkeleton />}
 
         {/* ── ERROR STATE ── */}
@@ -2384,29 +2034,7 @@ const LiveTV: React.FC = () => {
                 transition={{ duration: 0.25 }}
                 className="space-y-5"
               >
-                {selectedCatalog.startsWith('matches_') ? (
-                  <div className="space-y-4">
-                    {favoriteDisplayedChannels.length > 0 && (
-                      <div className="space-y-3">
-                        <LiveTVSectionDivider title={t('liveTV.favorites')} count={favoriteDisplayedChannels.length} />
-                        <div className="flex flex-col gap-4">
-                          {favoriteDisplayedChannels.map((channel, index) => renderMatchAccordion(channel, index))}
-                        </div>
-                      </div>
-                    )}
-                    {regularDisplayedChannels.length > 0 && (
-                      <div className="space-y-3">
-                        {favoriteDisplayedChannels.length > 0 && (
-                          <LiveTVSectionDivider title={t('liveTV.otherChannels')} count={regularDisplayedChannels.length} />
-                        )}
-                        <div className="flex flex-col gap-4">
-                          {regularDisplayedChannels.map((channel, index) => renderMatchAccordion(channel, favoriteDisplayedChannels.length + index))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <>
+                <>
                     {favoriteDisplayedChannels.length > 0 && (
                       <div className="space-y-3">
                         <LiveTVSectionDivider title={t('liveTV.favorites')} count={favoriteDisplayedChannels.length} />
@@ -2437,8 +2065,7 @@ const LiveTV: React.FC = () => {
                         )}
                       </div>
                     )}
-                  </>
-                )}
+                </>
               </motion.div>
             )}
           </div>
@@ -2453,13 +2080,6 @@ const LiveTV: React.FC = () => {
             channelName={selectedChannel.name}
             channelPoster={selectedChannel.poster}
             vavooVariants={selectedChannel._vavooVariants}
-            onSelectVavooVariant={(variantId) => {
-              // Swap the played variant while keeping the grouped channel's
-              // display name and variant list — the player refetches on id change.
-              setSelectedChannel((prev) => (
-                prev && prev.id !== variantId ? { ...prev, id: variantId } : prev
-              ));
-            }}
             onClose={handleClosePlayer}
           />
         )}

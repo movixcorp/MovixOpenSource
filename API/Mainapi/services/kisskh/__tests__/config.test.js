@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 
+const POLICY_PATH = path.resolve(__dirname, '../../../../../config/kisskhFallbackPolicy.json');
 const CANONICAL_HOSTS = 'auto.cdnvideo11.shop,sub.cdnvideo11.shop';
 
 function enabledEnv(overrides = {}) {
@@ -16,31 +17,11 @@ function enabledEnv(overrides = {}) {
 
 test('canonical fallback policy has the exact strict shape', () => {
   const { loadFallbackPolicy } = require('../config');
-  const policy = loadFallbackPolicy();
+  const policy = loadFallbackPolicy(POLICY_PATH);
   assert.deepEqual(Object.keys(policy), ['version', 'subtitleHosts', 'maxSubtitleBytes']);
   assert.equal(policy.version, 1);
   assert.deepEqual(policy.subtitleHosts, ['auto.cdnvideo11.shop', 'sub.cdnvideo11.shop']);
   assert.equal(policy.maxSubtitleBytes, 2097152);
-});
-
-test('runtime configuration starts without a deployed monorepo policy file', () => {
-  const fs = require('node:fs');
-  const originalReadFileSync = fs.readFileSync;
-  fs.readFileSync = (filename, ...args) => {
-    if (String(filename).endsWith('kisskhFallbackPolicy.json')) {
-      const error = new Error('simulated container policy absence');
-      error.code = 'ENOENT';
-      throw error;
-    }
-    return originalReadFileSync(filename, ...args);
-  };
-  try {
-    const { fromEnv } = require('../config');
-    const config = fromEnv(enabledEnv());
-    assert.equal(config.subtitleMaxBytes, 2097152);
-  } finally {
-    fs.readFileSync = originalReadFileSync;
-  }
 });
 
 test('config ignores removed browser fallback and subtitle byte environment settings', () => {

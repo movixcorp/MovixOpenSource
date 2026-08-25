@@ -52,6 +52,9 @@ export function getVipPaymentLabel(
   paymentMethod: VipDisplayedPaymentMethod | null | undefined,
   coin: VipCoin | null | undefined = null
 ) {
+  if (paymentMethod === 'cryptogate') {
+    return t('vipDonations.payment.cryptogate');
+  }
   if (paymentMethod === 'payblis') {
     return t('vipDonations.payment.payblis');
   }
@@ -76,6 +79,9 @@ export function getVipPaymentShortLabel(
   paymentMethod: VipDisplayedPaymentMethod | null | undefined,
   coin: VipCoin | null | undefined = null
 ) {
+  if (paymentMethod === 'cryptogate') {
+    return t('vipDonations.payment.cryptogateShort');
+  }
   if (paymentMethod === 'payblis') {
     return t('vipDonations.payment.payblisShort');
   }

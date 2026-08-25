@@ -72,6 +72,51 @@ class MediaProxyModule(
         }
     }
 
+    // --- Journal réseau (diagnostic) ---
+    // La requête média part du natif : sans ces trois méthodes, ni l'utilisateur
+    // ni un inspecteur réseau ne voient les en-têtes réellement émis, et un 403
+    // d'hébergeur reste indébogable. Tout est en mémoire, éteint par défaut.
+
+    @ReactMethod
+    fun setJournalEnabled(enabled: Boolean, promise: Promise) {
+        MediaProxyJournal.setEnabled(enabled)
+        promise.resolve(enabled)
+    }
+
+    @ReactMethod
+    fun getJournal(promise: Promise) {
+        val entries = Arguments.createArray()
+        MediaProxyJournal.snapshot().forEach(entries::pushString)
+        promise.resolve(entries)
+    }
+
+    @ReactMethod
+    fun clearJournal(promise: Promise) {
+        MediaProxyJournal.clear()
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun recordJournalEntry(
+        phase: String,
+        method: String,
+        url: String,
+        headers: ReadableMap,
+        statusCode: Int,
+        error: String?,
+        promise: Promise,
+    ) {
+        MediaProxyJournal.record(
+            phase = phase,
+            method = method,
+            url = url,
+            requestHeaders = readableMapToStrings(headers),
+            statusCode = statusCode.takeIf { it > 0 },
+            error = error,
+        )
+        promise.resolve(true)
+    }
+
     override fun invalidate() {
         openExecutor.shutdownNow()
         server.close()

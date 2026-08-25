@@ -332,6 +332,14 @@ internal class OkHttpMediaProxyUpstream(
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeRequestHeaders(target.headers))
         mergedHeaders.putAll(MediaProxyPolicy.sanitizeLocalRequestHeaders(localRequestHeaders))
         mergedHeaders.putIfAbsent("Sec-Ch-Ua", MediaProxyPolicy.PLAYBACK_SEC_CH_UA)
+        mergedHeaders.putIfAbsent(
+            "Sec-Ch-Ua-Mobile",
+            MediaProxyPolicy.PLAYBACK_SEC_CH_UA_MOBILE,
+        )
+        mergedHeaders.putIfAbsent(
+            "Sec-Ch-Ua-Platform",
+            MediaProxyPolicy.PLAYBACK_SEC_CH_UA_PLATFORM,
+        )
         mergedHeaders.putIfAbsent("Sec-Fetch-Site", "cross-site")
         mergedHeaders.putIfAbsent("Sec-Fetch-Mode", "cors")
         mergedHeaders.putIfAbsent("Sec-Fetch-Dest", "empty")
@@ -359,6 +367,15 @@ internal class OkHttpMediaProxyUpstream(
             val response = client.newCall(requestBuilder.build()).execute()
             val location = response.header("Location")
             if (response.code in 300..399 && location != null) {
+                MediaProxyJournal.record(
+                    phase = "media/okhttp",
+                    method = target.method,
+                    url = currentUrl,
+                    requestHeaders = mergedHeaders,
+                    statusCode = response.code,
+                    responseHeaders = mapOf("location" to location),
+                    localRequestHeaders = localRequestHeaders,
+                )
                 if (redirectCount >= MAX_REDIRECTS) {
                     response.close()
                     throw IllegalStateException("Too many media redirects")
@@ -377,6 +394,21 @@ internal class OkHttpMediaProxyUpstream(
             for (name in response.headers.names()) {
                 responseHeaders[name] = response.headers.values(name).joinToString(", ")
             }
+            // `peekBody` ne consomme rien : le corps part intact vers le lecteur.
+            MediaProxyJournal.record(
+                phase = "media/okhttp",
+                method = target.method,
+                url = currentUrl,
+                requestHeaders = mergedHeaders,
+                statusCode = response.code,
+                responseHeaders = responseHeaders,
+                bodySnippet = if (response.code >= 400) {
+                    runCatching { response.peekBody(JOURNAL_BODY_PEEK).string() }.getOrNull()
+                } else {
+                    null
+                },
+                localRequestHeaders = localRequestHeaders,
+            )
             val responseBody = response.body
             return MediaProxyUpstreamResponse(
                 statusCode = response.code,
@@ -392,6 +424,7 @@ internal class OkHttpMediaProxyUpstream(
 
     companion object {
         private const val MAX_REDIRECTS = 5
+        private const val JOURNAL_BODY_PEEK = 2_048L
     }
 }
 

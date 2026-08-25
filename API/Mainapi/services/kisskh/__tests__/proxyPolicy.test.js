@@ -76,47 +76,24 @@ test('reservations consume one rotated snapshot and atomically space only the se
   assert.ok(selection.calls.reserves.every(([, options]) => options.minIntervalMs === 1000));
 });
 
-test('global metadata spacing is process-local and independent for each worker', async () => {
+test('global metadata slots keep a 100ms floor while rotating distinct proxies', async () => {
   const { createKisskhProxyPolicy } = require('../proxyPolicy');
   const redis = createRedisDouble();
-  const workerASleeps = [];
-  const workerBSleeps = [];
-  const workerA = createKisskhProxyPolicy({
-    redis,
-    ...selectionDouble([[PROXY_A, PROXY_B]]),
-    now: () => 10_000,
-    async sleep(milliseconds) { workerASleeps.push(milliseconds); },
-  });
-  const workerB = createKisskhProxyPolicy({
-    redis,
-    ...selectionDouble([[PROXY_A, PROXY_B]]),
-    now: () => 10_000,
-    async sleep(milliseconds) { workerBSleeps.push(milliseconds); },
-  });
-
-  await Promise.all([workerA.reserveGlobal(), workerA.reserveGlobal(), workerA.reserveGlobal()]);
-  await workerB.reserveGlobal();
-
-  assert.deepEqual(workerASleeps, [1, 2]);
-  assert.deepEqual(workerBSleeps, []);
-  assert.equal(redis.calls.filter(([command]) => command === 'eval').length, 0);
-});
-
-test('global metadata reservation never waits for Redis', async () => {
-  const { createKisskhProxyPolicy } = require('../proxyPolicy');
-  let redisCalls = 0;
+  const sleeps = [];
   const policy = createKisskhProxyPolicy({
-    redis: { async eval() { redisCalls += 1; return new Promise(() => {}); } },
-    ...selectionDouble(),
+    redis,
+    ...selectionDouble([[PROXY_A, PROXY_B]]),
+    now: () => 10_000,
+    async sleep(milliseconds) { sleeps.push(milliseconds); },
   });
 
-  const outcome = await Promise.race([
-    policy.reserveGlobal().then(() => 'settled'),
-    delay(50).then(() => 'stalled'),
-  ]);
+  await Promise.all([policy.reserveGlobal(), policy.reserveGlobal(), policy.reserveGlobal()]);
 
-  assert.equal(outcome, 'settled');
-  assert.equal(redisCalls, 0);
+  assert.deepEqual(sleeps, [100, 200]);
+  const reservations = redis.calls.filter(([command]) => command === 'eval');
+  assert.equal(reservations.length, 3);
+  assert.ok(reservations.every((call) => call[3] === 'kisskh:metadata:global:next'));
+  assert.deepEqual(reservations.map((call) => Number(call[5])), [100, 100, 100]);
 });
 
 test('transport failures quarantine exponentially and cap at 900 seconds', async () => {
@@ -162,27 +139,60 @@ test('success resets failure count and quarantine', async () => {
   assert.equal(Number(quarantineWrite[2]) - clock, 30_000);
 });
 
-test('429 quarantines only the selected proxy for exactly 60 seconds', async () => {
+test('429 opens one shared breaker, parses integer Retry-After and blocks reservation', async () => {
   const { createKisskhProxyPolicy } = require('../proxyPolicy');
   const redis = createRedisDouble();
   let clock = 100_000;
-  const selection = selectionDouble([[PROXY_A, PROXY_B], [PROXY_A, PROXY_B], [PROXY_A, PROXY_B]]);
+  const selection = selectionDouble();
   const policy = createKisskhProxyPolicy({
     redis,
     ...selection,
     now: () => clock,
+    circuitDefaultMs: 60_000,
   });
-  assert.equal(await policy.record429(PROXY_A, { 'Retry-After': '120' }), 160_000);
+  await policy.record429({ 'Retry-After': '120' });
+  await assert.rejects(policy.assertCircuitClosed(), (error) => error.code === 'provider_rate_limited');
+  await assert.rejects(policy.reserve(), (error) => error.code === 'provider_rate_limited');
+  assert.equal(selection.calls.snapshots.length, 0);
+  clock = 220_000;
   await policy.assertCircuitClosed();
-  assert.equal(await policy.reserve(), PROXY_B);
-  const quarantineWrite = redis.calls.find((call) => call[0] === 'set' && call[1].endsWith(':quarantine'));
-  assert.equal(quarantineWrite[2], '160000');
-  assert.deepEqual(quarantineWrite.slice(3), ['PX', 60_000]);
-
-  clock = 159_999;
-  assert.equal(await policy.reserve(), PROXY_B);
-  clock = 160_000;
   assert.equal(await policy.reserve(), PROXY_A);
+});
+
+test('Retry-After HTTP-date is honored and short/missing values use at least 60 seconds', async () => {
+  const { createKisskhProxyPolicy } = require('../proxyPolicy');
+  for (const retryAfter of ['Thu, 01 Jan 1970 00:03:20 GMT', '1', undefined]) {
+    const redis = createRedisDouble();
+    let clock = 100_000;
+    const policy = createKisskhProxyPolicy({
+      redis,
+      ...selectionDouble(),
+      now: () => clock,
+      circuitDefaultMs: 60_000,
+    });
+    await policy.record429(retryAfter === undefined ? {} : { 'retry-after': retryAfter });
+    const breakerWrite = redis.calls.find((call) => call[0] === 'set' && call[1].endsWith(':breaker:429'));
+    const expected = typeof retryAfter === 'string' && retryAfter.startsWith('Thu') ? 200_000 : 160_000;
+    assert.equal(Number(breakerWrite[2]), expected);
+    clock = expected - 1;
+    await assert.rejects(policy.assertCircuitClosed(), (error) => error.code === 'provider_rate_limited');
+    clock = expected;
+    await policy.assertCircuitClosed();
+  }
+});
+
+test('a later short 429 cannot shorten an already-open shared breaker', async () => {
+  const { createKisskhProxyPolicy } = require('../proxyPolicy');
+  const redis = createRedisDouble();
+  let clock = 100_000;
+  const policy = createKisskhProxyPolicy({
+    redis,
+    ...selectionDouble(),
+    now: () => clock,
+  });
+  assert.equal(await policy.record429({ 'retry-after': '120' }), 220_000);
+  clock = 101_000;
+  assert.equal(await policy.record429({ 'retry-after': '1' }), 220_000);
 });
 
 test('Redis proxy identities are normalized SHA-256 digests and never raw proxy material', async () => {
@@ -255,6 +265,7 @@ test('a 1000-entry snapshot with repeats is deduplicated and processed with boun
   const quarantineReads = reserveRedisCalls.filter(([command]) => command === 'mget');
   assert.equal(quarantineReads.length, 1);
   assert.equal(quarantineReads[0].length - 1, unique.length);
+  assert.equal(reserveRedisCalls.filter(([command]) => command === 'get').length, 1);
 });
 
 test('reservation enforces hard candidate and wall-clock bounds', async () => {
@@ -276,21 +287,39 @@ test('reservation enforces hard candidate and wall-clock bounds', async () => {
   assert.ok(Date.now() - startedAt < 500);
 });
 
-test('direct transport is allowed only when no KissKH proxy source is configured', () => {
+test('the global deadline includes a slow breaker read and starts no late candidate work', async () => {
   const { createKisskhProxyPolicy } = require('../proxyPolicy');
-  const directPolicy = createKisskhProxyPolicy({
-    redis: createRedisDouble(),
-    ...selectionDouble([[]]),
-    isProxyConfigured: () => false,
-  });
-  const configuredPolicy = createKisskhProxyPolicy({
-    redis: createRedisDouble(),
-    ...selectionDouble([[]]),
-    isProxyConfigured: () => true,
+  let candidateCalls = 0;
+  let reservationCalls = 0;
+  const redis = createRedisDouble();
+  redis.get = async () => {
+    await delay(80);
+    return null;
+  };
+  const policy = createKisskhProxyPolicy({
+    redis,
+    getProxyCandidates: async () => {
+      candidateCalls += 1;
+      return [PROXY_A];
+    },
+    reserveProxy: async () => {
+      reservationCalls += 1;
+      return true;
+    },
+    reservationDeadlineMs: 20,
   });
 
-  assert.equal(directPolicy.allowsDirectTransport(), true);
-  assert.equal(configuredPolicy.allowsDirectTransport(), false);
+  const outcome = await Promise.race([
+    policy.reserve().then((value) => ({ value })),
+    delay(50).then(() => ({ late: true })),
+  ]);
+  assert.deepEqual(outcome, { value: null });
+  assert.equal(candidateCalls, 0);
+  assert.equal(reservationCalls, 0);
+
+  await delay(60);
+  assert.equal(candidateCalls, 0);
+  assert.equal(reservationCalls, 0);
 });
 
 test('proxyManager exposes a distinct rotated snapshot and atomic KissKH reservation API', () => {
@@ -298,17 +327,12 @@ test('proxyManager exposes a distinct rotated snapshot and atomic KissKH reserva
   assert.match(source, /function getKisskhProxyCandidates\(options = \{\}\)/);
   assert.match(source, /function reserveKisskhProxy\(proxy, options = \{\}\)/);
   assert.match(source, /function pickNextKisskhProxy\(options = \{\}\)/);
-  assert.match(source, /function isKisskhProxyConfigured\(\)/);
-  assert.match(source, /const KISSKH_PROXY_CONFIGURATION_PRESENT\s*=/);
-  assert.match(source, /PROXYSCRAPE_API_TOKEN\s*\|\|\s*PROXYSCRAPE_ACCOUNT_ID/);
-  assert.match(source, /process\.env\.SOCKS5_PROXIES/);
   assert.match(source, /poolName:\s*["']KISSKH_METADATA["']/);
   assert.match(source, /minIntervalMs:\s*1000/);
   assert.match(source, /digestIdentity:\s*true/);
   assert.match(source, /getKisskhProxyCandidates,/);
   assert.match(source, /reserveKisskhProxy,/);
   assert.match(source, /pickNextKisskhProxy,/);
-  assert.match(source, /isKisskhProxyConfigured,/);
   const snapshot = source.match(/async function getKisskhProxyCandidates[\s\S]*?\n\}/)?.[0] || '';
   assert.match(snapshot, /reserveProxyWindow/);
   assert.match(snapshot, /new Set\(\)/);

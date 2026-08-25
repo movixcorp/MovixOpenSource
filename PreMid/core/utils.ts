@@ -676,8 +676,6 @@ const WATCH_SOURCE_LABEL_MAP: Record<string, string> = {
   nexus_hls: 'Nexus HLS',
   omega: 'Omega',
   oneupload: 'OneUpload',
-  rivestream: 'Rivestream',
-  rivestream_hls: 'Rivestream',
   sibnet: 'Sibnet',
   supervideo: 'Supervideo',
   uqload: 'Uqload',

@@ -14,6 +14,7 @@ const SYNCABLE_EXACT_KEYS = new Set([
   'live_tv_favorite_iptv_categories',
   'miniPlayerPosition',
   'miniPlayerVolume',
+  'movixCalendarEntries',
   'movix_intro_enabled',
   'movix_intro_seen',
   'privacy_data_collection',

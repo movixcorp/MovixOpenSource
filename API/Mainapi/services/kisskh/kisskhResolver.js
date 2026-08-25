@@ -9,6 +9,7 @@ const {
   selectConfirmedDrama,
 } = require('./kisskhMatcher');
 const { assertMediaType } = require('./kisskhCache');
+const { appendSignature, signingConfigured } = require('../../utils/mediaSigning');
 
 const SAFE_CODES = new Set([
   'episode_missing', 'invalid_input', 'not_found', 'provider_changed',
@@ -129,7 +130,14 @@ function normalizedMatch(value, request) {
 function proxyUrl(origin, sourceUrl) {
   const url = new URL('/kisskh-proxy', origin);
   url.searchParams.set('url', sourceUrl);
-  return url.href;
+  // /kisskh-proxy n'accepte plus qu'une URL signée. Sans secret configuré on
+  // renvoie l'URL nue : elle sera refusée à la lecture, mais un 403 explicite
+  // vaut mieux qu'une exception qui ferait tomber toute la résolution.
+  if (!signingConfigured()) {
+    console.error('[KISSKH] MEDIA_SIGNING_SECRET absent — URL proxy non signée');
+    return url.href;
+  }
+  return appendSignature(url.href, '/kisskh-proxy', sourceUrl);
 }
 
 function mediaType(sourceUrl) {
@@ -395,6 +403,8 @@ function createKisskhResolver(deps = {}) {
       trace?.('tmdb_metadata_resolved', { titleCount: titles.length, queryCount: queries.length });
       const seasonCount = mediaNamespace === 'movie' ? 1 : localized.number_of_seasons;
       const tmdbSeasons = mediaNamespace === 'movie' ? [] : localized.seasons;
+      const expectedEpisodeCount = mediaNamespace === 'movie'
+        ? 1 : tmdbSeasonEpisodeCount(tmdbSeasons, request.season);
       const countries = mediaNamespace === 'movie'
         ? (Array.isArray(localized.production_countries) ? localized.production_countries : [])
           .map((entry) => entry?.iso_3166_1 || entry?.name).filter(Boolean)
@@ -425,6 +435,7 @@ function createKisskhResolver(deps = {}) {
           countries,
           seasonNumber: mediaNamespace === 'movie' ? undefined : request.season,
           seasonCount,
+          expectedEpisodeCount,
         };
         let ranked = rankKisskhCandidates(rankingCriteria, candidates);
         if (!ranked.length) continue;
@@ -464,17 +475,35 @@ function createKisskhResolver(deps = {}) {
           dramaId,
           episodeCount: Array.isArray(drama.episodes) ? drama.episodes.length : 0,
         });
+        if (!compatibleDetailedType(mediaNamespace, drama.type)) {
+          lastCompatibilityError = 'not_found';
+          continue;
+        }
+        const confirmedTop = rankKisskhCandidates(rankingCriteria, [{
+          ...top.candidate,
+          ...drama,
+          id: dramaId,
+        }])[0];
+        if (!confirmedTop) {
+          lastCompatibilityError = 'not_found';
+          continue;
+        }
         const markers = analyzeSeasonTitle(drama.title || top.candidate.title).markers;
         const confirmationSeason = Number(seasonCount) <= 1 && markers.length > 0
           ? markers[0]
           : request.season;
         try {
           const selected = selectConfirmedDrama(
-            [{ ...top, candidate: { ...drama, id: dramaId } }],
+            [{ ...confirmedTop, candidate: { ...drama, id: dramaId } }],
             confirmationSeason,
             segment.localEpisodeNumber,
           );
-          selectedResult = { selected, top, dramaId, localEpisodeNumber: segment.localEpisodeNumber };
+          selectedResult = {
+            selected,
+            top: confirmedTop,
+            dramaId,
+            localEpisodeNumber: segment.localEpisodeNumber,
+          };
         } catch (error) {
           if (!['not_found', 'episode_missing'].includes(error?.code)) throw error;
           lastCompatibilityError = error.code;

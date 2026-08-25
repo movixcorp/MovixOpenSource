@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { X, MessageCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_PUBLIC_DOMAIN } from '../i18n/currentDomain';
+import { getOverlayPortalRoot } from '../utils/overlayPortal';
 
 interface RedirectPopupProps {
   isOpen: boolean;
@@ -119,7 +120,7 @@ const RedirectPopup: React.FC<RedirectPopupProps> = ({
   );
 
   // Utiliser createPortal pour rendre le modal au niveau du body
-  return createPortal(modalContent, document.body);
+  return createPortal(modalContent, getOverlayPortalRoot());
 };
 
 export default RedirectPopup;

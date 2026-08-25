@@ -8,10 +8,11 @@
 
 export const M3U8_EXTRACTOR_KEYS = [
   'voe', 'fsvid', 'vidzy', 'vidmoly', 'sibnet', 'uqload', 'doodstream', 'seekstreaming',
+  'lulustream', 'veev', 'vidara',
 ] as const;
 
 export const LIVETV_SOURCE_KEYS = [
-  'northlive', 'vavoo', 'wiflix', 'sosplay', 'livetv', 'matches', 'daddylive',
+  'northlive', 'vavoo', 'matches',
 ] as const;
 
 export const EXTRACTION_METHOD_KEYS = [
@@ -63,14 +64,34 @@ function normalizeMethod(value: unknown): ExtractionMethod {
 
 export const DEFAULT_EXTRACTION_PREFS: ExtractionPrefs = buildDefaults();
 
+/**
+ * Contrôle de FORME uniquement, volontairement.
+ *
+ * Exiger que chaque clé de `M3U8_EXTRACTOR_KEYS` soit présente rendait toute
+ * préférence enregistrée invalide dès qu'on ajoutait un extracteur : l'objet
+ * stocké la veille n'avait pas la nouvelle clé, `getExtractionPrefs` repartait
+ * sur les valeurs par défaut, et l'utilisateur perdait silencieusement ses
+ * réglages (méthode d'extraction comprise). Les clés manquantes sont complétées
+ * par la fusion en aval — c'est là que la compatibilité ascendante se joue.
+ */
 function isValid(obj: unknown): obj is ExtractionPrefs {
   if (!obj || typeof obj !== 'object') return false;
   const p = obj as Partial<ExtractionPrefs>;
-  if (p.version !== 1) return false;
-  if (!p.m3u8 || typeof p.m3u8 !== 'object') return false;
-  if (!p.livetv || typeof p.livetv !== 'object') return false;
-  return M3U8_EXTRACTOR_KEYS.every((k) => typeof p.m3u8![k] === 'boolean')
-    && LIVETV_SOURCE_KEYS.every((k) => typeof p.livetv![k] === 'boolean');
+  return p.version === 1
+    && !!p.m3u8 && typeof p.m3u8 === 'object'
+    && !!p.livetv && typeof p.livetv === 'object';
+}
+
+/** Ne retient d'un objet stocké que les clés connues portant un booléen. */
+function pickBooleans<K extends string>(
+  keys: readonly K[],
+  stored: Partial<Record<K, unknown>> | undefined,
+): Partial<Record<K, boolean>> {
+  const out: Partial<Record<K, boolean>> = {};
+  for (const key of keys) {
+    if (typeof stored?.[key] === 'boolean') out[key] = stored[key] as boolean;
+  }
+  return out;
 }
 
 export function getExtractionPrefs(): ExtractionPrefs {
@@ -84,8 +105,8 @@ export function getExtractionPrefs(): ExtractionPrefs {
     const parsedMethod = (parsed as Partial<ExtractionPrefs>).method;
     return {
       version: 1,
-      m3u8: { ...defaults.m3u8, ...parsed.m3u8 },
-      livetv: { ...defaults.livetv, ...parsed.livetv },
+      m3u8: { ...defaults.m3u8, ...pickBooleans(M3U8_EXTRACTOR_KEYS, parsed.m3u8) },
+      livetv: { ...defaults.livetv, ...pickBooleans(LIVETV_SOURCE_KEYS, parsed.livetv) },
       method: normalizeMethod(parsedMethod),
       updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
     };

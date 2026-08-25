@@ -45,7 +45,13 @@ export const getNumericAge = (certification: string): number => {
  */
 export const isContentAllowed = (contentCert: string, profileAgeRestriction: number): boolean => {
   if (!profileAgeRestriction || profileAgeRestriction === 0) return true;
-  if (!contentCert) return true; // No certification info = allow
-  const contentAge = getNumericAge(contentCert);
+  const normalizedCert = contentCert?.trim().toUpperCase();
+  // A missing/unrecognised classification must not expose a title to a minor
+  // profile while the app cannot establish that it is suitable. Adults (18+)
+  // retain access to these unrated titles.
+  if (!normalizedCert || (!allAgesCerts.has(normalizedCert) && !(normalizedCert in ageMap))) {
+    return profileAgeRestriction >= 18;
+  }
+  const contentAge = getNumericAge(normalizedCert);
   return contentAge <= profileAgeRestriction;
 };

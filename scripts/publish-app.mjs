@@ -24,7 +24,7 @@ const PATHS = {
 };
 
 const APK_URL =
-  'https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/app/movix-android.apk';
+  'https://github.com/Movix-STMG/MovixOpenSource/raw/refs/heads/main/app/movix-android.apk';
 
 function die(msg) {
   console.error(`\n[publish-app] ${msg}\n`);

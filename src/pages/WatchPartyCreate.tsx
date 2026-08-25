@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { motion } from 'framer-motion';
-import { generateRandomCode, SyncMode } from '../utils/watchparty';
+import { SyncMode, storeRoomToken } from '../utils/watchparty';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -40,14 +40,6 @@ interface Mp4SourceInfo {
   isVip?: boolean;
 }
 
-interface RivestreamSourceInfo {
-  url: string;
-  label: string;
-  quality: number;
-  service: string;
-  category: string;
-}
-
 interface CaptionInfo {
   label: string;
   file: string;
@@ -66,13 +58,12 @@ interface MediaInfo {
   nexusSources?: NexusSourceInfo[];
   bravoSources?: BravoSourceInfo[];
   mp4Sources?: Mp4SourceInfo[];
-  rivestreamSources?: RivestreamSourceInfo[];
   captions?: CaptionInfo[];
   currentNexusSource?: NexusSourceInfo;
   currentBravoSource?: BravoSourceInfo;
 }
 
-type DefaultSourceFamily = 'nightflix' | 'nexus' | 'bravo' | 'mp4' | 'rivestream';
+type DefaultSourceFamily = 'nightflix' | 'nexus' | 'bravo' | 'mp4';
 
 interface DefaultSourceOption {
   value: string;
@@ -198,14 +189,7 @@ const WatchPartyCreate: React.FC = () => {
         };
       }
 
-      const selectedRivestreamSource = previousMediaInfo.rivestreamSources?.find((source) => source.url === value);
-      if (!selectedRivestreamSource) return previousMediaInfo;
-      return {
-        ...previousMediaInfo,
-        src: selectedRivestreamSource.url,
-        currentNexusSource: undefined,
-        currentBravoSource: undefined
-      };
+      return previousMediaInfo;
     });
   };
 
@@ -218,23 +202,27 @@ const WatchPartyCreate: React.FC = () => {
 
     try {
       localStorage.setItem('watchPartyNickname', nickname);
-      const roomCode = generateRandomCode(6);
 
+      // Le code de room est généré côté serveur (CSPRNG) : en fournir un depuis
+      // le client permettait de squatter un code.
       const response = await axios.post(`${MAIN_API}/api/watchparty/create`, {
         nickname,
         maxParticipants,
         media: mediaInfo,
-        roomCode,
         isPublic,
         syncMode
       });
 
       if (response.data.success) {
+        // Le hostToken lie l'hôte à la room : sans lui, impossible de reprendre
+        // la main dessus après un rafraîchissement.
+        storeRoomToken(response.data.roomId, response.data.hostToken);
         navigate(`/watchparty/room/${response.data.roomId}`, {
           state: {
             isHost: true,
             nickname,
-            roomCode: response.data.roomCode
+            roomCode: response.data.roomCode,
+            token: response.data.hostToken
           }
         });
       } else {
@@ -262,7 +250,6 @@ const WatchPartyCreate: React.FC = () => {
     (mediaInfo.currentBravoSource?.url || bravoSources.some((source) => source.url === mediaInfo.src)) ? 'bravo' :
       (mediaInfo.currentNexusSource?.url || mediaInfo.nexusSources?.some((source) => source.url === mediaInfo.src)) ? 'nexus' :
         mediaInfo.nightflixSources?.some((source) => source.src === mediaInfo.src) ? 'nightflix' :
-          mediaInfo.rivestreamSources?.some((source) => source.url === mediaInfo.src) ? 'rivestream' :
             mp4Sources.some((source) => source.url === mediaInfo.src) ? 'mp4' :
               null;
 
@@ -307,15 +294,6 @@ const WatchPartyCreate: React.FC = () => {
           label: source.label || buildSourceLabel('MP4', source.language, source.isVip ? 'VIP' : undefined) || `MP4 ${index + 1}`
         })),
         selectedValue: mp4Sources.find((source) => source.url === mediaInfo.src)?.url || mp4Sources[0]?.url || ''
-      },
-      {
-        id: 'rivestream',
-        label: 'Rivestream',
-        options: (mediaInfo.rivestreamSources || []).map((source, index) => ({
-          value: source.url,
-          label: buildSourceLabel(source.label, source.category, `${source.quality}p`) || `Rivestream ${index + 1}`
-        })),
-        selectedValue: mediaInfo.rivestreamSources?.find((source) => source.url === mediaInfo.src)?.url || mediaInfo.rivestreamSources?.[0]?.url || ''
       }
     ].filter((group) => group.options.length > 0);
 

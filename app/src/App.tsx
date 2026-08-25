@@ -14,6 +14,7 @@ import UpdateScreen from './screens/UpdateScreen';
 import UpdateDialog from './components/UpdateDialog';
 import { useAppUpdate } from './hooks/useAppUpdate';
 import { AddressProvider, useAddress } from './context/AddressContext';
+import { loadNetworkJournalPreference } from './services/networkJournal';
 
 const { DnsModule } = NativeModules;
 
@@ -65,6 +66,14 @@ function promptDns() {
 export default function App() {
   const [ready, setReady] = useState(false);
   const [dnsSettled, setDnsSettled] = useState(false);
+
+  // Le tampon natif du journal réseau part éteint à chaque démarrage : sans ce
+  // rappel au boot, la capture ne reprenait qu'en ouvrant les réglages, et une
+  // lecture lancée juste après une mise à jour n'était pas enregistrée — soit
+  // exactement le moment où on a besoin d'elle.
+  useEffect(() => {
+    loadNetworkJournalPreference().catch(() => {});
+  }, []);
 
   useEffect(() => {
     (async () => {
