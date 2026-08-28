@@ -2,11 +2,12 @@
 #import <React/RCTConvert.h>
 
 // Voir AppDelegate.mm : l'en-tete genere declare tout le module, y compris les
-// classes qui heritent de RCTEventEmitter ou adoptent des protocoles AVKit et
-// GoogleCast. Ces frameworks doivent etre importes avant.
+// classes qui heritent de RCTEventEmitter ou adoptent des protocoles AVKit,
+// GoogleCast et WebKit. Ces frameworks doivent etre importes avant.
 #import <AVKit/AVKit.h>
 #import <GoogleCast/GoogleCast.h>
 #import <React/RCTEventEmitter.h>
+#import <WebKit/WebKit.h>
 
 #import "Movix-Swift.h"
 

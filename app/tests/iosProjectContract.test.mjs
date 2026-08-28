@@ -371,3 +371,43 @@ test('legacy MovixApp Xcode artifacts are absent', async () => {
     missing('../ios/MovixAppTests'),
   ]);
 });
+
+test('every framework the generated Swift header names is imported before it', async () => {
+  // `Movix-Swift.h` declare tout le module @objc d'un coup, et Swift n'y
+  // forward-declare que ses propres types : un protocole venant d'un framework
+  // tiers y apparait nu. Sans son import prealable, la compilation casse sur
+  // « cannot find protocol declaration », loin du fichier Swift fautif — c'est
+  // ce qui est arrive quand MovixMediaSchemeHandler a adopte WKURLSchemeHandler
+  // sans que WebKit soit importe.
+  const importers = [
+    '../ios/Movix/AppDelegate.mm',
+    '../ios/Movix/UI/MovixBrowserChromeViewManager.m',
+    '../ios/Movix/UI/MovixGlassEffectViewManager.m',
+  ];
+  const required = [
+    '<AVKit/AVKit.h>',
+    '<GoogleCast/GoogleCast.h>',
+    '<React/RCTEventEmitter.h>',
+    '<WebKit/WebKit.h>',
+  ];
+
+  for (const path of importers) {
+    const source = await text(path);
+    const generated = source.indexOf('#import "Movix-Swift.h"');
+    assert.notEqual(generated, -1, `${path} doit importer l'en-tete genere`);
+    for (const framework of required) {
+      const at = source.indexOf(`#import ${framework}`);
+      assert.notEqual(at, -1, `${path} doit importer ${framework}`);
+      assert.ok(at < generated, `${path} : ${framework} doit preceder Movix-Swift.h`);
+    }
+  }
+});
+
+test('the Swift sources adopting third-party protocols stay covered by that list', async () => {
+  // Si une classe @objc adopte un protocole d'un framework absent de la liste
+  // ci-dessus, le test precedent passe alors que la compilation casse.
+  const handler = await text('../ios/Movix/Proxy/MediaProxySchemeHandler.swift');
+  assert.match(handler, /@objc\(MovixMediaSchemeHandler\)/);
+  assert.match(handler, /WKURLSchemeHandler/);
+  assert.match(handler, /^import WebKit$/m);
+});

@@ -1,12 +1,14 @@
 #import "AppDelegate.h"
 
 // Movix-Swift.h declare toutes les classes @objc du module, dont CastModule
-// (RCTEventEmitter <GCKRemoteMediaClientListener, GCKSessionManagerListener>)
-// et le controleur PiP. Swift ne forward-declare que les types de son propre
-// module : ces frameworks doivent etre visibles avant l'en-tete genere.
+// (RCTEventEmitter <GCKRemoteMediaClientListener, GCKSessionManagerListener>),
+// le controleur PiP et MovixMediaSchemeHandler (WKURLSchemeHandler). Swift ne
+// forward-declare que les types de son propre module : ces frameworks doivent
+// etre visibles avant l'en-tete genere.
 #import <AVKit/AVKit.h>
 #import <GoogleCast/GoogleCast.h>
 #import <React/RCTEventEmitter.h>
+#import <WebKit/WebKit.h>
 
 #import "Movix-Swift.h"
 
