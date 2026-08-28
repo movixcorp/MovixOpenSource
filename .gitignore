@@ -87,3 +87,18 @@ API/Mainapi/exportscripts/
 **/__pycache__/
 *.pyc
 *.pyo
+
+# Secrets de signature — ce dépôt est public
+#
+# app/.gitignore couvre déjà l'application, mais ces règles-ci valent pour tout
+# le dépôt : une synchro depuis le dépôt privé qui copierait un répertoire au
+# lieu des fichiers suivis par git publierait la clé de release et son mot de
+# passe. La seule protection ne doit pas être la prudence de celui qui synchronise.
+*.keystore
+!debug.keystore
+*.jks
+*.p12
+*.mobileprovision
+keystore.properties
+signing.properties
+release-signing.properties
