@@ -7,7 +7,9 @@ import android.os.Handler
 import android.os.Looper
 import androidx.mediarouter.app.MediaRouteChooserDialog
 import androidx.mediarouter.media.MediaRouteSelector
+import androidx.mediarouter.media.MediaRouter
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.LifecycleEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -29,7 +31,7 @@ import com.movix.app.proxy.CastPreparedTextTrack
 class CastModule internal constructor(
     private val reactContext: ReactApplicationContext,
     private val relayClient: CastRelayClient = ForegroundCastRelayClient(reactContext),
-) : ReactContextBaseJavaModule(reactContext) {
+) : ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
     private data class PendingLoad(
         val source: CastPreparedSource,
         val metadata: CastRemoteMetadata,
@@ -44,6 +46,14 @@ class CastModule internal constructor(
     private var pendingCoordinator: CastLoadCoordinator? = null
     private var pendingLoad: PendingLoad? = null
     private var listenerRegistered = false
+    private var mediaRouter: MediaRouter? = null
+    private var discoveryActive = false
+
+    /**
+     * Abonnement vide : seule son existence compte. MediaRouter ne fait tourner
+     * la découverte que tant qu'au moins un callback est enregistré.
+     */
+    private val discoveryCallback = object : MediaRouter.Callback() {}
 
     private val sessionListener = object : SessionManagerListener<CastSession> {
         override fun onSessionStarted(session: CastSession, sessionId: String) {
@@ -129,12 +139,15 @@ class CastModule internal constructor(
                 emitStatus(CastStatusMapper.disconnected(errorCode))
             }
         }
-        reactContext.runOnUiQueueThread { ensureContext() }
+        reactContext.addLifecycleEventListener(this)
+        reactContext.runOnUiQueueThread { startRouteDiscovery() }
     }
 
     override fun invalidate() {
         relayClient.setTerminalListener(null)
+        reactContext.removeLifecycleEventListener(this)
         reactContext.runOnUiQueueThread {
+            stopRouteDiscovery()
             clearCoordinators(CastRelayStopReason.SESSION_ENDED)
             if (listenerRegistered) {
                 castContext?.sessionManager?.removeSessionManagerListener(
@@ -145,6 +158,55 @@ class CastModule internal constructor(
             }
         }
         super.invalidate()
+    }
+
+    override fun onHostResume() {
+        reactContext.runOnUiQueueThread { startRouteDiscovery() }
+    }
+
+    override fun onHostPause() {
+        reactContext.runOnUiQueueThread { stopRouteDiscovery() }
+    }
+
+    override fun onHostDestroy() {
+        reactContext.runOnUiQueueThread { stopRouteDiscovery() }
+    }
+
+    /**
+     * Tient la découverte Cast chaude tant que l'app est au premier plan.
+     *
+     * MediaRouter ne scanne que tant qu'un callback est abonné, et `CastContext`
+     * n'existait qu'à partir du premier appui — `initialize()` s'exécutant avant
+     * qu'une activité soit attachée, `ensureContext()` y rendait `null`. Chaque
+     * ouverture du sélecteur repartait donc d'un scan à froid : la liste
+     * s'affichait vide, l'utilisateur fermait, et `setOnDismissListener`
+     * rejetait la lecture en MOVIX_CAST_PICKER_DISMISSED. D'où les appuis
+     * répétés avant que les appareils apparaissent.
+     *
+     * `CALLBACK_FLAG_REQUEST_DISCOVERY` demande une découverte passive : le
+     * scan actif reste réservé au sélecteur, qui l'active lui-même.
+     */
+    private fun startRouteDiscovery() {
+        if (discoveryActive) return
+        if (ensureContext() == null) return
+        val router = mediaRouter
+            ?: runCatching { MediaRouter.getInstance(reactContext) }
+                .getOrNull()
+                ?.also { mediaRouter = it }
+            ?: return
+        runCatching {
+            router.addCallback(
+                buildRouteSelector(),
+                discoveryCallback,
+                MediaRouter.CALLBACK_FLAG_REQUEST_DISCOVERY,
+            )
+        }.onSuccess { discoveryActive = true }
+    }
+
+    private fun stopRouteDiscovery() {
+        if (!discoveryActive) return
+        runCatching { mediaRouter?.removeCallback(discoveryCallback) }
+        discoveryActive = false
     }
 
     @ReactMethod

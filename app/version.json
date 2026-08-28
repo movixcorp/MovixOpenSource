@@ -1,13 +1,13 @@
 {
-  "version": "2.5.24",
-  "buildNumber": 33,
+  "version": "2.5.25",
+  "buildNumber": 34,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72583649,
-  "apkSha256": "621ff913f0da5d3a5b8272a9ad549eba9299b44f5337f27939284497296901ef",
+  "apkSizeBytes": 72584017,
+  "apkSha256": "d20e917019fb30ad61ba649b41a3414815db795f5fc9e006e11a75df40a7c1cf",
   "mandatory": false,
-  "releasedAt": "2026-08-25T00:00:00.000Z",
+  "releasedAt": "2026-08-28T00:00:00.000Z",
   "releaseNotes": {
-    "fr": "Ajout du support des nouveau host lulustream, vidara, veev. Ajout d'un journal réseau dans les réglages (Débogage) pour diagnostiquer les sources qui échouent.",
-    "en": "Added support for the new hosts LuluStream, Vidara and Veev. Added a network journal under Settings (Debug) to diagnose failing sources."
+    "fr": "Correction du cast : la diffusion vers la TV échouait sur toutes les sources depuis la 2.5.18, avec « Erreur lors du cast » puis un film qui ne démarrait pas. Les appareils sont aussi détectés dès l'ouverture de l'app, sans avoir à appuyer plusieurs fois.",
+    "en": "Cast fix: casting to a TV failed on every source since 2.5.18, showing \"Cast error\" and then a movie that never started. Devices are also discovered as soon as the app opens, instead of needing several taps."
   }
 }

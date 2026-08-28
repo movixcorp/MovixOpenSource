@@ -422,3 +422,48 @@ test('both native media proxies reject the same reserved local host names', asyn
     if (swift) assert.match(swift, new RegExp(`"${reserved}"`), reserved);
   }
 });
+
+test('the Cast header allow list covers every header the native proxy emits', async () => {
+  const [bridge, kotlin, swift] = await Promise.all([
+    read('src/services/bridge.ts'),
+    read('android/app/src/main/java/com/movix/app/proxy/MediaProxyPolicy.kt'),
+    read('ios/Movix/Proxy/MediaProxyPolicy.swift').catch(() => ''),
+  ]);
+
+  const allowList = bridge.match(
+    /const CAST_HEADER_ALLOW_LIST = new Set\(\[([\s\S]*?)\]\)/,
+  );
+  assert.ok(allowList, 'CAST_HEADER_ALLOW_LIST introuvable');
+  const allowed = new Set(
+    [...allowList[1].matchAll(/'([^']+)'/g)].map(match => match[1]),
+  );
+
+  const nativeAllowed = kotlin.match(
+    /private val allowedRequestHeaders = mapOf\(([\s\S]*?)\n {4}\)/,
+  );
+  assert.ok(nativeAllowed, 'allowedRequestHeaders introuvable');
+  const nativeNames = [...nativeAllowed[1].matchAll(/"([^"]+)" to "/g)]
+    .map(match => match[1]);
+  assert.ok(nativeNames.length >= 10, 'liste native suspecte');
+
+  // `resolveForCast` rend les en-têtes de la session telle que le natif l'a
+  // constituée. Un en-tête émis là-bas mais absent ici fait rendre `null` à
+  // `parsePreparedHeaders`, donc échouer tout cast en CAST_LOCAL_SOURCE_INVALID.
+  const missing = nativeNames.filter(name => !allowed.has(name));
+  assert.deepEqual(missing, [], `en-têtes refusés par le pont Cast : ${missing}`);
+
+  // Le pont est du code React Native partagé : iOS passe par la même liste, donc
+  // sa propre liste native doit y tenir aussi.
+  if (!swift) return;
+  const swiftAllowed = swift.match(
+    /static let allowedRequestHeaders: \[String: String\] = \[([\s\S]*?)\n {2}\]/,
+  );
+  assert.ok(swiftAllowed, 'allowedRequestHeaders Swift introuvable');
+  const swiftNames = [...swiftAllowed[1].matchAll(/"([^"]+)": "/g)]
+    .map(match => match[1]);
+  assert.deepEqual(
+    swiftNames,
+    nativeNames,
+    'les deux proxys natifs doivent émettre les mêmes en-têtes',
+  );
+});

@@ -156,6 +156,13 @@ type MediaProxyCapability = {
 const mediaProxyCapabilities = new WeakMap<object, MediaProxyCapability>();
 const retiredMediaProxyGenerations = new WeakMap<object, Set<string>>();
 const castLoadSingleFlights = new WeakMap<object, CastLoadSingleFlight>();
+// Doit rester un sur-ensemble de `allowedRequestHeaders` (MediaProxyPolicy.kt).
+// Une session de proxy porte les en-têtes que le natif a jugé bons d'émettre,
+// et `resolveForCast` les rend tels quels : tout en-tête accepté là-bas mais
+// refusé ici fait rendre `null` à `parsePreparedHeaders`, donc échouer le cast
+// en CAST_LOCAL_SOURCE_INVALID — pour toutes les sources d'un coup, sans que
+// rien ne désigne l'en-tête fautif. C'est ce qui est arrivé quand le natif s'est
+// mis à émettre les indices client Chrome sans que cette liste suive.
 const CAST_HEADER_ALLOW_LIST = new Set([
   'accept',
   'accept-encoding',
@@ -166,6 +173,12 @@ const CAST_HEADER_ALLOW_LIST = new Set([
   'origin',
   'range',
   'referer',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'sec-fetch-dest',
+  'sec-fetch-mode',
+  'sec-fetch-site',
   'user-agent',
 ]);
 
