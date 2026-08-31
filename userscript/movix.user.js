@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.5.0
+// @version      1.5.1
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -4025,7 +4025,8 @@
     voe: (url) => VOE_DOMAIN_PATTERN.test(url),
     fsvid: (url) => url.toLowerCase().includes("fsvid"),
     vidzy: (url) => url.toLowerCase().includes("vidzy"),
-    vidmoly: (url) => url.toLowerCase().includes("vidmoly"),
+    // `ansembed` sert le lecteur Vidmoly sous un autre nom : même extracteur.
+    vidmoly: (url) => /vidmoly|ansembed/i.test(url),
     sibnet: (url) => url.toLowerCase().includes("sibnet.ru"),
     uqload: (url) => /\buqload\.[a-z]{2,24}(?=[/:?#]|$)/i.test(url),
     // Veev shares `doods.to` with the DoodStream cluster but speaks a different
@@ -4744,6 +4745,23 @@
     }
   }
 
+  // Encodage base64 d'un segment vidéo. La concaténation octet par octet
+  // (`binary += String.fromCharCode(bytes[i])`) coûtait des centaines de ms sur
+  // un segment HLS de plusieurs Mo, sur le thread principal. On prend
+  // l'encodeur natif quand il existe, sinon on avance par blocs de 32 Ko.
+  function proxyBytesToBase64(bytes) {
+    if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 32768) {
+      binary += String.fromCharCode.apply(
+        null,
+        bytes.subarray(offset, offset + 32768),
+      );
+    }
+    return btoa(binary);
+  }
+
   // Helper to proxy HTTP requests via extension (to bypass Mixed Content)
   async function proxyHttpRequest(url, headers = {}) {
     try {
@@ -4762,15 +4780,7 @@
 
       const response = await fetch(url, { headers });
       const buffer = await response.arrayBuffer();
-
-      // Convert ArrayBuffer to Base64
-      let binary = "";
-      const bytes = new Uint8Array(buffer);
-      const len = bytes.byteLength;
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
+      const base64 = proxyBytesToBase64(new Uint8Array(buffer));
 
       return {
         data: base64,

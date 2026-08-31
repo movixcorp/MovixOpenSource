@@ -2072,6 +2072,15 @@ const LiveTV: React.FC = () => {
         )}
       </div>
 
+      {selectedChannel && (
+        <div
+          hidden
+          data-premid-live-context=""
+          data-premid-channel={selectedChannel.name || undefined}
+          data-premid-channel-poster={selectedChannel.poster || undefined}
+        />
+      )}
+
       {/* ── PLAYER MODAL ── */}
       <AnimatePresence>
         {selectedChannel && (

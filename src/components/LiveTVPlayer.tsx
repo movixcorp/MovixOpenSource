@@ -37,6 +37,7 @@ import {
     resolveVavooVariantStreams,
     type VavooChannelVariant,
 } from '../utils/vavooChannelGroups';
+import { isBareIpStreamUrl } from '../utils/streamHost';
 import { isLowLatencyEnabled } from '../utils/lowLatencyPref';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
@@ -103,6 +104,21 @@ class ProxyLoader {
         this.delegate.load(context, config, callbacks);
     }
 }
+
+// Décodage base64 d'un segment renvoyé par l'extension. La boucle octet par
+// octet bloquait le thread principal plusieurs centaines de ms par segment
+// (soit toutes les 2 à 6 s en live) : la page saccadait. Le décodeur natif
+// fait le travail en une passe ; à défaut, la data: URL décode hors du thread
+// principal.
+const decodeBase64ToBytes = async (base64: string): Promise<Uint8Array> => {
+    const fromBase64 = (Uint8Array as unknown as {
+        fromBase64?: (input: string) => Uint8Array;
+    }).fromBase64;
+    if (typeof fromBase64 === 'function') return fromBase64(base64);
+
+    const decoded = await fetch(`data:application/octet-stream;base64,${base64}`);
+    return new Uint8Array(await decoded.arrayBuffer());
+};
 
 // Custom Loader for HLS.js to use Extension Proxy
 class ExtensionLoader {
@@ -190,26 +206,25 @@ class ExtensionLoader {
                 gotValidPayload = true;
             }
 
-            // Decode Data (Base64) to ArrayBuffer
-            const binaryString = atob(response.data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-
             // HLS.js expects:
             // - string for playlists (.m3u8)
             // - ArrayBuffer for segments (.ts, .aac, etc.)
             const isPlaylist = url.endsWith('.m3u8') || url.includes('.m3u8?') || context.type === 'manifest' || context.type === 'level' || context.type === 'audio-track';
 
+            // Une playlist pèse quelques Ko : `atob` seul suffit et évite le
+            // détour par les octets. Un segment pèse plusieurs Mo : il passe
+            // par le décodeur rapide.
             let data: string | ArrayBuffer;
+            let byteLength: number;
             if (isPlaylist) {
-                // Convert to string for playlists
+                const binaryString = atob(response.data);
                 data = binaryString;
+                byteLength = binaryString.length;
                 console.log(`ExtensionLoader loaded playlist (${binaryString.length} chars) for: ${url}`);
             } else {
-                // Keep as ArrayBuffer for segments
+                const bytes = await decodeBase64ToBytes(response.data);
                 data = bytes.buffer;
+                byteLength = bytes.byteLength;
                 console.log(`ExtensionLoader loaded segment (${bytes.byteLength} bytes) for: ${url}`);
             }
 
@@ -217,13 +232,13 @@ class ExtensionLoader {
             const endTime = performance.now();
             this.stats.loading.first = startTime;
             this.stats.loading.end = endTime;
-            this.stats.loaded = bytes.byteLength;
-            this.stats.total = bytes.byteLength;
+            this.stats.loaded = byteLength;
+            this.stats.total = byteLength;
 
             console.log(`[ExtensionLoader] Response for ${url}:`, {
                 status: response.status,
                 finalUrl: response.finalUrl,
-                dataLength: bytes.byteLength
+                dataLength: byteLength
             });
 
             if (response.finalUrl && response.finalUrl !== url) {
@@ -1063,9 +1078,21 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         const isHttp = streamUrl.startsWith('http://');
         if (!streamUrl) return;
 
+        const extensionAvailable = isExtensionAvailable();
+        const effectiveExtensionAvailable = extensionAvailable;
+
+        // Vavoo répartit ses edges entre des domaines tournants et des serveurs
+        // en IP nue. Une IP n'a pas de certificat valide : elle n'est servie
+        // qu'en http, donc la page https ne peut pas la charger (mixed content).
+        // L'extension, elle, n'a pas cette limite : on lui délègue ces flux au
+        // lieu de les jouer en direct.
+        const isDirectPlayStream = currentStream._directPlay === true;
+        const isBareIpDirectServer = isDirectPlayStream && isBareIpStreamUrl(streamUrl);
+
         // Direct-play streams (Vavoo source): play the raw URL as-is, never proxy
         // or route through the extension, even if the URL matches a proxy heuristic.
-        const forceDirect = currentStream._directPlay === true;
+        const forceDirect = isDirectPlayStream
+            && !(isBareIpDirectServer && effectiveExtensionAvailable);
 
         // Vavoo streams typically contain "sunshine" signature or require headers that need proxy (when no extension)
         const isVavooStream = !forceDirect && (streamUrl.includes('/sunshine/') ||
@@ -1077,14 +1104,12 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         // Check if URL is already proxied (to prevent double-proxying)
         const isAlreadyProxied = streamUrl.includes('proxiesembed') || streamUrl.includes('/proxy?url=');
 
-        const extensionAvailable = isExtensionAvailable();
-        const effectiveExtensionAvailable = extensionAvailable;
-
         const isPageHttps = window.location.protocol === 'https:';
 
         // Determine if extension will handle this stream (via Blob proxy)
         // Wiflix streams with extension should use originalUrl (unproxied) + ExtensionLoader
-        const extensionHandlesStream = !forceDirect && effectiveExtensionAvailable && (isHttp || isVavooStream || isWiflixStream);
+        const extensionHandlesStream = !forceDirect && effectiveExtensionAvailable
+            && (isHttp || isVavooStream || isWiflixStream || isBareIpDirectServer);
 
         // Force REMOTE proxy (proxiesembed) ONLY if:
         // 1. FamilyRestream/TF1 (always use remote proxy for these)
@@ -1107,6 +1132,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         console.log("Proxy Logic:", {
             streamUrl,
             isVavooStream,
+            isBareIpDirectServer,
             isWiflixStream,
             isAlreadyProxied,
             isHttp,
@@ -1270,10 +1296,10 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                 nudgeOffset: 0.2,
             };
 
-            // Use ExtensionLoader for HTTP streams, Vavoo streams, or Wiflix streams when extension is available
+            // Use ExtensionLoader for HTTP streams, Vavoo streams (domaine ou IP
+            // nue), or Wiflix streams when extension is available.
             // This routes ALL network requests through the extension (blob proxy)
-            const useExtensionLoader = !forceDirect && effectiveExtensionAvailable && (isHttp || isVavooStream || isWiflixStream);
-            if (useExtensionLoader) {
+            if (extensionHandlesStream) {
                 hlsConfig.loader = ExtensionLoader;
                 console.log("HLS: Using ExtensionLoader (Blob Proxy) for HTTP/Vavoo/Wiflix stream");
             } else if ((shouldForceProxy && !extensionHandlesStream) || (isAlreadyProxied && streamUrl.includes('proxiesembed'))) {

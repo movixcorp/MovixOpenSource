@@ -6,7 +6,8 @@ import {
   Smartphone,
   Download,
   Apple,
-  Clock,
+  FlaskConical,
+  Github,
   ShieldCheck,
   Zap,
   Wifi,
@@ -21,6 +22,7 @@ import ShinyText from '../components/ui/shiny-text';
 import AnimatedBorderCard from '../components/ui/animated-border-card';
 
 const APK_URL = 'https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/app/movix-android.apk';
+const IOS_GITHUB_URL = 'https://github.com/movixcorp/MovixOpenSource/tree/main/app';
 
 const features = [
   {
@@ -186,43 +188,48 @@ const AppDownloadPage: React.FC = () => {
 
           <motion.div variants={itemVariants}>
             <AnimatedBorderCard
-              highlightColor="156 163 175"
+              highlightColor="59 130 246"
               backgroundColor="10 10 10"
               className="p-6 sm:p-8 h-full flex flex-col"
             >
               <div className="flex items-center gap-3 mb-5">
-                <div className="p-2.5 rounded-xl bg-white/5 ring-1 ring-white/20">
-                  <Apple className="w-6 h-6 text-white opacity-70" />
+                <div className="p-2.5 rounded-xl bg-blue-500/10 ring-1 ring-blue-500/30">
+                  <Apple className="w-6 h-6 text-white" />
                 </div>
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-white/35">
                     iOS
                   </p>
-                  <h2 className="text-xl font-bold text-white">Bientôt disponible</h2>
+                  <h2 className="text-xl font-bold text-white">Déjà disponible, en test</h2>
                 </div>
               </div>
               <p className="text-white/55 text-sm leading-relaxed mb-6">
-                L'application Movix pour iPhone et iPad est actuellement en préparation.
-                Nous travaillons dur pour vous offrir la meilleure expérience possible
-                sur iOS. Restez à l'écoute !
+                L'application iOS est déjà disponible en version de test, et tout le
+                monde peut l'essayer dès maintenant : récupère l'IPA sur GitHub,
+                signe-la avec l'outil de ton choix (AltStore, Sideloadly, ESign…)
+                puis installe-la sur ton iPhone ou iPad.
               </p>
               <div className="flex flex-wrap gap-2 mb-6">
-                <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full bg-white/5 text-white/60 border border-white/10">
-                  <Clock className="w-3.5 h-3.5 text-white opacity-60" />
-                  En développement
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full bg-blue-500/10 text-blue-300 border border-blue-500/30">
+                  <FlaskConical className="w-3.5 h-3.5" />
+                  Version de test
                 </span>
                 <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full bg-white/5 text-white/60 border border-white/10">
                   iPhone & iPad
                 </span>
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full bg-white/5 text-white/60 border border-white/10">
+                  Signature IPA requise
+                </span>
               </div>
-              <button
-                type="button"
-                disabled
-                className="mt-auto inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-white/5 text-white/40 border border-white/10 px-6 text-sm sm:text-base font-semibold cursor-not-allowed"
+              <a
+                href={IOS_GITHUB_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-auto inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-blue-600 text-white shadow-lg shadow-blue-500/20 hover:bg-blue-700 px-6 text-sm sm:text-base font-semibold transition-all duration-200 active:scale-95"
               >
-                <Apple className="w-5 h-5 flex-shrink-0 text-white opacity-40" />
-                Bientôt disponible
-              </button>
+                <Github className="w-5 h-5 flex-shrink-0" />
+                Récupérer l'IPA sur GitHub
+              </a>
             </AnimatedBorderCard>
           </motion.div>
         </motion.div>

@@ -237,12 +237,6 @@ def _load_proxy_list_env(env_name: str) -> list:
     return [proxy for proxy in parsed if _build_socks5_proxy_url(proxy)]
 
 
-def _load_proxy_dict_env(env_name: str) -> Optional[Dict]:
-    parsed = _load_json_env(env_name, {})
-    if isinstance(parsed, dict) and _build_socks5_proxy_url(parsed):
-        return parsed
-    return None
-
 # ---------------------------------------------------------------------------
 #  WideFrog / DRM Proxy integration
 # ---------------------------------------------------------------------------
@@ -702,8 +696,6 @@ DB_CONFIG = {
 # Proxies SOCKS5H configuration
 PROXIES = _load_proxy_list_env('PROXIES_SOCKS5_JSON')
 
-SIBNET_PROXY_CONFIG = _load_proxy_dict_env('SIBNET_PROXY_SOCKS5_JSON')
-
 DEEPBRID_API_KEY = os.environ.get('DEEPBRID_API_KEY', '').strip()
 REAL_DEBRID_API_KEY = os.environ.get('REAL_DEBRID_API_KEY', '').strip()
 REAL_DEBRID_API_BASE = 'https://api.real-debrid.com/rest/1.0'
@@ -714,7 +706,6 @@ DEBRIDR_MAX_POW_ATTEMPTS = 250_000
 
 DEBRID_PROVIDERS = frozenset({'deepbrid', 'realdebrid', 'debridr'})
 
-SIBNET_PROXY = PROXIES[0] if len(PROXIES) > 0 else None
 VIDMOLY_PROXY = PROXIES[1] if len(PROXIES) > 1 else (PROXIES[0] if len(PROXIES) > 0 else None)
 
 # Logging — default WARNING (errors/warns only); set LOG_LEVEL=INFO|DEBUG to reenable.
@@ -809,7 +800,12 @@ def _is_allowed_embed_host(url: str, allowed_suffixes: Tuple[str, ...]) -> bool:
     )
 
 
-VIDMOLY_HOSTS = ('vidmoly.net', 'vidmoly.to', 'vidmoly.me', 'vidmoly.biz', 'vidmoly.org')
+# `ansembed.net` sert le même lecteur que Vidmoly sous un autre nom : même
+# extracteur, mêmes en-têtes, seul le domaine de la page d'embed change.
+VIDMOLY_HOSTS = (
+    'vidmoly.net', 'vidmoly.to', 'vidmoly.me', 'vidmoly.biz', 'vidmoly.org',
+    'ansembed.net',
+)
 SIBNET_HOSTS = ('sibnet.ru',)
 UQLOAD_EXTRACT_HOSTS = (
     'uqload.com', 'uqload.co', 'uqload.io', 'uqload.net', 'uqload.to',
@@ -1257,7 +1253,7 @@ class ProxyServer:
     RE_VIDZY = re.compile(r'vidzy\.(?:org|cc)', re.IGNORECASE)
     RE_FSVID = re.compile(r'fsvid\.lol', re.IGNORECASE)
     RE_SIBNET = re.compile(r'sibnet\.ru|dv\d+\.sibnet\.ru', re.IGNORECASE)
-    RE_VMWESA = re.compile(r'vmwesa\.online|vidmoly|getromes\.space', re.IGNORECASE)
+    RE_VMWESA = re.compile(r'vmwesa\.online|vidmoly|ansembed|getromes\.space', re.IGNORECASE)
     RE_FAMILYRESTREAM = re.compile(r'familyrestream\.com', re.IGNORECASE)
     RE_SOSPLAY = re.compile(r'srvagu|6522236688\.shop|vuunov|1396168994\.live', re.IGNORECASE)
     RE_WITV = re.compile(r'lansdrud\.space', re.IGNORECASE)
@@ -1439,16 +1435,11 @@ class ProxyServer:
                     read_bufsize=SOCKET_READ_BUFFER,
                 )
 
-        # Sibnet Specific Session
-        if SIBNET_PROXY_CONFIG and _build_socks5_proxy_url(SIBNET_PROXY_CONFIG):
-            sibnet_connector = self._create_socks5_connector(SIBNET_PROXY_CONFIG)
-            self.sessions['sibnet'] = aiohttp.ClientSession(
-                connector=sibnet_connector,
-                timeout=ClientTimeout(total=None),
-                read_bufsize=SOCKET_READ_BUFFER,
-            )
-        else:
-            self.sessions['sibnet'] = self.sessions['normal']
+        # Sibnet n'a pas de session dédiée : ses jetons de flux ne sont pas liés
+        # à l'IP, et une sortie figée finit par tomber sur un nœud CDN que ce
+        # seul SOCKS ne sait plus joindre (dv97 pendait jusqu'au timeout depuis
+        # 178.171.106.51 alors que les autres sorties passaient). Chaque requête
+        # tire donc un proxy au hasard dans le pool, comme fsvid/vidzy.
 
         # curl_cffi session (JA3 impersonation) â€” cinep-proxy only
         self.curl_session = _CurlAsyncSession() if _CURL_CFFI_AVAILABLE else None
@@ -1480,9 +1471,9 @@ class ProxyServer:
         if service == 'bandwidth':
             return self.sessions.get('proxy_0', self.sessions['normal'])
         elif service == 'vmwesa':
-            return self.sessions.get('proxy_1', self.sessions.get('proxy_0', self.sessions['normal']))
+            return self._random_socks5_session()
         elif service == 'sibnet':
-            return self.sessions.get('sibnet', self.sessions['normal'])
+            return self._random_socks5_session()
         
         # France.tv CDN needs French proxy
         if self._is_francetv_url(url):
@@ -3810,9 +3801,7 @@ class ProxyServer:
         # Determine session based on proxy args (legacy support for dict args)
         session = self.sessions['normal']
         if use_proxy:
-            if specific_proxy and specific_proxy == SIBNET_PROXY:
-                session = self.sessions.get('proxy_0', self.sessions['normal'])
-            elif specific_proxy and specific_proxy == VIDMOLY_PROXY:
+            if specific_proxy and specific_proxy == VIDMOLY_PROXY:
                 session = self.sessions.get('proxy_1', self.sessions.get('proxy_0', self.sessions['normal']))
             else:
                 session = self.sessions.get('proxy_0', self.sessions['normal']) # Default proxy
@@ -4560,8 +4549,10 @@ class ProxyServer:
                 'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
             }
 
-            # Use SIBNET proxy
-            session = self.sessions.get('sibnet', self.sessions['normal'])
+            # Sortie SOCKS5 tirée au hasard : le jeton Sibnet n'est pas lié à
+            # l'IP, donc rien n'oblige l'extraction et le relais à partager la
+            # même adresse.
+            session = self._random_socks5_session()
             timeout = ClientTimeout(total=15)
 
             async with session.get(player_url, headers=headers, timeout=timeout) as response:
@@ -5858,6 +5849,11 @@ class ProxyServer:
         )
         return random.choice(proxy_session_keys) if proxy_session_keys else None
 
+    def _random_socks5_session(self) -> aiohttp.ClientSession:
+        """Session SOCKS5 tirée au hasard, `normal` si le pool est vide."""
+        key = self._random_socks5_session_key()
+        return self.sessions.get(key, self.sessions['normal']) if key else self.sessions['normal']
+
     async def _service_proxy_via_random_socks(
         self,
         request: Request,
@@ -5998,19 +5994,19 @@ class ProxyServer:
     
     async def vidmoly_proxy_handler(self, request: Request) -> Response:
         """Vidmoly proxy"""
-        return await self._service_proxy(request, 'vidmoly', {
+        return await self._service_proxy_via_random_socks(request, 'vidmoly', {
             'Accept': '*/*',
             'Origin': 'https://vidmoly.org',
             'Referer': 'https://vidmoly.org/',
             'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
-        }, session_key='proxy_1')
+        })
     
     async def sibnet_proxy_handler(self, request: Request) -> Response:
         """Sibnet proxy"""
-        return await self._service_proxy(request, 'sibnet', {
+        return await self._service_proxy_via_random_socks(request, 'sibnet', {
             'Accept': '*/*',
             'User-Agent': 'Mozilla/5.0 Chrome/140.0.0.0'
-        }, session_key='sibnet')
+        })
     
     async def uqload_proxy_handler(self, request: Request) -> Response:
         """Uqload proxy"""

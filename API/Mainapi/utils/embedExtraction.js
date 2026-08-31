@@ -41,7 +41,8 @@ const HOSTER_PATTERNS = Object.freeze({
         '(?:prepareddare|ralphysuccessfull|realfinanceblogcenter|rebeccaneverbase|rebeccapracticeloss|reputationsheriffkennethsand|richardsignfish|roberteachfinal|robertordercharacter|robertplacespace|sandratableother|sandrataxeight|scatch176duplicities|sethniceletter|shannonpersonalcost|simpulumlamerop|smoki)\\.',
         '(?:stevenfamilyedge|stevenimaginelittle|strawberriesporail|telyn610zoanthropy|timberwoodanotia|timmaybealready|toddpartneranimal|toxitabellaeatrebates306|tracylocalschool|uptodatefinishconferenceroom|valeronevijao|walterprettytheir|wolfdyslectic|yodelswartlike)\\.',
     ],
-    vidmoly: ['vidmoly'],
+    // `ansembed` sert le lecteur Vidmoly sous un autre nom : même extracteur.
+    vidmoly: ['vidmoly', 'ansembed'],
     uqload: ['uqload'],
     sibnet: ['sibnet'],
     // Veev partage `doods.to` avec la nébuleuse DoodStream mais a son propre

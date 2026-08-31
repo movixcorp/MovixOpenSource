@@ -283,7 +283,13 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         allowsBackForwardNavigationGestures={true}
         // Sécurité
         originWhitelist={['https://*', 'http://*']}
-        mixedContentMode="compatibility"
+        // « compatibility » laisse passer le contenu passif (images) mais
+        // bloque toujours le contenu actif : un `fetch("http://…")` depuis la
+        // page échouait donc en quelques millisecondes (« Network request
+        // failed »), et le proxy de l'app ne pouvait pas récupérer les flux
+        // servis par une IP nue, qui n'existent qu'en http. « always » est
+        // nécessaire pour que ce proxy fonctionne.
+        mixedContentMode="always"
         // Cache
         cacheEnabled={true}
         // Désactive le zoom pour un rendu app-like

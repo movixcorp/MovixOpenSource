@@ -4,6 +4,7 @@ import { useParams, useNavigate } from 'react-router-dom'; // Added useNavigate
 import { useTranslation } from 'react-i18next';
 import axios from 'axios';
 import HLSPlayer from '../../components/HLSPlayer';
+import PlayerOverlayPortal from '../../components/PlayerOverlayPortal';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
@@ -20,6 +21,7 @@ import { getTmdbId, encodeId } from '../../utils/idEncoder';
 import { useAntiSpoilerSettings } from '../../hooks/useAntiSpoilerSettings';
 import { useWrappedTracker } from '../../hooks/useWrappedTracker';
 import { isUserVip, getVipHeaders } from '../../utils/authUtils';
+import { serverResolveRequest } from '../../utils/serverResolveRequest';
 import { isExtensionAvailable } from '../../utils/extensionProxy';
 import { getTmdbLanguage } from '../../i18n';
 import { useProfile } from '../../context/ProfileContext';
@@ -32,6 +34,12 @@ import {
   syncHlsActiveSource,
 } from '../../utils/hlsAutoFallbackGuard';
 import { resolveKisskhTv } from '../../services/kisskhService';
+import SwiftfluxGate from '../../components/SwiftfluxGate';
+import {
+  readSwiftflux,
+  type SwiftfluxEntry,
+  type SwiftfluxPlayback,
+} from '../../services/swiftfluxService';
 import type { KisskhSource, KisskhSubtitleTrack } from '../../types/kisskh';
 import { markEpisodeHandoff } from '../../utils/playerFullscreenPersistence';
 const MAIN_API = import.meta.env.VITE_MAIN_API;
@@ -264,12 +272,11 @@ const checkCustomTVLink = async (showId: string, seasonNumber: number, episodeNu
   let isAvailable = false;
 
   try {
-    // `resolve=1` : le serveur résout les m3u8 des liens communautaires de cet
-    // épisode (ils viennent de sa base, pas du client).
-    const response = await axios.get(`${MAIN_API}/api/links/tv/${showId}`, {
-      params: { season: seasonNumber, episode: episodeNumber, resolve: 1 },
-      headers: { ...getVipHeaders() }
-    });
+    // Méthode serveur : `resolve=1` + clé VIP, le serveur résout les m3u8 des
+    // liens communautaires de cet épisode. Méthode extension/userscript :
+    // liens bruts, extraction locale.
+    const response = await axios.get(`${MAIN_API}/api/links/tv/${showId}`,
+      serverResolveRequest({ season: seasonNumber, episode: episodeNumber }));
 
     // Enregistré ici : cette fonction ne renvoie que les URLs, la table
     // `m3u8ByPlayer` serait perdue en aval.
@@ -507,6 +514,16 @@ const WatchTv: React.FC = () => {
   const [selectedDarkinoSource, setSelectedDarkinoSource] = useState<number>(0);
   const [mp4Sources, setMp4Sources] = useState<{ url: string; label?: string; language?: string; isVip?: boolean }[]>([]);
   const [selectedMp4Source, setSelectedMp4Source] = useState<number>(0);
+
+  // SwiftFlux (MP4 direct du catalogue SwiftFlow) : ce qu'on sait exister
+  // (`entries`, sans URL) et ce qui a été débloqué (`playback`, avec URL).
+  // La porte d'entrée — pub puis Turnstile — s'intercale entre les deux.
+  const [swiftfluxEntries, setSwiftfluxEntries] = useState<SwiftfluxEntry[]>([]);
+  const [swiftfluxPlayback, setSwiftfluxPlayback] = useState<SwiftfluxPlayback | null>(null);
+  // La porte se pose par-dessus ce qui joue : tant qu'elle n'a rien résolu, la
+  // source courante reste en place et visible derrière, et la refermer ne coûte
+  // rien à l'utilisateur.
+  const [swiftfluxGateOpen, setSwiftfluxGateOpen] = useState(false);
   const [watchProgress] = useState<number>(0); // Used to set initial HLSPlayer time
   const [, setLoadingError] = useState<boolean>(false);
   const [nextEpisodeData, setNextEpisodeData] = useState<NextEpisodeType | null>(null);
@@ -1065,6 +1082,7 @@ const WatchTv: React.FC = () => {
       (selectedSource === 'nexus_file' && nexusFileSources.length > 0) ||
       (selectedSource === 'darkino' && darkinoSources.length > 0) ||
       (selectedSource === 'mp4' && (mp4Sources.length > 0 || sibnetUrl)) ||
+      (selectedSource === 'swiftflux' && !!swiftfluxPlayback) ||
       (selectedSource === 'm3u8' && adFreeM3u8Url) ||
       (selectedSource === 'bravo' && purstreamSources.length > 0 && canUseBravo) ||
       (selectedSource === 'kisskh' && kisskhSources.length > 0)) {
@@ -1072,7 +1090,7 @@ const WatchTv: React.FC = () => {
     } else {
       setShowSourceButton(true);
     }
-  }, [selectedSource, nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, purstreamSources, canUseBravo, kisskhSources]);
+  }, [selectedSource, nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, sibnetUrl, swiftfluxPlayback, adFreeM3u8Url, purstreamSources, canUseBravo, kisskhSources]);
 
   // Effect to fetch episodes when the selected season changes in the menu
   useEffect(() => {
@@ -1293,12 +1311,10 @@ const WatchTv: React.FC = () => {
 
         const coflixPromise = (async () => {
           try {
-            // `resolve=1` : le serveur résout les m3u8 de cet épisode. Réservé
-            // à la lecture — la navigation ne doit pas déclencher d'extraction.
-            const coflixResponse = await axios.get(`${MAIN_API}/api/tmdb/tv/${id}`, {
-              params: { season: seasonNumber, episode: episodeNumber, resolve: 1 },
-              headers: { ...getVipHeaders() }
-            });
+            // Résolution serveur des m3u8 uniquement en méthode serveur.
+            // Réservé à la lecture — la navigation ne déclenche pas d'extraction.
+            const coflixResponse = await axios.get(`${MAIN_API}/api/tmdb/tv/${id}`,
+              serverResolveRequest({ season: seasonNumber, episode: episodeNumber }));
             return coflixResponse.data;
           } catch (error) {
             console.error('Error fetching Coflix TV sources:', error);
@@ -1348,17 +1364,12 @@ const WatchTv: React.FC = () => {
         // ========== CHECK FSTREAM SOURCE ==========
         const fstreamPromise = (async () => {
           try {
-            // La clé VIP part en header : le serveur la vérifie, puis résout
-            // lui-même les m3u8 du SEUL épisode demandé (`?episode=`) et les
-            // renvoie signées. Les sources déjà résolues évitent au client un
-            // aller-retour d'extraction par hébergeur.
-            const fstreamResponse = await axios.get(`${MAIN_API}/api/fstream/tv/${id}/season/${seasonNumber}`, {
-              // `resolve=1` demande explicitement la résolution serveur : sans
-              // lui le serveur n'extrait pas, pour ne pas travailler en double
-              // avec les clients qui ignorent encore `m3u8Url`.
-              params: { episode: episodeNumber, resolve: 1 },
-              headers: { ...getVipHeaders() }
-            });
+            // Méthode serveur : clé VIP + `resolve=1`, le serveur résout les
+            // m3u8 du SEUL épisode demandé (`?episode=`) et les renvoie
+            // signées. Méthode extension/userscript : liens bruts, extraction
+            // locale.
+            const fstreamResponse = await axios.get(`${MAIN_API}/api/fstream/tv/${id}/season/${seasonNumber}`,
+              serverResolveRequest({ episode: episodeNumber }));
             return fstreamResponse.data;
           } catch (error) {
             console.error('Error fetching FStream TV sources:', error);
@@ -1371,10 +1382,8 @@ const WatchTv: React.FC = () => {
         // ========== CHECK WIFLIX (LYNX) SOURCE ==========
         const wiflixPromise = (async () => {
           try {
-            const wiflixResponse = await axios.get(`${MAIN_API}/api/wiflix/tv/${id}/${seasonNumber}`, {
-              params: { episode: episodeNumber, resolve: 1 },
-              headers: { ...getVipHeaders() }
-            });
+            const wiflixResponse = await axios.get(`${MAIN_API}/api/wiflix/tv/${id}/${seasonNumber}`,
+              serverResolveRequest({ episode: episodeNumber }));
             return wiflixResponse.data;
           } catch (error) {
             console.error('Error fetching Wiflix/Lynx TV source:', error);
@@ -1387,10 +1396,8 @@ const WatchTv: React.FC = () => {
         // ========== CHECK J1F (1JOUR1FILM) SOURCE ==========
         const j1fPromise = (async () => {
           try {
-            const j1fResponse = await axios.get(`${MAIN_API}/api/j1f/tv/${id}/season/${seasonNumber}`, {
-              params: { episode: episodeNumber, resolve: 1 },
-              headers: { ...getVipHeaders() }
-            });
+            const j1fResponse = await axios.get(`${MAIN_API}/api/j1f/tv/${id}/season/${seasonNumber}`,
+              serverResolveRequest({ episode: episodeNumber }));
             return j1fResponse.data;
           } catch (error) {
             console.error('Error fetching 1jour1film TV source:', error);
@@ -1403,10 +1410,8 @@ const WatchTv: React.FC = () => {
         // ========== CHECK SWIFTFLOW SOURCE ==========
         const swiftflowPromise = (async () => {
           try {
-            const swiftflowResponse = await axios.get(`${MAIN_API}/api/swiftflow/tv/${id}/season/${seasonNumber}`, {
-              params: { episode: episodeNumber, resolve: 1 },
-              headers: { ...getVipHeaders() }
-            });
+            const swiftflowResponse = await axios.get(`${MAIN_API}/api/swiftflow/tv/${id}/season/${seasonNumber}`,
+              serverResolveRequest({ episode: episodeNumber }));
             return swiftflowResponse.data;
           } catch (error) {
             console.error('Error fetching SwiftFlow TV source:', error);
@@ -1419,10 +1424,8 @@ const WatchTv: React.FC = () => {
         // ========== CHECK VIPER SOURCE ==========
         const viperPromise = (async () => {
           try {
-            const viperResponse = await axios.get(`${MAIN_API}/api/cpasmal/tv/${id}/${seasonNumber}/${episodeNumber}`, {
-              params: { resolve: 1 },
-              headers: { ...getVipHeaders() }
-            });
+            const viperResponse = await axios.get(`${MAIN_API}/api/cpasmal/tv/${id}/${seasonNumber}/${episodeNumber}`,
+              serverResolveRequest());
             return viperResponse.data;
           } catch (error) {
             console.error('Error fetching Viper TV source:', error);
@@ -1474,6 +1477,14 @@ const WatchTv: React.FC = () => {
           swiftflowPromise,
           kisskhPromise,
         ]);
+
+        // ========== TRAITEMENT DES RÉSULTATS SWIFTFLUX ==========
+        // Même réponse que SwiftFlow : l'appel amont rend l'URL du MP4 de
+        // l'épisode en même temps que de quoi construire l'iframe. Pas de
+        // requête supplémentaire.
+        const swiftfluxResult = readSwiftflux(swiftflowResult);
+        setSwiftfluxEntries(swiftfluxResult.entries);
+        setSwiftfluxPlayback(null);
 
         // Mémorise les m3u8 que le serveur a résolues pour ces catalogues.
         // C'est la SEULE façon dont une m3u8 parvient au client : il n'existe
@@ -2437,6 +2448,19 @@ const WatchTv: React.FC = () => {
               setOnlyVostfrAvailable(false);
               return true;
             }
+            case 'swiftflux': {
+              if (!swiftfluxResult.available) return false;
+              // Aucune URL à poser : la porte d'entrée la demandera au serveur
+              // une fois la pub vue et le Turnstile validé.
+              setSelectedSource('swiftflux');
+              setVideoSource('');
+              setEmbedUrl(null);
+              setEmbedType(null);
+              currentSourceRef.current = 'swiftflux';
+              setOnlyVostfrAvailable(false);
+              setSwiftfluxGateOpen(true);
+              return true;
+            }
             case 'viper': {
               console.log('✅ Selecting VIPER as source');
               // Pré-tri langue + hoster pour respecter la préférence user
@@ -2544,9 +2568,13 @@ const WatchTv: React.FC = () => {
         // Legacy embedseek promotion : si embedseek existe ET nexus_hls n'est pas dispo,
         // il était promu #2 dans l'ancien code (juste après nexus_hls). On applique cette
         // règle avant le picker pour préserver la rétrocompat exacte.
-        // Exception : si user a customisé l'ordre (pin ou drag), on laisse le picker.
+        // Exceptions :
+        //  - un lecteur Viblix (source `mp4`) passe devant : la promotion
+        //    court-circuitait le picker et sélectionnait `custom` alors que `mp4`
+        //    est classé bien avant `custom` dans l'ordre par défaut ;
+        //  - si l'user a customisé l'ordre (pin ou drag), on laisse le picker.
         let embedseekPromoted = false;
-        if (embedseekLink && finalHlsSources.length === 0) {
+        if (embedseekLink && finalHlsSources.length === 0 && fetchedMp4Sources.length === 0) {
           const prefs = getSourcePriorityPrefs();
           const userOrderIds = prefs.categories.moviesTv.sourceOrder.map((s) => s.id);
           const defaultOrderIds = buildDefaults().categories.moviesTv.sourceOrder.map((s) => s.id);
@@ -2572,6 +2600,7 @@ const WatchTv: React.FC = () => {
             { id: 'wiflix', hasData: wiflixProcessedSources.length > 0 },
             { id: 'j1f', hasData: j1fProcessedSources.length > 0 },
             { id: 'swiftflow', hasData: swiftflowProcessedSources.length > 0 },
+            { id: 'swiftflux', hasData: swiftfluxResult.available },
             { id: 'viper', hasData: viperProcessedSources.length > 0 },
             { id: 'coflix', hasData: !!(coflixResult && (coflixResult.current_episode?.player_links?.length || coflixResult.player_links?.length)) },
             { id: 'custom', hasData: !!(customLinksResult.customLinks && customLinksResult.customLinks.length) },
@@ -2651,6 +2680,28 @@ const WatchTv: React.FC = () => {
           );
           return;
         }
+      }
+
+      // SwiftFlux se sélectionne sans URL : elle n'existe pas encore côté
+      // client. On repasse par la porte d'entrée, qui la demandera au serveur
+      // une fois la pub vue et le Turnstile validé.
+      if (type === 'swiftflux') {
+        if (!isAutomaticFallback) setLastPlayer('swiftflux');
+        setShowEmbedQuality(false);
+        // Déjà débloquée pour cet épisode : rien à redemander, on bascule.
+        if (swiftfluxPlayback) {
+          setOnlyVostfrAvailable(false);
+          setEmbedUrl(null);
+          setEmbedType(null);
+          setVideoSource('');
+          currentSourceRef.current = 'swiftflux';
+          setSelectedSource('swiftflux');
+          return;
+        }
+        // Sinon on ouvre la porte SANS toucher à la source courante : ce qui
+        // joue continue derrière, et refermer la porte n'a rien cassé.
+        setSwiftfluxGateOpen(true);
+        return;
       }
 
       const bravoAllowed = type !== 'bravo' || canUseBravo;
@@ -2943,8 +2994,8 @@ const WatchTv: React.FC = () => {
       window.removeEventListener('sourceChange', handleSourceChangeFromMenu as EventListener);
     };
   }, [
-    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, viperSources, voxSources, purstreamSources, kisskhSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, sortedSwiftflow, swiftflowSources, canUseBravo, // Data sources
-    setOnlyVostfrAvailable, setShowEmbedQuality, // State setters for visibility
+    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, viperSources, voxSources, purstreamSources, kisskhSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, sortedSwiftflow, swiftflowSources, canUseBravo, swiftfluxPlayback, // Data sources
+    setOnlyVostfrAvailable, setShowEmbedQuality, setSwiftfluxGateOpen, // State setters for visibility
     setEmbedUrl, setEmbedType, setSelectedSource, // General source setters
     setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedFstreamSource, setVideoSource, setSelectedViperSource, // HLS specific setters
     currentSourceRef, autoFallbackGuard // Refs
@@ -2984,6 +3035,10 @@ const WatchTv: React.FC = () => {
         }
       }
     }
+  } else if (selectedSource === 'swiftflux') {
+    // Vide tant que la porte d'entrée n'a pas rendu l'URL ; le rendu affiche
+    // alors la porte, pas le lecteur.
+    hlsSrc = swiftfluxPlayback?.url || '';
   } else if (selectedSource === 'm3u8' && adFreeM3u8Url) {
     hlsSrc = adFreeM3u8Url;
   } else if (selectedSource === 'bravo') {
@@ -3174,6 +3229,11 @@ const WatchTv: React.FC = () => {
 
   // Memoize callback functions for HLSPlayer
   const handleHlsError = useCallback(() => {
+    // SwiftFlux monte le lecteur avec une source vide le temps que la porte
+    // soit franchie : l'erreur est attendue et ne doit pas déclencher de repli,
+    // qui arracherait la source sous la porte encore ouverte.
+    if (selectedSource === 'swiftflux' && !swiftfluxPlayback) return;
+
     console.error(`Error playing HLS source: ${selectedSource}`);
 
     // Try the next source or fallback to other sources
@@ -3380,7 +3440,7 @@ const WatchTv: React.FC = () => {
       handleSourceChange('frembed', String(id));
     }
     // Note: Ne pas forcer vostfr automatiquement - laisser l'utilisateur choisir depuis le menu
-  }, [selectedSource, selectedDarkinoSource, darkinoSources, mp4Sources, id, videoSource, selectedMp4Source, handleSourceChange, frembedAvailable, seasonNumber, episodeNumber]);
+  }, [selectedSource, selectedDarkinoSource, darkinoSources, mp4Sources, id, videoSource, selectedMp4Source, handleSourceChange, frembedAvailable, seasonNumber, episodeNumber, swiftfluxPlayback]);
 
 
 
@@ -3537,6 +3597,9 @@ const WatchTv: React.FC = () => {
             break;
           case 'swiftflow':
             playerType = 'swiftflow';
+            break;
+          case 'swiftflux':
+            playerType = 'swiftflux';
             break;
           case 'viper':
             playerType = 'viper';
@@ -3708,6 +3771,12 @@ const WatchTv: React.FC = () => {
           sortedSwiftflow[selectedSwiftflowSource];
         return formatPremidSourceDetail(source?.label, source?.category);
       }
+      case 'swiftflux':
+        return formatPremidSourceDetail(
+          swiftfluxPlayback?.label,
+          swiftfluxPlayback?.quality ?? undefined,
+          swiftfluxPlayback?.language,
+        );
       case 'viper': {
         const source =
           viperSources.find(entry => entry.url === embedUrl) ||
@@ -3837,6 +3906,7 @@ const WatchTv: React.FC = () => {
           </div>
 
           {/* Source Selection Menu */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3878,7 +3948,9 @@ const WatchTv: React.FC = () => {
                         ...(sibnetUrl ? [{ url: sibnetUrl, label: "Sibnet (Anime)", language: "VOSTFR" }] : []),
                         ...mp4Sources
                       ]}
-                      frembedAvailable={frembedAvailable}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
+            frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
                       coflixSources={sortedCoflix}
@@ -3898,6 +3970,7 @@ const WatchTv: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : embedUrl ? ( // Render Embed Iframe
         <div className="w-full h-full flex flex-col items-center justify-center relative">
@@ -4185,6 +4258,7 @@ const WatchTv: React.FC = () => {
           ></iframe>
 
           {/* Source Selection Menu */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -4226,7 +4300,9 @@ const WatchTv: React.FC = () => {
                         ...(sibnetUrl ? [{ url: sibnetUrl, label: "Sibnet (Anime)", language: "VOSTFR" }] : []),
                         ...mp4Sources
                       ]}
-                      frembedAvailable={frembedAvailable}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
+            frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
                       coflixSources={sortedCoflix}
@@ -4249,8 +4325,13 @@ const WatchTv: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
-      ) : hlsSrc && hlsSrc.trim() !== '' && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? ( // Only render HLS Player if hlsSrc is valid
+      // SwiftFlux non encore résolue passe aussi par ici, avec une source vide :
+      // c'est le lecteur qu'on doit voir derrière le voile de la porte, avec son
+      // menu des sources — pas un écran noir — donc la refermer laisse de quoi
+      // choisir autre chose.
+      ) : ((hlsSrc && hlsSrc.trim() !== '') || selectedSource === 'swiftflux') && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
           <HLSPlayer
             priorityCategory="moviesTv"
@@ -4264,6 +4345,10 @@ const WatchTv: React.FC = () => {
             // lecteur (changement d'épisode ou de source).
             fullscreenTarget="page"
             src={hlsSrc}
+            // Le CDN SwiftFlux répond une 302 vers un autre domaine : en mode
+            // CORS le navigateur refuse de la suivre. Les autres sources gardent
+            // `crossOrigin`, dont dépendent le booster de volume et l'égaliseur.
+            disableCrossOrigin={selectedSource === 'swiftflux'}
             poster={showPosterPath ? `https://image.tmdb.org/t/p/w500${showPosterPath}` : undefined}
             backdrop={backdropPath ? `https://image.tmdb.org/t/p/w1280${backdropPath}` : undefined}
             className="w-full h-full"
@@ -4286,6 +4371,8 @@ const WatchTv: React.FC = () => {
               ...(sibnetUrl ? [{ url: sibnetUrl, label: "Sibnet (Anime)", language: "VOSTFR" }] : []),
               ...mp4Sources
             ]}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -4313,6 +4400,7 @@ const WatchTv: React.FC = () => {
 
 
           {/* Source Selection Menu */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -4352,7 +4440,9 @@ const WatchTv: React.FC = () => {
                         ...(sibnetUrl ? [{ url: sibnetUrl, label: "Sibnet (Anime)", language: "VOSTFR" }] : []),
                         ...mp4Sources
                       ]}
-                      frembedAvailable={frembedAvailable}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
+            frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
                       coflixSources={sortedCoflix}
@@ -4375,6 +4465,7 @@ const WatchTv: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : (
         <div className="w-full h-full flex flex-col items-center justify-center relative bg-black">
@@ -4398,6 +4489,8 @@ const WatchTv: React.FC = () => {
               ...(sibnetUrl ? [{ url: sibnetUrl, label: "Sibnet (Anime)", language: "VOSTFR" }] : []),
               ...mp4Sources
             ]}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -4452,6 +4545,30 @@ const WatchTv: React.FC = () => {
           click-anywhere. */}
       {showAdFreePopup && adPopupTriggered && !adPopupBypass && (
         <AdFreePlayerAds onClose={handlePopupClose} onAccept={handlePopupAccept} adType={adType} onAdClick={() => setHasClickedAd(true)} />
+      )}
+
+      {/* Porte SwiftFlux — posée par-dessus le lecteur en cours, jamais à sa
+          place : la refermer rend la main à ce qui jouait déjà.
+
+          Elle attend que NOTRE popup pub soit passée. Deux fenêtres empilées
+          demanderaient deux publicités à la fois, et celle du partenaire
+          masquerait la nôtre — l'utilisateur cliquerait la seconde sans avoir
+          vu la première, qui est celle qui finance le site. */}
+      {swiftfluxGateOpen && !showAdFreePopup && !adPopupBypass
+        && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) && (
+        <SwiftfluxGate
+          request={{ kind: 'tv', tmdbId: id || '', season: seasonNumber, episode: episodeNumber, index: 0 }}
+          onResolved={(playback) => {
+            setSwiftfluxPlayback(playback);
+            setEmbedUrl(null);
+            setEmbedType(null);
+            setVideoSource('');
+            currentSourceRef.current = 'swiftflux';
+            setSelectedSource('swiftflux');
+            setSwiftfluxGateOpen(false);
+          }}
+          onClose={() => setSwiftfluxGateOpen(false)}
+        />
       )}
     </div>
   );

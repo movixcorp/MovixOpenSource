@@ -304,6 +304,19 @@ const WatchPartyCreate: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-black text-white">
+      <div
+        hidden
+        data-premid-party-context=""
+        data-premid-party-title={mediaInfo.title || undefined}
+        data-premid-party-media-type={mediaInfo.mediaType || undefined}
+        data-premid-party-season={mediaInfo.mediaType === 'tv' ? String(mediaInfo.seasonNumber || 1) : undefined}
+        data-premid-party-episode={mediaInfo.mediaType === 'tv' ? String(mediaInfo.episodeNumber || 1) : undefined}
+        data-premid-party-poster={mediaInfo.poster
+          ? (mediaInfo.poster.startsWith('http')
+            ? mediaInfo.poster
+            : `https://image.tmdb.org/t/p/w500${mediaInfo.poster}`)
+          : undefined}
+      />
       {/* Background gradient */}
       <div className="fixed inset-0 h-52 z-0 bg-gradient-to-t from-transparent to-black/50 pointer-events-none" />
 

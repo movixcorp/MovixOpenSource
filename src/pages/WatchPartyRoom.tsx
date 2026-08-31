@@ -43,6 +43,10 @@ const MemoizedHLSPlayer = memo(HLSPlayer, (prevProps, nextProps) => {
     prevProps.src === nextProps.src &&
     prevProps.isPlaying === nextProps.isPlaying &&
     prevProps.controls === nextProps.controls &&
+    // `crossOrigin` se pose au montage de l'élément vidéo : si ce drapeau
+    // change sans que `src` bouge, le comparateur figerait l'ancienne valeur et
+    // la source qui redirige repartirait en mode CORS.
+    prevProps.disableCrossOrigin === nextProps.disableCrossOrigin &&
     (Math.abs((prevProps.initialTime || 0) - (nextProps.initialTime || 0)) < 1.0) // More precise for initialTime
   );
 });
@@ -326,6 +330,15 @@ const WatchPartyRoom: React.FC = () => {
       return !isBravoByUrl && !label.includes('bravo');
     });
   }, [roomInfo?.media?.mp4Sources, bravoSources]);
+
+  // SwiftFlux passe par un CDN qui redirige vers un autre domaine : en mode CORS
+  // le navigateur refuse de suivre la 302. On ne retire `crossOrigin` que quand
+  // c'est bien cette source qui joue — les autres en dépendent pour le booster
+  // de volume et l'égaliseur.
+  const activeSourceFollowsRedirect = useMemo(
+    () => mp4Sources.some((source) => source.followsRedirect && source.url === currentMediaSrc),
+    [mp4Sources, currentMediaSrc],
+  );
 
   // Moved an effect hook for source changes up to avoid conditional rendering issues.
   useEffect(() => {
@@ -1515,6 +1528,16 @@ const WatchPartyRoom: React.FC = () => {
 
   return (
     <div className="flex flex-col h-[100dvh] bg-black text-white overflow-hidden">
+      <div
+        hidden
+        data-premid-party-context=""
+        data-premid-party-title={roomInfo.media?.title || undefined}
+        data-premid-party-media-type={roomInfo.media?.mediaType || undefined}
+        data-premid-party-season={roomInfo.media?.seasonNumber != null ? String(roomInfo.media.seasonNumber) : undefined}
+        data-premid-party-episode={roomInfo.media?.episodeNumber != null ? String(roomInfo.media.episodeNumber) : undefined}
+        data-premid-party-poster={roomInfo.media?.poster || undefined}
+        data-premid-party-participants={String(participants.length)}
+      />
       {/* Floating Emoji Reactions - Fixed position for fullscreen support */}
       <FloatingReactionsContainer
         reactions={floatingReactions}
@@ -1632,6 +1655,7 @@ const WatchPartyRoom: React.FC = () => {
                   })) || []}
                   purstreamSources={bravoSources}
                   mp4Sources={mp4Sources}
+                  disableCrossOrigin={activeSourceFollowsRedirect}
                   onPlayerPlay={handlePlayerPlay}
                   onPlayerPause={handlePlayerPause}
                   onPlayerTimeUpdate={handlePlayerTimeUpdate}

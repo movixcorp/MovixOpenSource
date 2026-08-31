@@ -41,7 +41,8 @@ export const BUILTIN_HOSTER_PATTERNS: Record<BuiltinHosterId, string[]> = {
     '(?:prepareddare|ralphysuccessfull|realfinanceblogcenter|rebeccaneverbase|rebeccapracticeloss|reputationsheriffkennethsand|richardsignfish|roberteachfinal|robertordercharacter|robertplacespace|sandratableother|sandrataxeight|scatch176duplicities|sethniceletter|shannonpersonalcost|simpulumlamerop|smoki)\\.',
     '(?:stevenfamilyedge|stevenimaginelittle|strawberriesporail|telyn610zoanthropy|timberwoodanotia|timmaybealready|toddpartneranimal|toxitabellaeatrebates306|tracylocalschool|uptodatefinishconferenceroom|valeronevijao|walterprettytheir|wolfdyslectic|yodelswartlike)\\.',
   ],
-  vidmoly: ['vidmoly'],
+  // `ansembed` sert le lecteur Vidmoly sous un autre nom : même extracteur.
+  vidmoly: ['vidmoly', 'ansembed'],
   uqload: ['uqload'],
   sibnet: ['sibnet'],
   // Veev partage `doods.to` avec la nébuleuse DoodStream mais parle un tout
@@ -99,11 +100,66 @@ export const CANONICAL_HOSTER_DOMAINS: Partial<Record<BuiltinHosterId, string>> 
  * Réécrit le domaine d'une URL vers le domaine canonique de son hoster.
  * Sans domaine canonique déclaré, l'URL est rendue telle quelle.
  */
+/**
+ * Façades d'un même hébergeur : domaines qui servent le catalogue d'un hoster
+ * sous une autre marque. L'identifiant de fichier est identique de part et
+ * d'autre, donc réécrire l'hôte suffit à réutiliser l'extracteur existant.
+ *
+ * La clé est le premier label du domaine (`ansembed` pour `ansembed.net`),
+ * pour rester insensible au TLD comme le reste du registre.
+ */
+export const HOSTER_FRONTEND_ALIASES: Partial<Record<BuiltinHosterId, readonly string[]>> = {
+  vidmoly: ['ansembed'],
+};
+
+/** Premier label de l'hôte d'une URL (`ansembed.net` → `ansembed`). */
+function hostFamily(url: string): string | null {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, '').split('.')[0].toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Réécrit le domaine d'une URL vers le domaine canonique de son hoster.
+ *
+ * Deux cas : une façade déclarée voit son hôte entier remplacé ; sinon on
+ * remplace le domaine de la famille (uqload.cx → uqload.is). Sans domaine
+ * canonique déclaré, l'URL est rendue telle quelle.
+ */
 export function toCanonicalHosterDomain(url: string, hoster: BuiltinHosterId): string {
   const canonical = CANONICAL_HOSTER_DOMAINS[hoster];
   if (!canonical || !url) return url;
-  const family = canonical.split('.')[0];
-  return url.replace(new RegExp(`${family}\\.[a-z0-9-]+`, 'gi'), canonical);
+
+  const aliases = HOSTER_FRONTEND_ALIASES[hoster];
+  const family = hostFamily(url);
+  if (aliases && family && aliases.includes(family)) {
+    try {
+      const parsed = new URL(url);
+      parsed.hostname = canonical;
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  const canonicalFamily = canonical.split('.')[0];
+  return url.replace(new RegExp(`${canonicalFamily}\\.[a-z0-9-]+`, 'gi'), canonical);
+}
+
+/**
+ * Nom à afficher dans le menu des sources. Une façade garde sa propre marque
+ * — l'utilisateur a cliqué sur « Ansembed », il doit retrouver « Ansembed »,
+ * même si techniquement le flux est extrait par le chemin Vidmoly.
+ */
+export function getHosterDisplayName(url: string, hoster: BuiltinHosterId): string {
+  const aliases = HOSTER_FRONTEND_ALIASES[hoster];
+  const family = hostFamily(url);
+  if (aliases && family && aliases.includes(family)) {
+    return family.charAt(0).toUpperCase() + family.slice(1);
+  }
+  return HOSTER_LABELS[hoster];
 }
 
 /** Labels human-readable pour UI. */
@@ -174,29 +230,47 @@ if (typeof window !== 'undefined') {
  * Les 2 caches (built-in vs override) sont invalidés par le même
  * `cacheEpoch`, bumpé à chaque `movix-source-priority-changed`.
  */
+/**
+ * Patterns effectifs pour un hoster built-in, overrides utilisateur compris.
+ *
+ * Les façades listées dans HOSTER_FRONTEND_ALIASES sont TOUJOURS ajoutées, même
+ * quand l'utilisateur possède sa propre liste de patterns. Un override exprime
+ * quels domaines appartiennent à un hébergeur ; il ne peut pas exprimer qu'un
+ * domaine cesse d'être une façade, ce qui est un fait et non une préférence.
+ *
+ * Sans cette règle, quiconque a ouvert une fois l'éditeur de patterns figeait le
+ * hoster dans son état du jour — l'UI recopie les built-in dans l'override à la
+ * première édition — et ne recevait plus jamais les domaines ajoutés ensuite.
+ */
 export function getEffectivePatterns(
   id: BuiltinHosterId,
   overrides: Partial<Record<BuiltinHosterId, string[]>> = {},
 ): RegExp[] {
+  const aliases = HOSTER_FRONTEND_ALIASES[id] ?? [];
   const override = overrides[id];
+
   if (override !== undefined && override.length > 0) {
-    // Chemin override : l'utilisateur est propriétaire de la liste.
+    // Chemin override : l'utilisateur est propriétaire de la liste des domaines,
+    // mais pas de la table des façades.
     if (overrideCacheEpoch !== cacheEpoch) {
       overrideCompiled.clear();
       overrideCacheEpoch = cacheEpoch;
     }
     if (overrideCompiled.has(id)) return overrideCompiled.get(id)!;
-    const compiled = override.map(safeCompile).filter((r): r is RegExp => r !== null);
+    const compiled = [...override, ...aliases]
+      .map(safeCompile)
+      .filter((r): r is RegExp => r !== null);
     overrideCompiled.set(id, compiled);
     return compiled;
   }
+
   // Chemin built-in (dynamique).
   if (builtinCacheEpoch !== cacheEpoch) {
     builtinCompiled.clear();
     builtinCacheEpoch = cacheEpoch;
   }
   if (builtinCompiled.has(id)) return builtinCompiled.get(id)!;
-  const compiled = (BUILTIN_HOSTER_PATTERNS[id] ?? [])
+  const compiled = [...(BUILTIN_HOSTER_PATTERNS[id] ?? []), ...aliases]
     .map(safeCompile)
     .filter((r): r is RegExp => r !== null);
   builtinCompiled.set(id, compiled);

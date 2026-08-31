@@ -1113,8 +1113,17 @@ async function make1j1fRequest(targetUrl, options = {}) {
     (b.includes("cf-wrapper") ||
       b.includes("Just a moment") ||
       b.includes("cloudflare"));
+  // 408/0 : CycleTLS ne throw PAS sur ses propres timeouts — il résout avec un
+  // statut synthétique 408 (ou 0) et un corps d'erreur Go. Sans rotation ici, un
+  // relais/proxy qui timeout renvoyait ce déchet comme un « succès » et la chaîne
+  // s'arrêtait au lieu d'essayer l'egress suivant.
   const shouldRotate = (status, b) =>
-    (status >= 500 && status < 600) || isCfBlock(status, b);
+    status === 408 || status === 0 || (status >= 500 && status < 600) || isCfBlock(status, b);
+
+  // Piste des échecs par egress, loggée UNIQUEMENT quand tout a échoué — sinon
+  // une panne se manifeste comme un unique `via=direct` sans rien dire des
+  // relais/proxies tentés avant.
+  const trail = [];
 
   const cycleTLS = await getCycleTLS();
   // `via` tags which egress produced the response — callers log it, so a failure
@@ -1143,10 +1152,13 @@ async function make1j1fRequest(targetUrl, options = {}) {
   let lastResult = null;
   let lastError = null;
 
-  // 1) Cloudflare Worker relays, rotated on 429/403/5xx/challenge.
+  // 1) Cloudflare Worker relays, rotated on 429/403/5xx/timeout/challenge.
   const relayFailed = (status, b) =>
     status === 429 || status === 403 || shouldRotate(status, b);
-  for (const relay of j1fAvailableRelays()) {
+  const relays = j1fAvailableRelays();
+  if (relays.length === 0) trail.push("relais=aucun (CLOUDFLARE_WORKERS_PROXIES vide)");
+  for (const relay of relays) {
+    const relayTag = relay.replace(/^https?:\/\//, "").slice(0, 40);
     try {
       const viaRelay = asAxiosLike(
         await cycleTLS(
@@ -1166,6 +1178,7 @@ async function make1j1fRequest(targetUrl, options = {}) {
       );
       if (relayFailed(viaRelay.status, viaRelay.data)) {
         j1fBenchRelay(relay, viaRelay.status);
+        trail.push(`relay:${relayTag}=${viaRelay.status}`);
         lastResult = viaRelay;
         continue;
       }
@@ -1173,12 +1186,14 @@ async function make1j1fRequest(targetUrl, options = {}) {
       return viaRelay;
     } catch (err) {
       j1fBenchRelay(relay, "timeout");
+      trail.push(`relay:${relayTag}=${err.code || err.message || "erreur"}`);
       lastError = err;
     }
   }
 
   // 2) Proxy pool.
   const { proxies, useSocks } = pickProxyscrapeCandidates();
+  if (!proxies || proxies.length === 0) trail.push("proxies=aucun");
   for (let i = 0; i < (proxies || []).length; i++) {
     const proxy = proxies[i];
     const auth = proxy.auth ? `${proxy.auth}@` : "";
@@ -1191,11 +1206,13 @@ async function make1j1fRequest(targetUrl, options = {}) {
         `proxy:${proxy.host}:${proxy.port}`,
       );
       if (shouldRotate(result.status, result.data)) {
+        trail.push(`proxy:${proxy.host}=${result.status}`);
         lastResult = result;
         continue;
       }
       return result; // 2xx success, or a definitive 4xx
     } catch (err) {
+      trail.push(`proxy:${proxy.host}=${err.code || err.message || "erreur"}`);
       lastError = err;
     }
   }
@@ -1206,11 +1223,17 @@ async function make1j1fRequest(targetUrl, options = {}) {
   try {
     const direct = asAxiosLike(await doRequest(null), "direct");
     if (!shouldRotate(direct.status, direct.data)) return direct;
+    trail.push(`direct=${direct.status}`);
     lastResult = direct;
   } catch (err) {
+    trail.push(`direct=${err.code || err.message || "erreur"}`);
     lastError = err;
   }
 
+  // Tout a échoué : une seule ligne qui nomme chaque egress tenté et son verdict.
+  console.warn(
+    `[1J1F EGRESS] ${cleanTargetUrl.slice(0, 120)} -> ${trail.join(" | ").slice(0, 600)}`,
+  );
   if (lastResult) return lastResult;
   throw lastError || new Error("[1J1F] Tous les relais et proxies ont echoue");
 }
@@ -1660,43 +1683,64 @@ async function makeVavooBrowserRequest(targetUrl, payload, options = {}) {
     : {};
   const timeout = Math.max(1, Math.floor(Number(options.timeout) || 4));
   const userAgent = headers["User-Agent"] || headers["user-agent"] || CHROME_UA;
+  const url = String(targetUrl).trim();
+  const body = JSON.stringify(payload);
   const cycleTLS = await getCycleTLS();
   let lastError = null;
 
-  for (let attempt = 0; attempt < 15; attempt += 1) {
+  // Un seul aller-retour CycleTLS : renvoie le JSON, ou lève avec le statut
+  // HTTP attaché pour que la politique de santé sache doser la quarantaine.
+  async function attempt(proxyUrl) {
+    const response = await cycleTLS(
+      url,
+      {
+        body,
+        ja3: CHROME_JA3,
+        userAgent,
+        ...(proxyUrl ? { proxy: proxyUrl } : {}),
+        headers,
+        timeout,
+      },
+      "post",
+    );
+    const status = Number(response?.status) || 0;
+    if (status < 200 || status >= 300) {
+      const error = new Error(`[VAVOO CYCLETLS] status ${status || "unknown"}`);
+      error.response = { status: status || undefined };
+      throw error;
+    }
+
+    let data = response?.body;
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        data = null;
+      }
+    }
+    if (!data || typeof data !== "object") {
+      const error = new Error("[VAVOO CYCLETLS] invalid JSON response");
+      error.response = { status };
+      throw error;
+    }
+    return data;
+  }
+
+  // Chemin nominal : direct. kool.to répond sans géoblocage, et le pool DE est
+  // trop petit (2 IP) pour encaisser toutes les résolutions à lui seul.
+  try {
+    return await attempt(null);
+  } catch (error) {
+    lastError = error;
+  }
+
+  for (let i = 0; i < 15; i += 1) {
     const proxy = await pickVavooSocks5Proxy();
     if (!proxy) break;
 
     const auth = proxy.auth ? `${proxy.auth}@` : "";
-    const proxyUrl = `socks5h://${auth}${proxy.host}:${proxy.port}`;
     try {
-      const response = await cycleTLS(
-        String(targetUrl).trim(),
-        {
-          body: JSON.stringify(payload),
-          ja3: CHROME_JA3,
-          userAgent,
-          proxy: proxyUrl,
-          headers,
-          timeout,
-        },
-        "post",
-      );
-      const status = Number(response?.status) || 0;
-      if (status < 200 || status >= 300) {
-        const error = new Error(`[VAVOO CYCLETLS] status ${status || "unknown"}`);
-        error.response = { status: status || undefined };
-        throw error;
-      }
-
-      let data = response?.body;
-      if (typeof data === "string") data = JSON.parse(data);
-      if (!data || typeof data !== "object") {
-        const error = new Error("[VAVOO CYCLETLS] invalid JSON response");
-        error.response = { status };
-        throw error;
-      }
-
+      const data = await attempt(`socks5h://${auth}${proxy.host}:${proxy.port}`);
       markVavooProxyAsHealthy(proxy);
       return data;
     } catch (error) {

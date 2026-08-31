@@ -10,8 +10,11 @@
  * ----
  * 0. Domain rotates. Resolve the live base from the stable /go/ entry
  *    (TARGET_URL = "..."), cached + env-overridable (J1F_BASE_URL).
- * 1. Search via the nonce-free WP listing {base}/?s={query} -> /films/ +
- *    /tvshows/ links (slug carries the year). Matched against TMDB title+year.
+ * 1. Search via the Dooplay live-search REST route
+ *    {base}/wp-json/dooplay/search/?keyword={q}&nonce={n} -> map id -> {title,
+ *    url, extra:{date}}. The nonce is scraped from any page (base64 data-script
+ *    `var dtGonza = {"api":...,"nonce":"..."}`), cached, and refreshed on a
+ *    `no_verify_nonce` reply. Matched against TMDB title+year.
  * 2. The real source list is NOT in the plain HTML — it ships base64-encoded
  *    inside <script defer src="data:text/javascript;base64,...">. Decode those:
  *      - Movies: `var J1F_SRV = [{label,url,type,source}, ...]`
@@ -49,6 +52,7 @@ const {
 } = require('../utils/cacheManager');
 const { calculateTitleSimilarity } = require('./coflix'); // pure fn, no configure() needed
 const { respondWithResolvedSources } = require('../utils/embedExtraction');
+const { createConcurrencyLimiter } = require('../utils/concurrency');
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 const TMDB_API_URL = 'https://api.themoviedb.org/3';
@@ -80,9 +84,17 @@ const WRAP_HOST_RE = new RegExp(process.env.J1F_WRAP_HOSTS || 'onregardeou', 'i'
 const SRV_VAR = process.env.J1F_SRV_VAR || 'J1F_SRV'; // movie source array
 const EPS_VAR = process.env.J1F_EPS_VAR || 'j1fEpsData'; // series episodes array
 const SIMILARITY_THRESHOLD = parseFloat(process.env.J1F_SIMILARITY || '0.7');
-// REST search page size. The listing is dominated by /episodes/ hits, which we
-// discard — 20 leaves room for the /films/ + /tvshows/ entries to survive.
-const SEARCH_PER_PAGE = parseInt(process.env.J1F_SEARCH_PER_PAGE || '20', 10);
+// Interrupteur global du scraping (J1F_SCRAPE=false pour couper, true par
+// défaut). À false, on sert UNIQUEMENT le cache existant : aucun rafraîchissement
+// en arrière-plan, aucun scrape de titres nouveaux, aucune requête réseau vers
+// 1J1F (ni /go/, ni nonce). Utile quand tous les egress sont morts (relais 1020,
+// proxies challengés) : évite de brûler du quota relais pour rien.
+const SCRAPE_ENABLED = (process.env.J1F_SCRAPE || 'true').trim().toLowerCase() !== 'false';
+// Dooplay search nonce. Empty override = dynamic (scraped from the site pages);
+// setting J1F_SEARCH_NONCE pins it and disables the scrape entirely.
+const NONCE_OVERRIDE = (process.env.J1F_SEARCH_NONCE || '').trim();
+// Last-known-good nonce, used only when the scrape fails before a first success.
+const SEED_NONCE = '286f6fae56';
 const BASE_TTL_MS = 6 * 60 * 60 * 1000; // re-resolve domain every 6h
 const REFRESH_MS = 40 * 60 * 1000; // serve cache fresh within this window
 
@@ -140,9 +152,69 @@ async function resolveBase() {
   return cachedBase;
 }
 
+// === Search nonce resolution (cached) ===
+// The Dooplay search route rejects requests without a valid WP nonce
+// (`no_verify_nonce`). The current nonce ships in every page inside a base64
+// data-script: `var dtGonza = {"api":".../wp-json/dooplay/search/","nonce":"..."}`.
+// Scraped from the home page, cached with a TTL, and force-refreshed when a
+// search answers `no_verify_nonce` (WP nonces expire on their own schedule).
+//
+// Deux garde-fous, tous deux appris d'une panne réelle : les échecs sont aussi
+// mis en cache (cooldown court) — sinon, 1J1F injoignable = CHAQUE recherche
+// repaye un fetch de page d'accueil à travers toute la chaîne relais/proxies/
+// direct avant même de tenter sa recherche — et les résolutions concurrentes
+// partagent un seul fetch en vol au lieu d'en empiler une par recherche.
+let cachedNonce = null;
+let cachedNonceAt = 0;
+let nonceFailAt = 0;
+let nonceInFlight = null;
+const NONCE_FAIL_COOLDOWN_MS = 5 * 60 * 1000;
+const fallbackNonce = () => cachedNonce || SEED_NONCE;
+async function resolveNonce(base, force = false) {
+  if (NONCE_OVERRIDE) return NONCE_OVERRIDE;
+  const age = Date.now() - cachedNonceAt;
+  if (cachedNonce && (force ? age < 30 * 1000 : age < BASE_TTL_MS)) return cachedNonce; // force : un refresh < 30s est déjà « frais »
+  if (!force && Date.now() - nonceFailAt < NONCE_FAIL_COOLDOWN_MS) return fallbackNonce();
+  if (nonceInFlight) return nonceInFlight;
+  nonceInFlight = (async () => {
+    try {
+      const res = await make1j1fRequest(`${base}/`, { timeout: 20 });
+      for (const js of decodeDataScripts(toBody(res))) {
+        if (!js.includes('dooplay/search')) continue;
+        const m = js.match(/"nonce"\s*:\s*"([A-Za-z0-9]+)"/);
+        if (m) {
+          if (m[1] !== cachedNonce) console.log(`[1J1F NONCE] nouveau nonce=${m[1]}`);
+          cachedNonce = m[1];
+          cachedNonceAt = Date.now();
+          nonceFailAt = 0;
+          return cachedNonce;
+        }
+      }
+      console.warn(`[1J1F NONCE] dtGonza/nonce introuvable sur ${base}/ (status=${res.status})`);
+    } catch (e) {
+      console.warn(`[1J1F NONCE] ${base}/: ${e.message}`);
+    }
+    nonceFailAt = Date.now();
+    return fallbackNonce(); // scrape failed -> last good, else seed
+  })().finally(() => {
+    nonceInFlight = null;
+  });
+  return nonceInFlight;
+}
+
 // In-flight scrapes keyed by cache key, so concurrent cold requests for the same
 // title kick off only ONE background scrape.
 const inFlight = new Map();
+
+// Cap on scrapes running at once (per worker). A page of posters cold-loads a
+// dozen titles at a time; without this cap they all walk the relais/proxies/
+// direct chain in parallel, Cloudflare rate-limite l'egress, et tout finit en
+// timeout — y compris les requêtes qui seraient passées seules. Les jobs sont
+// déjà en tâche de fond : les mettre en file ne bloque personne, ça retarde
+// juste le remplissage du cache.
+const limitScrape = createConcurrencyLimiter(
+  parseInt(process.env.J1F_SCRAPE_CONCURRENCY || '3', 10),
+);
 
 // Non-blocking cache — never make the user wait on the slow CycleTLS+proxy scrape:
 //  - fresh cache      -> return it
@@ -155,7 +227,7 @@ function startBackgroundScrape(key, fetcher, cached) {
   if (inFlight.has(key)) return inFlight.get(key);
   const job = (async () => {
     try {
-      const fresh = await fetcher();
+      const fresh = await limitScrape(fetcher);
       // A failure must never clobber a good entry. Two rules:
       //  - `_transient` (Cloudflare challenge, timeout, markup drift) says
       //    nothing about the title -> never persisted, the next request retries.
@@ -183,6 +255,14 @@ function startBackgroundScrape(key, fetcher, cached) {
 
 async function withCache(key, fetcher) {
   const cached = await getFromCacheNoExpiration(CACHE_DIR.J1F, key);
+
+  // Scraping coupé (J1F_SCRAPE=off) : cache servi tel quel sans rafraîchissement ;
+  // à froid, négatif définitif SANS `pending` — le client ne doit pas re-poller
+  // un scrape qui ne viendra jamais.
+  if (!SCRAPE_ENABLED) {
+    return cached || { success: false, error: 'Scraping 1jour1film désactivé', tmdb_id: undefined };
+  }
+
   if (cached && cached._ts && Date.now() - cached._ts < REFRESH_MS) return cached;
 
   // Stale or cold: trigger a background refresh/scrape (deduped), don't await it.
@@ -298,15 +378,15 @@ async function expandWrappers(servers) {
 const decodeEntities = (s) => (s ? cheerio.load(`<x>${s}</x>`)('x').text() : '');
 
 // === Search -> [{url, slug, type, year, title}] ===
-// Uses the WordPress REST API, NOT the {base}/?s= listing: that endpoint is now
-// behind a Cloudflare managed challenge for every client (verified 403 from a
-// clean residential IP, not just from proxies/relays). /wp-json is still open and
-// is a better source anyway — it returns the real post title instead of one
-// reconstructed from the slug, so the match against TMDB is far more reliable.
-// `subtype` is not usable as a query param (the WAF 403s it); results are typed
-// from their URL path instead, which also drops the /episodes/ noise.
-async function searchJ1F(base, query) {
-  const url = `${base}/wp-json/wp/v2/search?search=${encodeURIComponent(query)}&per_page=${SEARCH_PER_PAGE}`;
+// Uses the Dooplay live-search route ({base}/wp-json/dooplay/search/), not
+// /wp/v2/search: it answers a map id -> {title, url, extra:{date}} with the real
+// post title AND the release year, so the TMDB match no longer depends on the
+// year hidden in the slug. It needs a valid WP nonce (see resolveNonce); error
+// replies are typed: `no_posts` = definitive "not here" (cacheable negative),
+// `no_verify_nonce` = stale nonce -> force-refresh and retry once.
+async function searchJ1F(base, query, retried = false) {
+  const nonce = await resolveNonce(base, retried);
+  const url = `${base}/wp-json/dooplay/search/?keyword=${encodeURIComponent(query)}&nonce=${nonce}`;
   const res = await make1j1fRequest(url, { timeout: 15 });
   const body = toBody(res);
   let items;
@@ -314,32 +394,42 @@ async function searchJ1F(base, query) {
     items = JSON.parse(body);
   } catch {
     // Not JSON = a challenge page / WAF error, i.e. we never reached 1J1F.
-    // THROWING is what separates that from a genuine empty result: the REST API
-    // answers `[]` for an unknown title, which is a definitive "not here" and
-    // must stay cacheable. The message carries the egress (`via`) and the head
-    // of the body — a relay 1020 vs a proxy challenge vs a direct block.
+    // THROWING is what separates that from a genuine empty result (`no_posts`),
+    // which is a definitive "not here" and must stay cacheable. The message
+    // carries the egress (`via`) and the head of the body — a relay 1020 vs a
+    // proxy challenge vs a direct block.
     throw new Error(
       `reponse non-JSON status=${res.status} via=${res.via || '?'} len=${body.length} body="${body
         .slice(0, 200)
         .replace(/\s+/g, ' ')}"`,
     );
   }
-  if (!Array.isArray(items)) return [];
+  if (!items || typeof items !== 'object') return [];
+  if (items.error) {
+    if (items.error === 'no_posts') return []; // vrai vide -> negatif cacheable
+    if (items.error === 'no_verify_nonce' && !retried) {
+      return searchJ1F(base, query, true); // nonce expire -> refresh force + retry unique
+    }
+    // Nonce toujours refuse apres retry, ou code d'erreur inconnu : on n'a rien
+    // appris sur le titre -> transitoire, jamais cache comme "pas trouve".
+    throw new Error(`erreur dooplay "${items.error}" via=${res.via || '?'}`);
+  }
 
   const seen = new Set();
   const out = [];
-  for (const it of items) {
+  for (const it of Object.values(items)) {
     const href = (it && it.url) || '';
     const m = href.match(/\/(films|tvshows)\/([^/"?#]+)\/?/);
-    if (!m) continue; // /episodes/ and anything that isn't a film/show page
+    if (!m) continue; // anything that isn't a film/show page
     const slug = m[2];
     if (seen.has(slug)) continue;
     seen.add(slug);
+    const extraYear = parseInt(it.extra && it.extra.date, 10);
     out.push({
       url: href.split('#')[0],
       slug,
       type: m[1] === 'films' ? 'movie' : 'tv',
-      year: yearFromSlug(slug),
+      year: Number.isNaN(extraYear) ? yearFromSlug(slug) : extraYear,
       title: decodeEntities(it.title),
     });
   }
@@ -548,7 +638,7 @@ const respondWithMovieSources = (req, res, payload) =>
 router.get('/movie/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const base = await resolveBase();
+    const base = SCRAPE_ENABLED ? await resolveBase() : ''; // off : zéro réseau, cache only
     const data = await withCache(generateCacheKey({ src: 'j1f', t: 'movie', id }), () =>
       fetchMovie(base, id),
     );
@@ -563,7 +653,7 @@ router.get('/tv/:id/season/:season', async (req, res) => {
   const { id, season } = req.params;
   const { episode } = req.query;
   try {
-    const base = await resolveBase();
+    const base = SCRAPE_ENABLED ? await resolveBase() : ''; // off : zéro réseau, cache only
     const key = generateCacheKey({ src: 'j1f', t: 'tv', id, season, episode: episode || '' });
     const data = await withCache(key, () => fetchSeason(base, id, season, episode));
     await respondWithEpisodeSources(req, res, hideHosts(data));

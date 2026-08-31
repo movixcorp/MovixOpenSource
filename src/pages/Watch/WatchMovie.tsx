@@ -4,6 +4,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import axios from 'axios';
 import HLSPlayer from '../../components/HLSPlayer';
+import PlayerOverlayPortal from '../../components/PlayerOverlayPortal';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
@@ -18,12 +19,19 @@ import { setLastPlayer } from '../../utils/lastPlayerPref';
 import { getTmdbId } from '../../utils/idEncoder';
 import { useWrappedTracker } from '../../hooks/useWrappedTracker';
 import { isUserVip, getVipHeaders } from '../../utils/authUtils';
+import { serverResolveRequest } from '../../utils/serverResolveRequest';
 import { isExtensionAvailable } from '../../utils/extensionProxy';
 import { getTmdbLanguage } from '../../i18n';
 import { useProfile } from '../../context/ProfileContext';
 import { isContentAllowed, getClassificationLabel } from '../../utils/certificationUtils';
 import { getCoflixPreferredUrl } from '../../utils/coflix';
 import { KisskhServiceError, resolveKisskhMovie } from '../../services/kisskhService';
+import SwiftfluxGate from '../../components/SwiftfluxGate';
+import {
+  readSwiftflux,
+  type SwiftfluxEntry,
+  type SwiftfluxPlayback,
+} from '../../services/swiftfluxService';
 import type { KisskhSource, KisskhSubtitleTrack } from '../../types/kisskh';
 import {
   createHlsAutoFallbackGuard,
@@ -223,13 +231,14 @@ function formatPremidSourceDetail(...parts: Array<string | null | undefined>) {
 }
 
 // Helper functions - Check custom links from MySQL API
-// Config commune des appels catalogue en contexte de lecture : `resolve=1`
-// demande la résolution serveur des m3u8, la clé VIP l'autorise.
+// Config commune des appels catalogue en contexte de lecture, pilotée par la
+// méthode d'extraction choisie : en méthode serveur `resolve=1` + clé VIP, en
+// méthode extension/userscript ni l'un ni l'autre (extraction 100 % locale).
 //
 // Une fonction et non une constante : `checkMovieAvailability` vit au niveau
-// module, hors du composant, et la clé VIP doit de toute façon être relue à
-// chaque appel plutôt que figée au chargement.
-const resolveRequest = () => ({ params: { resolve: 1 }, headers: { ...getVipHeaders() } });
+// module, hors du composant, et la clé VIP comme la méthode doivent être
+// relues à chaque appel plutôt que figées au chargement.
+const resolveRequest = () => serverResolveRequest();
 
 const checkMovieAvailability = async (movieId: string) => {
   try {
@@ -374,6 +383,16 @@ const WatchMovie: React.FC = () => {
   const [selectedDarkinoSource, setSelectedDarkinoSource] = useState<number>(0);
   const [mp4Sources, setMp4Sources] = useState<{ url: string; label?: string; language?: string; isVip?: boolean }[]>([]);
   const [selectedMp4Source, setSelectedMp4Source] = useState<number>(0);
+
+  // SwiftFlux (MP4 direct du catalogue SwiftFlow). Trois états distincts :
+  // ce qu'on sait exister (`entries`, sans URL), et ce qui a été débloqué
+  // (`playback`, avec URL) — la porte d'entrée s'intercale entre les deux.
+  const [swiftfluxEntries, setSwiftfluxEntries] = useState<SwiftfluxEntry[]>([]);
+  const [swiftfluxPlayback, setSwiftfluxPlayback] = useState<SwiftfluxPlayback | null>(null);
+  // La porte se pose par-dessus ce qui joue : tant qu'elle n'a rien résolu, la
+  // source courante reste en place et visible derrière, et la refermer ne coûte
+  // rien à l'utilisateur.
+  const [swiftfluxGateOpen, setSwiftfluxGateOpen] = useState(false);
   const [watchProgress] = useState<number>(0);
   const [, setLoadingError] = useState<boolean>(false);
   const [nextMovie, setNextMovie] = useState<NextMovieType | null>(null);
@@ -912,14 +931,9 @@ const WatchMovie: React.FC = () => {
       // =========== CHECK FSTREAM SOURCE ==========
       const fstreamPromise = (async () => {
         try {
-          // La clé VIP part en header, et `resolve=1` demande au serveur de
-          // résoudre lui-même les m3u8 du film. Sans ce paramètre il n'extrait
-          // pas, pour ne pas travailler en double avec les clients qui
-          // ignorent encore `m3u8Url`.
-          const fstreamResponse = await axios.get(`${MAIN_API}/api/fstream/movie/${id}`, {
-            params: { resolve: 1 },
-            headers: { ...getVipHeaders() }
-          });
+          // Méthode serveur : clé VIP + `resolve=1` (résolution serveur des
+          // m3u8). Méthode extension/userscript : liens bruts, extraction locale.
+          const fstreamResponse = await axios.get(`${MAIN_API}/api/fstream/movie/${id}`, resolveRequest());
           return fstreamResponse.data;
         } catch (error) {
           console.error('Error fetching FStream movie sources:', error);
@@ -983,6 +997,13 @@ const WatchMovie: React.FC = () => {
         j1fPromise,
         swiftflowPromise
       ]);
+
+      // =========== TRAITEMENT DES RÉSULTATS SWIFTFLUX ===========
+      // Même réponse que SwiftFlow : l'appel amont rend l'URL du MP4 en même
+      // temps que de quoi construire l'iframe. Pas de requête supplémentaire.
+      const swiftfluxResult = readSwiftflux(swiftflowResult);
+      setSwiftfluxEntries(swiftfluxResult.entries);
+      setSwiftfluxPlayback(null);
 
       // Mémorise les m3u8 que le serveur a résolues pour ces catalogues.
       // C'est la SEULE façon dont une m3u8 parvient au client : il n'existe
@@ -1802,6 +1823,19 @@ const WatchMovie: React.FC = () => {
             currentSourceRef.current = 'mp4';
             return true;
           }
+          case 'swiftflux': {
+            if (!swiftfluxResult.available) return false;
+            // Aucune URL à poser : la porte d'entrée s'en charge et remplira
+            // `swiftfluxPlayback` une fois la pub vue et le Turnstile validé.
+            setSelectedSource('swiftflux');
+            setVideoSource('');
+            setEmbedUrl(null);
+            setEmbedType(null);
+            currentSourceRef.current = 'swiftflux';
+            setOnlyVostfrAvailable(false);
+            setSwiftfluxGateOpen(true);
+            return true;
+          }
           case 'darkino': {
             if (!darkinoResult || typeof darkinoResult !== 'object' || !('available' in darkinoResult) || !darkinoResult.available || !darkinoResult.sources.length) {
               return false;
@@ -1993,7 +2027,9 @@ const WatchMovie: React.FC = () => {
 
       // Special case for movie ID 1218925 - force custom source selection
       // (overrides any user priority, comportement préservé)
-      if (id === '1218925') {
+      // Garde-fou : si un lecteur Viblix (source `mp4`) existe, on ne force plus
+      // `custom` — le forçage servait à combler l'absence de lecteur direct.
+      if (id === '1218925' && fetchedMp4Sources.length === 0) {
         console.log('🎯 Special case: Movie ID 1218925 - selecting custom source');
         setSelectedSource('custom');
         setEmbedUrl('https://movix1.embedseek.com/#h6j8');
@@ -2002,7 +2038,8 @@ const WatchMovie: React.FC = () => {
         setOnlyVostfrAvailable(false);
       }
       // Special case for movie ID 1311031 - force custom source selection
-      else if (id === '1311031') {
+      // (même garde-fou Viblix que ci-dessus)
+      else if (id === '1311031' && fetchedMp4Sources.length === 0) {
         console.log('🎯 Special case: Movie ID 1311031 - selecting custom source');
 
         // Fetch custom links from API for this specific movie
@@ -2056,6 +2093,7 @@ const WatchMovie: React.FC = () => {
           { id: 'wiflix', hasData: wiflixProcessedSources.length > 0 },
           { id: 'j1f', hasData: j1fProcessedSources.length > 0 },
           { id: 'swiftflow', hasData: swiftflowProcessedSources.length > 0 },
+          { id: 'swiftflux', hasData: swiftfluxResult.available },
           { id: 'coflix', hasData: !!(coflixResult && getMultiFromCoflix(coflixResult)) },
           { id: 'viper', hasData: viperProcessedSources.length > 0 },
           { id: 'custom', hasData: customLinks.length > 0 },
@@ -2196,6 +2234,28 @@ const WatchMovie: React.FC = () => {
           );
           return;
         }
+      }
+
+      // SwiftFlux se sélectionne sans URL : elle n'existe pas encore côté
+      // client à cet instant. On repasse par la porte d'entrée, qui la
+      // demandera au serveur une fois la pub vue et le Turnstile validé.
+      if (type === 'swiftflux') {
+        if (!isAutomaticFallback) setLastPlayer('swiftflux');
+        setShowEmbedQuality(false);
+        // Déjà débloquée pour ce film : rien à redemander, on bascule.
+        if (swiftfluxPlayback) {
+          setOnlyVostfrAvailable(false);
+          setEmbedUrl(null);
+          setEmbedType(null);
+          setVideoSource('');
+          currentSourceRef.current = 'swiftflux';
+          setSelectedSource('swiftflux');
+          return;
+        }
+        // Sinon on ouvre la porte SANS toucher à la source courante : ce qui
+        // joue continue derrière, et refermer la porte n'a rien cassé.
+        setSwiftfluxGateOpen(true);
+        return;
       }
 
       const bravoAllowed = type !== 'bravo' || canUseBravo;
@@ -2434,9 +2494,9 @@ const WatchMovie: React.FC = () => {
     };
   }, [
     // State values used in logic
-    darkinoSources, mp4Sources, darkinoAvailable, nexusHlsSources, nexusFileSources, fstreamSources, wiflixSources, j1fSources, swiftflowSources, sortedFstream, sortedWiflix, sortedJ1f, sortedSwiftflow, viperSources, purstreamSources, kisskhSources, canUseBravo,
+    darkinoSources, mp4Sources, darkinoAvailable, nexusHlsSources, nexusFileSources, fstreamSources, wiflixSources, j1fSources, swiftflowSources, sortedFstream, sortedWiflix, sortedJ1f, sortedSwiftflow, viperSources, purstreamSources, kisskhSources, canUseBravo, swiftfluxPlayback,
     // State setters
-    setOnlyVostfrAvailable, setShowEmbedQuality, setEmbedUrl, setEmbedType,
+    setOnlyVostfrAvailable, setShowEmbedQuality, setEmbedUrl, setEmbedType, setSwiftfluxGateOpen,
     setSelectedSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedFstreamSource, setSelectedWiflixSource, setSelectedViperSource, setVideoSource,
     // Refs (currentSourceRef.current is mutated, so the ref object itself is a dependency)
     currentSourceRef, autoFallbackGuard
@@ -2538,6 +2598,9 @@ const WatchMovie: React.FC = () => {
             break;
           case 'swiftflow':
             playerType = 'swiftflow';
+            break;
+          case 'swiftflux':
+            playerType = 'swiftflux';
             break;
           case 'viper':
             playerType = 'viper';
@@ -2812,6 +2875,7 @@ const WatchMovie: React.FC = () => {
             </div>
           </div>
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -2845,6 +2909,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -2870,6 +2936,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : selectedSource === 'fstream' && fstreamSources.length > 0 && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -2919,6 +2986,7 @@ const WatchMovie: React.FC = () => {
           ></iframe>
 
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -2952,6 +3020,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -2977,6 +3047,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : selectedSource === 'darkino' && darkinoSources.length > 0 && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -3054,6 +3125,8 @@ const WatchMovie: React.FC = () => {
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -3071,6 +3144,7 @@ const WatchMovie: React.FC = () => {
             initialTime={watchProgress}
           />
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3104,6 +3178,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3129,6 +3205,120 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
+        </div>
+      ) : selectedSource === 'swiftflux' ? (
+        // Une seule branche, résolue ou non : tant que la porte n'a rien rendu,
+        // le lecteur est monté avec une source vide. C'est lui qu'on voit
+        // derrière le voile, avec son menu des sources — pas un écran noir —
+        // donc refermer la porte laisse de quoi choisir autre chose.
+        <div className="w-full h-full flex items-center justify-center">
+          <HLSPlayer
+            priorityCategory="moviesTv"
+            autoFallbackGuard={autoFallbackGuard}
+            key={`swiftflux-${id}-${swiftfluxPlayback?.url || 'pending'}`}
+            src={swiftfluxPlayback?.url || ''}
+            // Le CDN partenaire répond une 302 vers un autre domaine : en mode
+            // CORS le navigateur refuse de la suivre.
+            disableCrossOrigin
+            className="w-full h-full"
+            autoPlay={true}
+            onError={() => {
+              // Source vide = porte pas encore franchie : l'erreur est attendue,
+              // elle ne doit pas rouvrir la porte en boucle.
+              if (!swiftfluxPlayback) return;
+              // Le lien est à usage unique du point de vue de l'interface : on
+              // repasse par la porte plutôt que de réessayer une URL périmée.
+              setSwiftfluxPlayback(null);
+              setSwiftfluxGateOpen(true);
+            }}
+            nextMovie={nextMovie}
+            onNextMovie={handleNextMovie}
+            poster={posterPath ? `https://image.tmdb.org/t/p/w500${posterPath}` : undefined}
+            backdrop={backdropPath ? `https://image.tmdb.org/t/p/w1280${backdropPath}` : undefined}
+            movieId={id || undefined}
+            controls={true}
+            nexusHlsSources={nexusHlsSources}
+            nexusFileSources={nexusFileSources}
+            purstreamSources={purstreamSources}
+            darkinoSources={darkinoSources}
+            mp4Sources={mp4Sources}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
+            frembedAvailable={frembedAvailable}
+            customSources={customSources}
+            omegaSources={sortedOmega}
+            coflixSources={sortedCoflix}
+            fstreamSources={sortedFstream}
+            wiflixSources={sortedWiflix}
+            j1fSources={sortedJ1f}
+            swiftflowSources={sortedSwiftflow}
+            viperSources={sortedViper}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
+            title={movieTitle}
+            initialTime={watchProgress}
+          />
+          {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
+          <AnimatePresence>
+            {showEmbedQuality && (
+              <motion.div
+                key="embed-quality-menu"
+                initial={{ opacity: 0, x: 300 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 300 }}
+                transition={{ duration: 0.3, ease: 'easeOut' }}
+                className="fixed inset-0 z-[10000] bg-black/50 flex justify-end pointer-events-auto"
+              >
+                <div className="bg-black/95 border-l border-gray-800 shadow-2xl w-full max-w-md h-full overflow-y-auto z-[10000]">
+                  <div className="flex justify-between items-center p-4 border-b border-gray-700/60 sticky top-0 bg-black/95 z-10">
+                    <h3 className="text-white text-lg font-bold">{t('watch.changeSource')}</h3>
+                    <button
+                      onClick={() => setShowEmbedQuality(false)}
+                      className="text-gray-400 hover:text-red-500 transition-colors text-2xl font-bold focus:outline-none"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="p-4">
+                    <HLSPlayer
+                      priorityCategory="moviesTv"
+                      autoFallbackGuard={autoFallbackGuard}
+                      src={''}
+                      className="hidden"
+                      movieId={id || undefined}
+                      controls={false}
+                      darkinoSources={darkinoSources}
+                      mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
+                      frembedAvailable={frembedAvailable}
+                      customSources={customSources}
+                      omegaSources={sortedOmega}
+                      coflixSources={sortedCoflix}
+                      fstreamSources={sortedFstream}
+                      wiflixSources={sortedWiflix}
+                      j1fSources={sortedJ1f}
+                      swiftflowSources={sortedSwiftflow}
+                      viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
+                      autoPlay={false}
+                      onlyQualityMenu={true}
+                      embedType={embedType || undefined}
+                      embedUrl={embedUrl || undefined}
+                      title={movieTitle}
+                      initialTime={watchProgress}
+                    />
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : selectedSource === 'mp4' && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -3165,6 +3355,8 @@ const WatchMovie: React.FC = () => {
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -3182,6 +3374,7 @@ const WatchMovie: React.FC = () => {
             initialTime={watchProgress}
           />
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3212,6 +3405,8 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3237,6 +3432,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : ((selectedSource === 'nexus_hls' && nexusHlsSources.length > 0) || (selectedSource === 'bravo' && purstreamSources.length > 0 && canUseBravo) || (selectedSource === 'kisskh' && kisskhSources.length > 0)) && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -3273,6 +3469,8 @@ const WatchMovie: React.FC = () => {
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -3290,6 +3488,7 @@ const WatchMovie: React.FC = () => {
             initialTime={watchProgress}
           />
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3323,6 +3522,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3348,6 +3549,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : selectedSource === 'nexus_file' && nexusFileSources.length > 0 && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -3384,6 +3586,8 @@ const WatchMovie: React.FC = () => {
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -3401,6 +3605,7 @@ const WatchMovie: React.FC = () => {
             initialTime={watchProgress}
           />
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3434,6 +3639,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3459,6 +3666,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : selectedSource === 'darkino' && darkinoSources.length > 0 && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
@@ -3499,6 +3707,8 @@ const WatchMovie: React.FC = () => {
             purstreamSources={purstreamSources}
             darkinoSources={darkinoSources}
             mp4Sources={mp4Sources}
+            swiftfluxAvailable={swiftfluxEntries.length > 0}
+            swiftfluxUrl={swiftfluxPlayback?.url}
             frembedAvailable={frembedAvailable}
             customSources={customSources}
             omegaSources={sortedOmega}
@@ -3516,6 +3726,7 @@ const WatchMovie: React.FC = () => {
             initialTime={watchProgress}
           />
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3546,6 +3757,8 @@ const WatchMovie: React.FC = () => {
                       controls={false}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3571,6 +3784,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : embedUrl ? (
         <div className="w-full h-full flex flex-col items-center justify-center relative">
@@ -3638,6 +3852,7 @@ const WatchMovie: React.FC = () => {
           ></iframe>
 
           {/* Sources Menu Overlay */}
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3671,6 +3886,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3696,6 +3913,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       ) : (
         // Show VO/VOSTFR when nothing else is available
@@ -3742,6 +3960,7 @@ const WatchMovie: React.FC = () => {
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
           ></iframe>
 
+          <PlayerOverlayPortal>
           <AnimatePresence>
             {showEmbedQuality && (
               <motion.div
@@ -3775,6 +3994,8 @@ const WatchMovie: React.FC = () => {
                       purstreamSources={purstreamSources}
                       darkinoSources={darkinoSources}
                       mp4Sources={mp4Sources}
+                      swiftfluxAvailable={swiftfluxEntries.length > 0}
+                      swiftfluxUrl={swiftfluxPlayback?.url}
                       frembedAvailable={frembedAvailable}
                       customSources={customSources}
                       omegaSources={sortedOmega}
@@ -3800,6 +4021,7 @@ const WatchMovie: React.FC = () => {
               </motion.div>
             )}
           </AnimatePresence>
+          </PlayerOverlayPortal>
         </div>
       )}
 
@@ -3809,6 +4031,30 @@ const WatchMovie: React.FC = () => {
           (black) loading state below it. */}
       {showAdFreePopup && adPopupTriggered && !adPopupBypass && (
         <AdFreePlayerAds onClose={handlePopupClose} onAccept={handlePopupAccept} adType={adType} onAdClick={() => setHasClickedAd(true)} />
+      )}
+
+      {/* Porte SwiftFlux — posée par-dessus le lecteur en cours, jamais à sa
+          place : la refermer rend la main à ce qui jouait déjà.
+
+          Elle attend que NOTRE popup pub soit passée. Deux fenêtres empilées
+          demanderaient deux publicités à la fois, et celle du partenaire
+          masquerait la nôtre — l'utilisateur cliquerait la seconde sans avoir
+          vu la première, qui est celle qui finance le site. */}
+      {swiftfluxGateOpen && !showAdFreePopup && !adPopupBypass
+        && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) && (
+        <SwiftfluxGate
+          request={{ kind: 'movie', tmdbId: id || '', index: 0 }}
+          onResolved={(playback) => {
+            setSwiftfluxPlayback(playback);
+            setEmbedUrl(null);
+            setEmbedType(null);
+            setVideoSource('');
+            currentSourceRef.current = 'swiftflux';
+            setSelectedSource('swiftflux');
+            setSwiftfluxGateOpen(false);
+          }}
+          onClose={() => setSwiftfluxGateOpen(false)}
+        />
       )}
     </div>
   );

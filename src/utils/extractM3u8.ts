@@ -1,6 +1,6 @@
 // Utility functions to extract m3u8 URLs from supervideo and dropload players
-import { isUserVip } from './authUtils';
 import { isM3u8ExtractorEnabled } from './extractionPrefs';
+import { usesServerExtraction } from './serverResolveRequest';
 import { detectHoster, toCanonicalHosterDomain } from './hosterRegistry';
 import { getSourcePriorityPrefs } from './sourcePriorityPrefs';
 import { sortHostersByPriority } from './sourceAutoSelect';
@@ -123,61 +123,42 @@ function hasNexusExtractors(): boolean {
   return !!(window.hasMovixNexusExtractor && window.movixExtractM3u8);
 }
 
+
 /**
- * The extension/userscript injects its API very early, but still asynchronously.
- * On fast page loads we can start source extraction before the page API exists,
- * which makes some hosters disappear until a manual refresh.
+ * AUCUNE attente du bridge, jamais.
+ *
+ * L'extension (content script `document_start` qui injecte `injected.js`,
+ * flags posés à ses premières lignes) comme le userscript (`@run-at
+ * document-start`, `exposePageApi()` appelé synchrone) installent le bridge
+ * AVANT que le bundle de l'app soit seulement parsé — or la première
+ * extraction part plusieurs centaines de ms après la navigation. Si le bridge
+ * n'est pas là à ce moment, il ne viendra plus : attendre ne faisait que
+ * retenir l'écran de chargement (jusqu'à 7 × 4 s au pire historique).
+ *
+ * C'est aussi le contrat affiché dans Réglages → Méthode d'extraction :
+ * « Aucune bascule automatique : si la méthode sélectionnée n'est pas
+ * disponible, l'extraction échoue. » Le panneau montre déjà chaque méthode
+ * comme disponible/indisponible via ces mêmes flags — on échoue donc
+ * immédiatement, comme annoncé, au lieu d'espérer une injection tardive.
  */
-async function waitForNexusExtractors(timeoutMs = 1500): Promise<boolean> {
-  if (hasNexusExtractors()) {
-    return true;
-  }
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let intervalId: number | null = null;
-    let timeoutId: number | null = null;
-
-    const cleanup = () => {
-      if (intervalId !== null) {
-        window.clearInterval(intervalId);
-      }
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
-      window.removeEventListener('movix-extension-loaded', handleLoaded);
-    };
-
-    const finish = (ready: boolean) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(ready);
-    };
-
-    const handleLoaded = () => {
-      finish(hasNexusExtractors());
-    };
-
-    window.addEventListener('movix-extension-loaded', handleLoaded, { once: true });
-
-    intervalId = window.setInterval(() => {
-      if (hasNexusExtractors()) {
-        finish(true);
-      }
-    }, 50);
-
-    timeoutId = window.setTimeout(() => {
-      finish(hasNexusExtractors());
-    }, timeoutMs);
-  });
-}
 
 /**
- * Try extraction via extension first, fallback to server
+ * Routeur unique d'extraction, piloté par la méthode choisie dans les réglages.
+ *
+ * - `server` + VIP disponible : lecture du registre des m3u8 résolues par le
+ *   serveur (la clé VIP est partie avec `resolve=1` sur les appels
+ *   catalogue). L'extension n'est JAMAIS sollicitée.
+ * - `extension` / `userscript`, ou `server` sans VIP : extraction 100 %
+ *   locale via le bridge. AUCUN repli serveur — le catalogue n'a de toute
+ *   façon pas été résolu côté serveur, et c'est ce repli silencieux qui
+ *   mélangeait les deux chemins.
  */
 async function tryExtensionFirst(type: string, url: string, serverFallback: () => Promise<M3u8Result | null>): Promise<M3u8Result | null> {
-  const extensionReady = hasNexusExtractors() || await waitForNexusExtractors();
+  if (usesServerExtraction()) {
+    return serverFallback();
+  }
+
+  const extensionReady = hasNexusExtractors();
 
   if (extensionReady && window.movixExtractM3u8) {
     try {
@@ -187,26 +168,18 @@ async function tryExtensionFirst(type: string, url: string, serverFallback: () =
         console.log(`[NEXUS] Extension extraction success for ${type}`);
         return result;
       }
-      if (result?.reason === 'deleted') {
-        return result;
-      }
-      // Extension failed - only fallback to server if VIP
-      if (isUserVip()) {
-        console.warn(`[NEXUS] Extension failed for ${type}, falling back to server (VIP)`);
-        return serverFallback();
-      }
-      console.warn(`[NEXUS] Extension failed for ${type}, no server fallback (non-VIP)`);
+      console.warn(`[NEXUS] Extension failed for ${type}, no server fallback (extraction locale)`);
       return result || { success: false, error: `${type} extraction failed via extension` };
     } catch (e) {
       console.warn(`[NEXUS] Extension error for ${type}:`, e);
-      if (isUserVip()) {
-        return serverFallback();
-      }
       return { success: false, error: `Extension error for ${type}` };
     }
   }
-  // No extension - server requires VIP (checked inside server functions)
-  return serverFallback();
+
+  return {
+    success: false,
+    error: `Extension/userscript indisponible pour ${type} (extraction locale requise — installez l'extension ou passez VIP)`,
+  };
 }
 
 // Feature flags pour les extracteurs jamais exposés côté UI (hors-scope du
@@ -388,12 +361,7 @@ export async function extractVoeM3u8(
 
   if (!voeUrl) return null;
 
-  // Try extension first (no VIP needed - everyone gets access via extension)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('voe', voeUrl, () => extractVoeM3u8Server(voeUrl));
-  }
-
-  return extractVoeM3u8Server(voeUrl);
+  return tryExtensionFirst('voe', voeUrl, () => extractVoeM3u8Server(voeUrl));
 }
 
 async function extractVoeM3u8Server(voeUrl: string): Promise<M3u8Result | null> {
@@ -420,23 +388,21 @@ export async function extractUqloadFile(
   // Normaliser tous TLDs uqload.* → uqload.is avant transmission (extension/serveur)
   const normalizedUrl = toCanonicalHosterDomain(uqloadUrl, 'uqload');
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('uqload', normalizedUrl, () => extractUqloadFileServer(normalizedUrl));
-  }
-
-  return extractUqloadFileServer(normalizedUrl);
+  return tryExtensionFirst('uqload', normalizedUrl, () =>
+    extractUqloadFileServer(normalizedUrl, uqloadUrl));
 }
 
-async function extractUqloadFileServer(uqloadUrl: string): Promise<M3u8Result | null> {
+async function extractUqloadFileServer(
+  uqloadUrl: string,
+  originalUrl?: string,
+): Promise<M3u8Result | null> {
   if (!uqloadUrl) return null;
 
-  // Le catalogue indexe l'URL telle qu'il l'a scrapée ; l'appelant a pu la
-  // normaliser vers uqload.is au passage. On tente donc les deux écritures.
-  const resolved = takeServerResolved(
-    uqloadUrl,
-    uqloadUrl.replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is'),
-  );
+  // Le catalogue indexe l'URL telle qu'il l'a scrapée ; l'appelant l'a
+  // normalisée vers uqload.is au passage. Les deux écritures étaient bien
+  // tentées, mais toutes deux à partir de l'URL déjà normalisée : la seconde
+  // retombait sur la première et le TLD d'origine n'était jamais interrogé.
+  const resolved = takeServerResolved(uqloadUrl, originalUrl || '');
   return resolved ? { m3u8Url: resolved, success: true } : notResolved('UQLOAD');
 }
 
@@ -456,12 +422,7 @@ export async function extractVidzyM3u8(
 
   if (!vidzyUrl) return null;
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('vidzy', vidzyUrl, () => extractVidzyM3u8Server(vidzyUrl));
-  }
-
-  return extractVidzyM3u8Server(vidzyUrl);
+  return tryExtensionFirst('vidzy', vidzyUrl, () => extractVidzyM3u8Server(vidzyUrl));
 }
 
 async function extractVidzyM3u8Server(vidzyUrl: string): Promise<M3u8Result | null> {
@@ -486,12 +447,7 @@ export async function extractFsvidM3u8(
 
   if (!fsvidUrl) return null;
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('fsvid', fsvidUrl, () => extractFsvidM3u8Server(fsvidUrl));
-  }
-
-  return extractFsvidM3u8Server(fsvidUrl);
+  return tryExtensionFirst('fsvid', fsvidUrl, () => extractFsvidM3u8Server(fsvidUrl));
 }
 
 async function extractFsvidM3u8Server(fsvidUrl: string): Promise<M3u8Result | null> {
@@ -526,16 +482,19 @@ export async function extractVidmolyM3u8(
   // agrégateurs servent le lecteur sur le TLD du moment.
   const normalizedUrl = toCanonicalHosterDomain(vidmolyUrl, 'vidmoly');
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('vidmoly', normalizedUrl, () => extractVidmolyM3u8Server(normalizedUrl));
-  }
-
-  return extractVidmolyM3u8Server(normalizedUrl);
+  return tryExtensionFirst('vidmoly', normalizedUrl, () =>
+    extractVidmolyM3u8Server(normalizedUrl, vidmolyUrl));
 }
 
-async function extractVidmolyM3u8Server(vidmolyUrl: string): Promise<M3u8Result | null> {
-  const resolved = takeServerResolved(vidmolyUrl);
+async function extractVidmolyM3u8Server(
+  vidmolyUrl: string,
+  originalUrl?: string,
+): Promise<M3u8Result | null> {
+  // Le catalogue indexe le lien tel qu'il l'a scrapé, alors que l'extraction
+  // reçoit l'URL normalisée vers le domaine canonique. Pour une façade la
+  // normalisation change l'hôte entier (ansembed.net -> vidmoly.org), donc
+  // chercher la seule écriture normalisée manquait toujours la table.
+  const resolved = takeServerResolved(vidmolyUrl, originalUrl || '');
   return resolved ? { m3u8Url: resolved, success: true } : notResolved('Vidmoly');
 }
 
@@ -555,12 +514,7 @@ export async function extractSibnetM3u8(
 
   if (!sibnetUrl) return null;
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('sibnet', sibnetUrl, () => extractSibnetM3u8Server(sibnetUrl));
-  }
-
-  return extractSibnetM3u8Server(sibnetUrl);
+  return tryExtensionFirst('sibnet', sibnetUrl, () => extractSibnetM3u8Server(sibnetUrl));
 }
 
 async function extractSibnetM3u8Server(sibnetUrl: string): Promise<M3u8Result | null> {
@@ -612,10 +566,11 @@ export function detectSupportedEmbeds(
       });
     }
 
-    // Détection VOE, Vidmoly et UQLOAD (VIP requis sauf si extension Nexus installée)
-    const isVip = isUserVip();
-    const hasExtension = hasNexusExtractors();
-    const canAccess = isVip || hasExtension;
+    // Accès à l'extraction selon le chemin EFFECTIF (plus de cumul VIP OU
+    // extension, qui rendait le chemin réellement emprunté imprévisible) :
+    // - serveur (méthode « server » + VIP dispo) : toujours accessible
+    // - sinon (méthode locale, ou « server » sans VIP) : bridge local présent
+    const canAccess = usesServerExtraction() || hasNexusExtractors();
     const detectedHoster = detectHosterFromPrefs(url);
 
     if (detectedHoster === 'voe' && isVoeExtractionEnabled() && canAccess) {
@@ -655,8 +610,8 @@ export function detectSupportedEmbeds(
       });
     }
 
-    // Détection Fsvid (VIP requis)
-    if (urlLower.includes('fsvid') && isFsvidExtractionEnabled() && isVip) {
+    // Détection Fsvid (méthode serveur : VIP requis ; sinon bridge local)
+    if (urlLower.includes('fsvid') && isFsvidExtractionEnabled() && canAccess) {
       detectedEmbeds.push({
         type: 'fsvid',
         url,
@@ -778,7 +733,12 @@ export async function extractM3u8OnDetection(
   context?: { category: PriorityCategory; topLevel?: TopLevelSourceId | LanguageId },
 ): Promise<ExtractionProgress[]> {
 
-  const extensionReady = hasNexusExtractors() || await waitForNexusExtractors();
+  // Extraction locale (méthode extension/userscript, ou serveur sans VIP) :
+  // le bridge s'annonce à `document_start`, bien avant ce point — s'il est
+  // absent maintenant, il ne viendra plus, on n'attend pas (voir le
+  // commentaire « AUCUNE attente du bridge »). Extraction serveur (méthode
+  // « server » + VIP) : l'extension est ignorée.
+  const extensionReady = !usesServerExtraction() && hasNexusExtractors();
   const detectedEmbeds = detectSupportedEmbeds(sources, context);
 
   // If extension with Nexus extractors is available, use its bulk extraction for better performance
@@ -1042,12 +1002,7 @@ export async function extractDoodStreamFile(
 
   if (!doodUrl) return null;
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('doodstream', doodUrl, () => extractDoodStreamFileServer(doodUrl));
-  }
-
-  return extractDoodStreamFileServer(doodUrl);
+  return tryExtensionFirst('doodstream', doodUrl, () => extractDoodStreamFileServer(doodUrl));
 }
 
 async function extractDoodStreamFileServer(doodUrl: string): Promise<M3u8Result | null> {
@@ -1090,11 +1045,7 @@ export async function extractLuluStreamM3u8(
 
   if (!luluUrl) return null;
 
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('lulustream', luluUrl, () => extractLuluStreamM3u8Server(luluUrl));
-  }
-
-  return extractLuluStreamM3u8Server(luluUrl);
+  return tryExtensionFirst('lulustream', luluUrl, () => extractLuluStreamM3u8Server(luluUrl));
 }
 
 async function extractLuluStreamM3u8Server(luluUrl: string): Promise<M3u8Result | null> {
@@ -1116,11 +1067,7 @@ export async function extractVeevFile(
 
   if (!veevUrl) return null;
 
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('veev', veevUrl, () => extractVeevFileServer(veevUrl));
-  }
-
-  return extractVeevFileServer(veevUrl);
+  return tryExtensionFirst('veev', veevUrl, () => extractVeevFileServer(veevUrl));
 }
 
 async function extractVeevFileServer(veevUrl: string): Promise<M3u8Result | null> {
@@ -1149,11 +1096,7 @@ export async function extractVidaraM3u8(
 
   if (!vidaraUrl) return null;
 
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('vidara', vidaraUrl, () => extractVidaraM3u8Server(vidaraUrl));
-  }
-
-  return extractVidaraM3u8Server(vidaraUrl);
+  return tryExtensionFirst('vidara', vidaraUrl, () => extractVidaraM3u8Server(vidaraUrl));
 }
 
 async function extractVidaraM3u8Server(vidaraUrl: string): Promise<M3u8Result | null> {
@@ -1175,12 +1118,7 @@ export async function extractSeekStreamingM3u8(
 
   if (!seekUrl) return null;
 
-  // Try extension first (no VIP needed)
-  if (hasNexusExtractors()) {
-    return tryExtensionFirst('seekstreaming', seekUrl, () => extractSeekStreamingM3u8Server(seekUrl));
-  }
-
-  return extractSeekStreamingM3u8Server(seekUrl);
+  return tryExtensionFirst('seekstreaming', seekUrl, () => extractSeekStreamingM3u8Server(seekUrl));
 }
 
 async function extractSeekStreamingM3u8Server(seekUrl: string): Promise<M3u8Result | null> {

@@ -23,6 +23,14 @@ interface TurnstileWidgetProps {
   className?: string;
   theme?: 'light' | 'dark' | 'auto';
   action?: string;
+  /**
+   * Ignore la dispense admin et affiche le challenge à tout le monde.
+   *
+   * Pour les routes dont le serveur ne dispense personne : sans ça un admin
+   * n'aurait aucun widget, enverrait le marqueur de dispense, et se ferait
+   * refuser par Cloudflare sans comprendre pourquoi.
+   */
+  forceChallenge?: boolean;
 }
 
 const TurnstileWidget: React.FC<TurnstileWidgetProps> = ({
@@ -32,13 +40,15 @@ const TurnstileWidget: React.FC<TurnstileWidgetProps> = ({
   resetSignal = 0,
   className,
   theme = 'dark',
-  action
+  action,
+  forceChallenge = false
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const widgetIdRef = useRef<string | null>(null);
   const resolvedSiteKey = siteKey || TURNSTILE_SITE_KEY;
   const handleTokenChange = onTokenChange || onVerify || null;
-  const bypassStatus = useTurnstileBypass();
+  const resolvedBypass = useTurnstileBypass();
+  const bypassStatus = forceChallenge ? 'challenge' : resolvedBypass;
 
   useEffect(() => {
     // Dispense admin : aucun widget, et le marqueur qui débloque les boutons

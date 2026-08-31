@@ -500,12 +500,29 @@ function northliveEmbedUrl(slug) {
 }
 
 // === VAVOO (FREE source — direct HLS, no extension / no proxy / no VIP) ======
-// vavoo.to exposes IPTV channels grouped by country/region (MediaHubMX API).
+// Vavoo exposes IPTV channels grouped by country/region (MediaHubMX API).
 // The catalog is a POST (mediahubmx-catalog.json, paginated via `nextCursor`);
 // each play URL resolves to a raw .m3u8 (mediahubmx-resolve.json) that the
 // client plays as-is (_directPlay) — no proxy, no headers. Groups double as UI
 // categories. Refreshed hourly, cached to disk.
-const VAVOO_BASE = process.env.VAVOO_BASE_URL || "https://vavoo.to";
+//
+// L'API vit désormais sur kool.to : vavoo.to renvoie 451 (« Unavailable For
+// Legal Reasons ») depuis la plupart des IP, y compris derrière les proxies
+// allemands où il n'est que partiellement joignable (mélange 200/451/503).
+// kool.to et kool.ws répondent tous deux 200 en direct, sans proxy.
+//
+// L'URL de lecture envoyée au resolver est une donnée, pas une convention : le
+// catalogue la fournit déjà par chaîne dans `item.url`. Ce champ est une
+// étiquette, pas un lien — un GET dessus redirige vers kool.ws puis renvoie
+// 404, alors que la même chaîne en payload résout parfaitement. Le resolver
+// compare simplement le DOMAINE à sa liste de règles : kool.to et vavoo.to y
+// figurent, kool.ws non (d'où 500 « No resolver found »), et le segment de
+// chemin n'entre pas en jeu. Le préfixe n'est donc jamais reconstruit ni
+// configuré : il est lu dans le catalogue, ce qui suit tout seul le prochain
+// changement de domaine.
+const VAVOO_BASE = process.env.VAVOO_BASE_URL || "https://kool.to";
+const VAVOO_PLAY_PREFIX_CACHE_KEY = "vavoo_play_prefix_v1";
+const VAVOO_PLAY_PREFIX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const VAVOO_CATALOG_URL = `${VAVOO_BASE}/mediahubmx-catalog.json`;
 const VAVOO_RESOLVE_URL = `${VAVOO_BASE}/mediahubmx-resolve.json`;
 const VAVOO_HEADERS = {
@@ -514,9 +531,9 @@ const VAVOO_HEADERS = {
   Accept: "application/json",
 };
 
-// vavoo.to geoblocks selected IP ranges (HTTP 451), so VAVOO calls use the
-// dedicated German SOCKS5 pool with VAVOO-specific health tracking. Resolve
-// additionally uses the existing CycleTLS Chrome impersonation.
+// Le pool SOCKS5 allemand ne sert plus que de repli : chaque appel part en
+// direct, et ne bascule sur les proxies (avec suivi de santé dédié) que si
+// l'origine bloque. Resolve ajoute l'impersonation Chrome via CycleTLS.
 // Playback stays direct — the resolved m3u8 is fetched client-side (in-region).
 const {
   pickVavooSocks5Proxy,
@@ -538,6 +555,20 @@ async function vavooPost(url, payload, options = {}) {
     ? options.headers
     : {};
   let lastErr;
+
+  // Chemin nominal : sans proxy. Les proxies allemands sont plus lents et
+  // moins fiables que l'origine, on ne les sollicite qu'en repli.
+  try {
+    const resp = await axios.post(url, payload, {
+      headers: { ...VAVOO_HEADERS, ...requestHeaders },
+      timeout,
+      proxy: false,
+    });
+    return resp.data;
+  } catch (e) {
+    lastErr = e;
+  }
+
   for (let attempt = 0; attempt < 15; attempt++) {
     let proxy = null;
     let agent = null;
@@ -576,6 +607,53 @@ const VAVOO_SLUG_TO_GROUP = Object.fromEntries(
   VAVOO_GROUPS.map((g) => [vavooGroupSlug(g), g]),
 );
 
+// `item.url` vaut « https://kool.to/kool-iptv/play/<id> » : on n'en garde que
+// le préfixe, l'id étant reconstruit à la résolution (les doublons de nom
+// portent un suffixe `~n` côté Movix qui n'existe pas en amont).
+function extractVavooPlayPrefix(items) {
+  for (const item of items) {
+    const url = typeof item?.url === "string" ? item.url : "";
+    const id = item?.ids?.id;
+    if (!id || !url.startsWith("https://") || !url.endsWith(`/${id}`)) continue;
+    return url.slice(0, url.length - id.length);
+  }
+  return null;
+}
+
+async function rememberVavooPlayPrefix(items) {
+  const prefix = extractVavooPlayPrefix(items);
+  if (!prefix) return null;
+  await saveToCache(generateCacheKey(VAVOO_PLAY_PREFIX_CACHE_KEY), prefix);
+  return prefix;
+}
+
+// Préfixe de lecture courant, appris du catalogue. Le cache survit une semaine :
+// il couvre le cas où les groupes sont servis depuis le disque, donc sans appel
+// amont. À froid (cache vide, aucun catalogue encore lu — deep link juste après
+// un déploiement), une page de catalogue suffit à l'apprendre.
+async function getVavooPlayPrefix() {
+  const cached = await getFromCacheMs(
+    generateCacheKey(VAVOO_PLAY_PREFIX_CACHE_KEY),
+    VAVOO_PLAY_PREFIX_TTL_MS,
+  );
+  if (typeof cached === "string" && cached.startsWith("https://")) return cached;
+
+  try {
+    const data = await vavooPost(VAVOO_CATALOG_URL, {
+      language: "fr", region: "FR", catalogId: "iptv", id: "",
+      adult: false, search: "", sort: "name",
+      filter: { group: VAVOO_GROUPS[0] },
+      cursor: 0,
+    });
+    return await rememberVavooPlayPrefix(
+      Array.isArray(data?.items) ? data.items : [],
+    );
+  } catch (e) {
+    console.warn(`[VAVOO] préfixe de lecture indisponible: ${e.message}`);
+    return null;
+  }
+}
+
 // Fetch one group's full channel list (paginated via nextCursor), cache 1h.
 async function fetchVavooGroup(group) {
   const cacheKey = generateCacheKey(`vavoo_group_${group}_v4`);
@@ -608,6 +686,9 @@ async function fetchVavooGroup(group) {
     }
 
     const items = Array.isArray(data?.items) ? data.items : [];
+
+    await rememberVavooPlayPrefix(items);
+
     for (const it of items) {
       const baseId = it?.ids?.id;
       if (!baseId) continue;
@@ -662,7 +743,10 @@ async function getVavooChannels(catalogId) {
 function buildVavooResolveHeaders(id) {
   return {
     Accept: "*/*",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
+    // CycleTLS ne décompresse ni brotli ni zstd : annoncer autre chose que gzip
+    // ramène un corps binaire, JSON.parse échoue et le proxy est marqué en
+    // panne à tort (puis mis en quarantaine 10 min).
+    "Accept-Encoding": "gzip",
     "Accept-Language": "fr-FR,fr;q=0.9",
     "Cache-Control": "no-cache",
     "Content-Type": "application/json; charset=utf-8",
@@ -685,15 +769,17 @@ function buildVavooResolveHeaders(id) {
 // Each resolve lands on a random edge: usually https on a rotating domain,
 // sometimes plain http on a bare IP — unplayable from the https site (mixed
 // content). Re-resolve up to 5 times to get an https URL; if none shows up,
-// return the http one as a last resort. Every resolve uses CycleTLS through the
-// dedicated German SOCKS5 pool since Vavoo rejects datacenter IPs.
+// return the http one as a last resort. Chaque resolve passe par CycleTLS en
+// direct, et ne retombe sur le pool SOCKS5 allemand que si l'origine bloque.
 async function resolveVavooStream(channelId) {
   let id = channelId.slice("vavoo_".length);
   if (id.includes("~")) {
     id = id.split("~")[0];
   }
   if (!/^[a-z0-9_-]{1,128}$/i.test(id)) return null;
-  const playUrl = `${VAVOO_BASE}/vavoo-iptv/play/${id}`;
+  const playPrefix = await getVavooPlayPrefix();
+  if (!playPrefix) return null;
+  const playUrl = `${playPrefix}${id}`;
   const headers = buildVavooResolveHeaders(id);
   let httpFallback = null;
 
@@ -2136,7 +2222,14 @@ router.get("/stream/:type/:channelId", async (req, res) => {
       });
     }
 
-    const skipOuterCache = channelId.startsWith("vavoo_");
+    // Le cache externe dure 1 h : bien trop long pour un match, dont la liste
+    // de serveurs amont grossit au fil de l'événement (et peut être partielle
+    // sur une réponse tronquée). Un instantané pauvre restait figé une heure
+    // pour la variante concernée — d'où « le VIP ne sort qu'un serveur alors
+    // que l'extension en montre six ». Les matchs ont déjà leur propre cache
+    // interne de 30 s, on saute donc le cache externe pour eux.
+    const skipOuterCache =
+      channelId.startsWith("vavoo_") || channelId.startsWith("match_");
     const cacheKey = generateCacheKey(
       `stream_${type}_${channelId}_${mode}_${sourceIndex ?? "all"}_v6_${isVip.vip ? "vip" : "free"}`,
     );

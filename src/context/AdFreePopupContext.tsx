@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useState, useCallback, useEffect, useMemo } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { useLocation } from 'react-router-dom';
 import { checkVipStatus, isUserVip } from '../utils/vipUtils';
 import { getAdPopupMode, subscribeToAdPopupModeChanges } from '../utils/adPopupMode';
 import { SCRIPT_AD_MODE_ENABLED, loadAdScript } from '../utils/adScriptMode';
@@ -68,6 +69,32 @@ export const AdFreePopupProvider: React.FC<{ children: React.ReactNode }> = ({ c
       window.removeEventListener('vipStatusChanged', handleVipStatusChanged);
     };
   }, []);
+
+  // L'acceptation de la popup n'est valable que « le temps de la session »
+  // (`handlePopupAccept` monte `is_vip` en mémoire, sans rien écrire dans
+  // localStorage). Tant que le changement d'épisode rechargeait le document,
+  // ce provider était remonté à chaque épisode : l'acceptation retombait
+  // toute seule et la popup revenait. Depuis le passage en navigation SPA
+  // (nécessaire pour garder le plein écran d'un épisode à l'autre), le
+  // provider survit à la navigation — l'acceptation ne retombait donc plus
+  // jamais et plus aucune popup n'apparaissait après la première du chargement.
+  //
+  // On rejoue ici, à la main, ce que faisait le rechargement : à chaque
+  // changement de route, l'état de session repart de zéro et `is_vip` est
+  // relu depuis sa source de vérité (localStorage, donc un vrai VIP reste VIP).
+  // Le premier rendu ne réinitialise rien : il n'y a rien à annuler.
+  const { pathname } = useLocation();
+  const lastPathnameRef = useRef(pathname);
+  useEffect(() => {
+    if (lastPathnameRef.current === pathname) return;
+    lastPathnameRef.current = pathname;
+    setShowAdFreePopup(false);
+    setPlayerToShow(null);
+    setShouldLoadIframe(true);
+    setIsSpecialPlayer(false);
+    setIsVoVostfrOnly(false);
+    setIsVip(isUserVip());
+  }, [pathname]);
 
   // Précharge le script popunder quand le popup est en mode normal/bouton.
   // Auto et click-anywhere continuent d'utiliser le lien direct.

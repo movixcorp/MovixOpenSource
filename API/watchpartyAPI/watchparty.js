@@ -422,7 +422,11 @@ function sanitizeMedia(media) {
     nightflixSources: sanitizeSourceList(media?.nightflixSources, ['src', 'quality', 'language', 'label']),
     nexusSources: sanitizeSourceList(media?.nexusSources, ['url', 'label', 'type']),
     bravoSources: sanitizeSourceList(media?.bravoSources, ['url', 'label', 'language', 'isVip']),
-    mp4Sources: sanitizeSourceList(media?.mp4Sources, ['url', 'label', 'language', 'isVip']),
+    // `followsRedirect` : le salon en a besoin pour retirer `crossOrigin` sur la
+    // source SwiftFlux, dont le CDN répond une 302 qu'une requête CORS refuse
+    // de suivre. Sans ce champ dans la liste blanche, le drapeau était perdu au
+    // passage par le serveur et les invités repartaient en mode CORS.
+    mp4Sources: sanitizeSourceList(media?.mp4Sources, ['url', 'label', 'language', 'isVip', 'followsRedirect']),
     captions: sanitizeSourceList(media?.captions, ['label', 'file']),
     currentNexusSource: sanitizeSourceList([media?.currentNexusSource], ['url', 'label', 'type'])[0] || null,
     currentBravoSource: sanitizeSourceList([media?.currentBravoSource], ['url', 'label', 'language', 'isVip'])[0] || null

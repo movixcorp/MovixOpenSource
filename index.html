@@ -224,20 +224,10 @@
             defer
         ></script>
         <script type="module" src="/src/main.tsx"></script>
-        <!-- Google tag (gtag.js) -->
-        <script
-            async
-            src="https://www.googletagmanager.com/gtag/js?id=G-6Q3B4D5KQL"
-        ></script>
-        <script>
-            window.dataLayer = window.dataLayer || [];
-            function gtag() {
-                dataLayer.push(arguments);
-            }
-            gtag("js", new Date());
-
-            gtag("config", "G-6Q3B4D5KQL");
-        </script>
+        <!-- Analytics : le snippet gtag codé en dur ici a été remplacé par
+             `src/utils/analytics.ts`, appelé depuis `main.tsx`. Le fournisseur
+             (Google Analytics ou Plausible) et son identifiant viennent
+             maintenant du `.env` — voir VITE_ANALYTICS_PROVIDER. -->
     </head>
     <body>
         <div id="root"></div>

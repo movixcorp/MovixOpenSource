@@ -5,12 +5,19 @@
 export const AD_POPUP_ADULT_KEY = 'settings_ad_popup_adult';
 export const AD_POPUP_ADULT_CHANGED_EVENT = 'ad_popup_adult_changed';
 
-// +18: les 2 directlinks s'ouvrent ensemble au clic (1 fenêtre par URL).
-export const AD_URLS_ADULT = [
-  'https://endedstrung.com/x4pevxtv?key=49e7936afff7a0d21472d6ce1632e309',
-];
-export const AD_URL_SFW =
-  'https://endedstrung.com/c7c9gpr0q?key=6b8520a3e98e4cd1228e9319d751b237';
+// Les directlinks viennent du .env (jamais en dur dans le code : le dépôt est
+// synchronisé vers le miroir public, chaque déploiement met les siens).
+// Vides = aucune fenêtre ouverte, le popup valide quand même.
+const readEnvUrl = (value: unknown): string =>
+  typeof value === 'string' ? value.trim() : '';
+
+// +18: les directlinks s'ouvrent ensemble au clic (1 fenêtre par URL).
+// Format .env : URLs séparées par des virgules.
+export const AD_URLS_ADULT = readEnvUrl(import.meta.env.VITE_AD_DIRECT_URLS_ADULT)
+  .split(',')
+  .map((url) => url.trim())
+  .filter(Boolean);
+export const AD_URL_SFW = readEnvUrl(import.meta.env.VITE_AD_DIRECT_URL_SFW);
 
 export const isAdultAdsEnabled = (): boolean => {
   try {
@@ -43,4 +50,4 @@ export const subscribeToAdultAdsChanges = (cb: (enabled: boolean) => void): (() 
 };
 
 export const getAdTargetUrls = (): string[] =>
-  isAdultAdsEnabled() ? AD_URLS_ADULT : [AD_URL_SFW];
+  isAdultAdsEnabled() ? AD_URLS_ADULT : [AD_URL_SFW].filter(Boolean);

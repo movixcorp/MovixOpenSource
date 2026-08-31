@@ -55,6 +55,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   wiflix_main: 'wiflix',
   j1f_main: 'j1f',
   swiftflow_main: 'swiftflow',
+  swiftflux: 'swiftflux',
   omega_main: 'omega',
   multi_main: 'coflix', // multi = coflix (naming historique)
   viper_main: 'viper',
@@ -707,6 +708,9 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                               (nexusFileSources && nexusFileSources.some(ns => ns.url === src));
                           } else if (source.type === 'mp4') {
                             isActive = src === source.url; // Direct comparison for MP4
+                          } else if (source.type === 'swiftflux') {
+                            // `#` = pas encore débloquée, donc rien à comparer.
+                            isActive = source.url !== '#' && src === source.url;
                           } else if (source.type === 'kisskh_main') {
                             isActive = kisskhSources.some((kisskhSource: KisskhSource) => (
                               kisskhSource.url === src && kisskhSource.id === source.id

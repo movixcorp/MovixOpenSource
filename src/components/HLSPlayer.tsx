@@ -243,6 +243,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   wiflix_main: 'wiflix',
   j1f_main: 'j1f',
   swiftflow_main: 'swiftflow',
+  swiftflux: 'swiftflux',
   omega_main: 'omega',
   multi_main: 'coflix',
   viper_main: 'viper',
@@ -494,6 +495,36 @@ const SourceQualityMeta = ({ qualityLabel, isActive = false }: { qualityLabel: s
       </AnimatePresence>
     </span>
   );
+};
+
+/**
+ * Nom de domaine affichable d'un lecteur embed (le « ndd »), utilisé pour
+ * distinguer les lecteurs custom entre eux dans le menu des sources : ils
+ * portent tous le même nom générique, seul le domaine les différencie.
+ * `www.` est retiré et une URL percent-encodée est décodée avant parsing.
+ * Renvoie null si rien d'exploitable n'en sort.
+ */
+const getEmbedDomainLabel = (url: string): string | null => {
+  const raw = (url || '').trim();
+  if (!raw) return null;
+
+  const candidates = [raw];
+  try {
+    const decoded = decodeURIComponent(raw);
+    if (decoded !== raw) candidates.push(decoded);
+  } catch {
+    // URI malformée : on reste sur la valeur brute
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const hostname = new URL(candidate).hostname.replace(/^www\./i, '');
+      if (hostname) return hostname;
+    } catch {
+      // on tente la variante suivante
+    }
+  }
+  return null;
 };
 
 // Helper function to detect if URL is MP4 (even in proxy URLs with encoded parameters)
@@ -873,6 +904,27 @@ interface HLSPlayerProps {
   subtitleUrl?: string; // Optional subtitle URL
   darkinoSources?: any[];
   mp4Sources?: { url: string; label?: string; language?: string; isVip?: boolean }[];
+  /**
+   * SwiftFlux n'a pas de liste d'URL à proposer : son fichier ne se débloque
+   * qu'après la porte d'entrée (pub + Turnstile), côté page. Le menu n'affiche
+   * donc qu'une entrée, et c'est la page qui sait quoi en faire.
+   */
+  swiftfluxAvailable?: boolean;
+  /**
+   * URL du fichier une fois la porte franchie. Sert uniquement à reconnaître
+   * l'entrée comme active dans le menu : avant résolution il n'y a pas d'URL à
+   * comparer, donc pas de marqueur possible.
+   */
+  swiftfluxUrl?: string;
+  /**
+   * Retire `crossOrigin` de l'élément vidéo.
+   *
+   * Pour les sources dont le CDN répond une 302 vers un autre domaine : en mode
+   * CORS le navigateur refuse de suivre la redirection et la lecture échoue.
+   * En contrepartie le booster de volume et l'égaliseur sont indisponibles —
+   * Web Audio ne peut pas lire un média non « tainted-free ».
+   */
+  disableCrossOrigin?: boolean;
   nexusHlsSources?: SeekStreamingHlsSource[];
   nexusFileSources?: { url: string; label: string }[];
   purstreamSources?: { url: string; label: string }[];
@@ -1143,6 +1195,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   subtitleUrl,
   darkinoSources = [],
   mp4Sources = [],
+  swiftfluxAvailable = false,
+  swiftfluxUrl = '',
+  disableCrossOrigin = false,
   nexusHlsSources = [],
   nexusFileSources = [],
   purstreamSources = [],
@@ -2651,9 +2706,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }
     }
 
+    // Bravo est réservé aux VIP et aux porteurs de l'extension. Le menu du
+    // lecteur applique déjà cette règle ; la watch party doit l'appliquer aussi,
+    // sinon un visiteur ordinaire se voit proposer une source qu'il ne peut pas
+    // lire — et la page de création la choisissait même par défaut.
+    const canShareBravo = isUserVip() || isExtensionAvailable();
+
     // Find the currently selected Bravo source (if any)
     let currentBravoSource = null;
-    if (purstreamSources && purstreamSources.length > 0) {
+    if (canShareBravo && purstreamSources && purstreamSources.length > 0) {
       const matchingBravoSource = purstreamSources.find(source => source.url === src);
       if (matchingBravoSource) {
         currentBravoSource = {
@@ -2662,7 +2723,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         };
       }
     }
-    if (!currentBravoSource && mp4Sources && mp4Sources.length > 0) {
+    if (canShareBravo && !currentBravoSource && mp4Sources && mp4Sources.length > 0) {
       const matchingBravoSource = mp4Sources.find(source =>
         source.url === src && source.label && source.label.includes('🦁 Bravo')
       );
@@ -2712,17 +2773,29 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       // Add Nexus sources to the media info
       nexusSources: nexusSources,
       // Add Bravo/PurStream sources to the media info
-      bravoSources: Array.isArray(purstreamSources) ? purstreamSources.map(source => ({
+      bravoSources: canShareBravo && Array.isArray(purstreamSources) ? purstreamSources.map(source => ({
         url: source.url,
         label: source.label
       })) : [],
       // Add generic MP4/file sources to the media info
-      mp4Sources: Array.isArray(mp4Sources) ? mp4Sources.map(source => ({
-        url: source.url,
-        label: source.label,
-        language: source.language,
-        isVip: source.isVip
-      })) : [],
+      mp4Sources: [
+        ...(Array.isArray(mp4Sources) ? mp4Sources.map(source => ({
+          url: source.url,
+          label: source.label,
+          language: source.language,
+          isVip: source.isVip
+        })) : []),
+        // SwiftFlux : un fichier MP4 direct comme les autres une fois la porte
+        // franchie, donc il rejoint la même liste. Seulement une fois résolu —
+        // avant, il n'y a pas d'URL à partager, et les invités ne peuvent pas
+        // passer la porte à la place de l'hôte. `followsRedirect` prévient le
+        // salon que ce CDN redirige, ce qu'il ne peut pas deviner.
+        ...(swiftfluxUrl ? [{
+          url: swiftfluxUrl,
+          label: t('watch.swiftfluxSource'),
+          followsRedirect: true,
+        }] : []),
+      ],
       // Add currently selected Nexus source info for proper Bravo player transmission
       currentNexusSource: currentNexusSource,
       // Add currently selected Bravo source info
@@ -2913,6 +2986,23 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       });
     }
 
+    // SwiftFlux : une seule entrée, sans URL. La page la reçoit via l'event
+    // `sourceChange` et ouvre sa porte d'entrée ; c'est elle qui obtiendra le
+    // fichier, pas le lecteur.
+    if (swiftfluxAvailable) {
+      hlsSources.push({
+        type: 'swiftflux',
+        id: 'swiftflux',
+        label: t('watch.swiftfluxSource'),
+        // Avant résolution il n'y a pas d'URL : `#` marque l'entrée comme
+        // « à débloquer », et la page ouvre sa porte au clic. `mediaType`
+        // n'est posé qu'une fois l'URL connue — sinon la sonde de qualité
+        // irait interroger `#`.
+        url: swiftfluxUrl || '#',
+        ...(swiftfluxUrl ? { mediaType: 'mp4' as const } : {}),
+      });
+    }
+
     // Le proxy KissKH peut relayer un manifeste HLS ou un MP4 direct.
     const kisskhSource = kisskhSources[0];
     if (kisskhSource && (isUserVip() || isExtensionAvailable())) {
@@ -2955,6 +3045,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       visibleCustomSources.forEach((source, index) => {
         const isSeek = isSeekStreamingEmbedUrl(source);
         if (isSeek) seekStreamingIndex += 1;
+        // Les lecteurs Movix génériques sont indiscernables entre eux : le ndd
+        // passe en tête du nom. Les entrées SeekStreaming gardent leur nom de
+        // marque, il identifie déjà le lecteur.
+        const domain = isSeek ? null : getEmbedDomainLabel(source);
         embedSources.push({
           type: 'custom',
           id: `custom_${index}`,
@@ -2964,7 +3058,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 ? t('watch.seekStreamingPlayer', { n: seekStreamingIndex })
                 : t('watch.seekStreaming')
             )
-            : t('watch.movixPlayer', { n: index + 1 }),
+            : (
+              domain
+                ? t('watch.movixPlayerDomain', { n: index + 1, domain })
+                : t('watch.movixPlayer', { n: index + 1 })
+            ),
           url: source,
         });
       });
@@ -3157,6 +3255,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [
     darkinoSources?.length,
     mp4Sources?.length,
+    swiftfluxAvailable,
+    swiftfluxUrl,
     kisskhSources,
     loadingKisskh,
     nexusHlsSources?.length,
@@ -5360,6 +5460,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const video = videoRef.current;
     if (!video || sourceNodeRef.current) return; // Don't reinitialize if already set up
 
+    // Sans `crossOrigin`, Web Audio ne peut pas lire le média : le graphe se
+    // construit sans erreur mais ne sort que du silence. Mieux vaut renoncer au
+    // booster et à l'égaliseur que rendre la vidéo muette — et l'utilisateur
+    // qui a un préréglage enregistré le déclencherait sans même y penser.
+    if (disableCrossOrigin) {
+      console.log('🔇 Booster de volume désactivé : source sans CORS (Web Audio sortirait du silence)');
+      return;
+    }
+
     try {
       // Create AudioContext if not exists
       if (!audioContextRef.current) {
@@ -5426,7 +5535,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     } catch (error) {
       console.error('❌ Failed to initialize volume booster:', error);
     }
-  }, [volumeBoost, audioEnhancerMode]);
+  }, [volumeBoost, audioEnhancerMode, disableCrossOrigin]);
 
   // Audio Enhancer presets
   const applyAudioEnhancerPreset = useCallback((mode: 'off' | 'cinema' | 'music' | 'dialogue' | 'custom', customValues?: typeof customAudio) => {
@@ -5473,6 +5582,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [customAudio]);
 
   async function ensureAudioEnhancerReady() {
+    // Voir `initializeVolumeBooster` : sur une source sans CORS, brancher Web
+    // Audio rendrait la vidéo muette. Un préréglage enregistré s'applique tout
+    // seul au chargement, donc la garde doit être ici aussi.
+    if (disableCrossOrigin) return;
+
     const shouldEnableAudioProcessing = audioEnhancerMode !== 'off' || volumeBoost > 1;
     if (!shouldEnableAudioProcessing) return;
 
@@ -8953,8 +9067,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             if (handledByKisskh) return;
           }
           
-          // Vérification explicite de l'erreur 403 via un fetch
-          if (target.error.code === 4) {
+          // Vérification explicite de l'erreur 403 via un fetch.
+          //
+          // Inutile sur une source sans CORS : ce `fetch` part, lui, en mode
+          // CORS, et échoue toujours — pas parce que le serveur refuse, mais
+          // parce que le navigateur ne veut pas nous montrer sa réponse. On
+          // conclurait à une panne réseau et on changerait de source pour rien.
+          if (target.error.code === 4 && !disableCrossOrigin) {
             try {
               console.log('🕵️ verifying whether the media error is a 403');
               const response = await fetch(src, { method: 'HEAD' });
@@ -11402,7 +11521,14 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             // Required so MediaElementAudioSourceNode (volume booster + audio enhancer)
             // doesn't output silence on cross-origin proxied media. All proxies return
             // Access-Control-Allow-Origin: *, so the request still succeeds.
-            crossOrigin="anonymous"
+            //
+            // Sauf pour les sources qui redirigent : une requête en mode CORS ne
+            // suit pas une 302 vers un domaine qui ne l'autorise pas, et la
+            // lecture échoue avant d'avoir commencé. Sans cet attribut la
+            // requête redevient une requête média ordinaire, le navigateur suit
+            // la redirection, et seuls le booster de volume et l'égaliseur
+            // deviennent indisponibles sur cette source-là.
+            crossOrigin={disableCrossOrigin ? undefined : 'anonymous'}
             {...{ referrerPolicy: "strict-origin-when-cross-origin" } as React.VideoHTMLAttributes<HTMLVideoElement>}
             poster={poster}
             onTimeUpdate={handleTimeUpdate}

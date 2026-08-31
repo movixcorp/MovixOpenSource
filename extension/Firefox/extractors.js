@@ -1796,7 +1796,8 @@ const EMBED_PATTERNS = {
     voe: url => VOE_DOMAIN_PATTERN.test(url),
     fsvid: url => url.toLowerCase().includes('fsvid'),
     vidzy: url => url.toLowerCase().includes('vidzy'),
-    vidmoly: url => url.toLowerCase().includes('vidmoly'),
+    // `ansembed` serves the Vidmoly player under another name — same extractor.
+    vidmoly: url => /vidmoly|ansembed/i.test(url),
     sibnet: url => url.toLowerCase().includes('sibnet.ru'),
     uqload: url => /\buqload\.[a-z]{2,24}(?=[/:?#]|$)/i.test(url),
     // Veev shares `doods.to` with the DoodStream cluster but speaks a different

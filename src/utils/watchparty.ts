@@ -163,6 +163,15 @@ export interface Mp4SourceInfo {
   label: string;       // Display label for the source
   language?: string;   // Language of the source
   isVip?: boolean;     // Whether the source requires VIP
+  /**
+   * Le CDN répond une redirection vers un autre domaine (SwiftFlux).
+   *
+   * Le salon doit alors retirer `crossOrigin` de l'élément vidéo : en mode CORS
+   * le navigateur refuse de suivre la 302 et la lecture échoue. Le drapeau
+   * voyage avec la source parce que le salon, lui, n'a aucun moyen de deviner
+   * d'où elle vient.
+   */
+  followsRedirect?: boolean;
 }
 
 /**

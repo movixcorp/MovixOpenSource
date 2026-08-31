@@ -28,6 +28,7 @@ export const SOURCE_LABELS: Record<TopLevelSourceId, string> = {
   wiflix: 'Lynx',
   j1f: '1jour1film',
   swiftflow: 'SwiftFlow',
+  swiftflux: 'SwiftFlux (MP4)',
   omega: 'Omega',
   coflix: 'Coflix',
   frembed: 'Frembed',

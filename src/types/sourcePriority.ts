@@ -2,7 +2,7 @@
 
 /** Sources top-level disponibles pour Films/Séries. Ordre = default hardcodé actuel. */
 export const TOP_LEVEL_SOURCE_IDS = [
-  'darkino', 'mp4', 'nexus_hls', 'bravo',
+  'darkino', 'mp4', 'nexus_hls', 'swiftflux', 'bravo',
   'fstream', 'wiflix', 'j1f', 'swiftflow', 'omega', 'coflix', 'frembed', 'vostfr',
   'viper', 'vox', 'kisskh', 'custom',
 ] as const;
@@ -71,7 +71,7 @@ export interface CustomHoster {
 }
 
 export interface SourcePriorityPrefs {
-  version: 3;
+  version: 4;
   categories: {
     moviesTv: MoviesTvPrefs;
     anime: AnimePrefs;

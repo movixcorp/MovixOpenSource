@@ -22,9 +22,8 @@
  *     froid -> fetch inline (API JSON rapide). Tout est dédupliqué in-flight.
  *   - les négatifs (404) sont cachés aussi — la plupart des ids TMDB ne sont
  *     PAS sur SwiftFlow, c'est le gros du volume.
- *   - TTL : films 24h (une entrée catalogue ne bouge plus), séries 6h (les
- *     épisodes tombent chaque semaine), négatifs 6h (un nouvel ajout devient
- *     visible en <= 6h).
+ *   - TTL : 1h pour tout (films, séries, négatifs) — un ajout ou un nouvel
+ *     épisode devient visible en <= 1h.
  *   - une erreur upstream (timeout/5xx) n'est JAMAIS cachée : le stale reste
  *     servi et la requête suivante retente le refresh.
  *   - garde-fou: max ~900 appels upstream/min, au-delà on échoue vite (non
@@ -55,9 +54,9 @@ if (!CONFIGURED) {
   console.warn('[SwiftFlow] SWIFTFLOW_BASE_URL / SWIFTFLOW_API_KEY manquants — source désactivée');
 }
 
-const MOVIE_TTL_MS = 24 * 60 * 60 * 1000;
-const TV_TTL_MS = 6 * 60 * 60 * 1000;
-const NEGATIVE_TTL_MS = 6 * 60 * 60 * 1000;
+const MOVIE_TTL_MS = 60 * 60 * 1000;
+const TV_TTL_MS = 60 * 60 * 1000;
+const NEGATIVE_TTL_MS = 60 * 60 * 1000;
 const UPSTREAM_TIMEOUT_MS = 10000;
 const UPSTREAM_MAX_PER_MIN = 900; // marge sous la limite SwiftFlow (1000/min)
 
@@ -155,6 +154,50 @@ const isVostfr = (lang) => /vostfr/i.test(lang || '');
 const buildLabel = (item) =>
   [item && item.quality, item && item.size].filter((v) => v && v !== 'Unknown').join(' · ');
 
+// ---------------------------------------------------------------------------
+//  SwiftFlux — le versant MP4 direct de la même réponse
+// ---------------------------------------------------------------------------
+// L'appel amont rend déjà l'URL du fichier progressif à côté de quoi construire
+// l'iframe : les deux modes sortent donc de la même requête et du même cache.
+// Ce qu'on n'expose pas ici, c'est l'URL elle-même — cette réponse part au
+// chargement de chaque fiche, elle serait un robinet à liens directs sur le
+// catalogue du partenaire. Le client reçoit de quoi étiqueter l'entrée dans son
+// menu ; l'adresse s'obtient ensuite par `POST /mp4/resolve`, contre un jeton
+// Turnstile.
+
+/** Métadonnées publiables d'une entrée MP4 : tout sauf son URL. */
+const mp4Meta = (item, index) => ({
+  index,
+  label: buildLabel(item) || 'MP4',
+  quality: item && item.quality && item.quality !== 'Unknown' ? item.quality : null,
+  size: (item && item.size) || null,
+  language: (item && item.language) || 'VF',
+});
+
+/** Entrées MP4 d'un film, dans l'ordre rendu par l'API. */
+function movieMp4Items(env) {
+  if (!env || env.notFound || !env.data) return [];
+  return (env.data.sources || []).filter((s) => s && s.url);
+}
+
+/** Entrées MP4 d'un épisode précis. Une seule en pratique, mais rien ne l'impose. */
+function episodeMp4Items(env, seasonNum, episodeNum) {
+  if (!env || env.notFound || !env.data || !episodeNum) return [];
+  const season = (env.data.seasons || []).find(
+    (s) => parseInt(String(s.season).replace(/\D/g, ''), 10) === Number(seasonNum),
+  );
+  if (!season) return [];
+  return (season.episodes || []).filter(
+    (ep) => ep && ep.url && Number(ep.episode_number) === Number(episodeNum),
+  );
+}
+
+/** Bloc `mp4` joint aux réponses catalogue. Jamais d'URL, voir plus haut. */
+const mp4Block = (items) => ({
+  available: items.length > 0,
+  entries: items.map(mp4Meta),
+});
+
 function buildMovieResponse(id, env) {
   if (!env || env.notFound || !env.data) {
     return { success: false, error: 'Film non disponible sur SwiftFlow', tmdb_id: id };
@@ -175,6 +218,7 @@ function buildMovieResponse(id, env) {
     year: env.data.year,
     source: 'swiftflow',
     players: { vf: vostfrOnly ? [] : [player], vostfr: vostfrOnly ? [player] : [] },
+    mp4: mp4Block(movieMp4Items(env)),
     cache_timestamp: new Date(env._ts).toISOString(),
   };
 }
@@ -216,6 +260,9 @@ function buildSeasonResponse(id, env, seasonNum, episodeNum) {
     source: 'swiftflow',
     season: Number(seasonNum),
     episodes,
+    // Portée à l'épisode demandé : sans `?episode=`, la réponse couvre toute
+    // la saison et il n'y a pas de fichier unique à annoncer.
+    mp4: mp4Block(episodeMp4Items(env, seasonNum, episodeNum)),
     cache_timestamp: new Date(env._ts).toISOString(),
   };
 }
@@ -258,6 +305,123 @@ router.get('/tv/:id/season/:season', async (req, res) => {
   } catch (err) {
     console.error(`[SwiftFlow TV] ${id} S${season}: ${err.message}`);
     res.status(200).json({ success: false, error: 'Erreur SwiftFlow', tmdb_id: id });
+  }
+});
+
+// =====================================================================
+//  SwiftFlux — mode MP4 direct
+// =====================================================================
+// La disponibilité voyage dans le bloc `mp4` des réponses catalogue ci-dessus :
+// l'appel amont rend l'URL du fichier en même temps que de quoi construire
+// l'iframe, une seule requête suffit donc pour les deux modes. Ne reste ici que
+// la seconde moitié de la porte d'entrée : rendre l'URL, contre un jeton
+// Turnstile, une fois que l'utilisateur a vu la pub côté client.
+//
+// L'URL est servie telle quelle, sans relais : le CDN du partenaire autorise
+// les domaines Movix par `Referer` et le navigateur envoie le bon de lui-même.
+// La faire transiter par un proxy la casserait (mauvais Referer) autant que ça
+// coûterait — ces fichiers pèsent plusieurs gigaoctets.
+
+const { verifyTurnstile } = require('../utils/turnstile');
+const { verifyAccessKey } = require('../checkVip');
+
+// Domaine de sortie du CDN, quand il ne doit pas être celui que l'API annonce.
+// Le partenaire fait tourner ses domaines de distribution comme n'importe quel
+// agrégateur, et tous ne sont pas également joignables ni également autorisés
+// pour nos domaines : cette variable permet de basculer sans redéployer, en
+// n'attendant pas que l'amont mette sa réponse à jour.
+//
+// Accepte une origine (`https://cdn.exemple.tld`) ou une origine + préfixe de
+// chemin (`https://cdn.exemple.tld/mirror`), auquel cas le préfixe est ajouté
+// devant le chemin du fichier. Absente, l'URL de l'API est rendue telle quelle.
+const CDN_OVERRIDE = (process.env.SWIFTFLOW_CDN_BASE_URL || '').trim();
+
+/**
+ * Réécrit l'origine d'une URL de fichier vers `SWIFTFLOW_CDN_BASE_URL`.
+ *
+ * Une valeur illisible ou une URL amont invalide laisse l'URL intacte : un
+ * mauvais réglage doit dégrader vers le comportement d'origine, pas casser la
+ * lecture pour tout le monde.
+ */
+function applyCdnOverride(fileUrl) {
+  if (!CDN_OVERRIDE || !fileUrl) return fileUrl;
+  try {
+    const base = new URL(CDN_OVERRIDE);
+    const target = new URL(fileUrl);
+    target.protocol = base.protocol;
+    target.host = base.host;
+    const prefix = base.pathname.replace(/\/+$/, '');
+    if (prefix) target.pathname = `${prefix}${target.pathname}`;
+    return target.toString();
+  } catch (err) {
+    console.warn(`[SwiftFlux] SWIFTFLOW_CDN_BASE_URL ignoré (${err.message})`);
+    return fileUrl;
+  }
+}
+
+/**
+ * Rend l'URL de lecture contre un jeton Turnstile.
+ *
+ * Le statut VIP n'entre pas ici : il dispense de la pub, côté client, pas de
+ * la vérification. Les admins non plus : on passe par `verifyTurnstile`, sans
+ * la dispense de `verifyTurnstileFromRequest`, pour que l'équipe voie
+ * exactement le parcours qu'elle fait vivre aux autres.
+ */
+router.post('/mp4/resolve', async (req, res) => {
+  const { kind, tmdbId, season, episode, index, turnstileToken } = req.body || {};
+
+  if (kind !== 'movie' && kind !== 'tv') {
+    return res.status(400).json({ success: false, error: 'Type invalide' });
+  }
+  if (!/^\d+$/.test(String(tmdbId || ''))) {
+    return res.status(400).json({ success: false, error: 'TMDB id invalide' });
+  }
+  if (kind === 'tv' && (!/^\d+$/.test(String(season || '')) || !/^\d+$/.test(String(episode || '')))) {
+    return res.status(400).json({ success: false, error: 'Saison/épisode invalides' });
+  }
+  if (!CONFIGURED) {
+    return res.status(503).json({ success: false, error: 'SwiftFlux non configuré' });
+  }
+
+  if (process.env.TURNSTILE_SECRET_KEY) {
+    if (!turnstileToken) {
+      return res.status(400).json({ success: false, error: 'Vérification de sécurité requise' });
+    }
+    const ip = req.headers['cf-connecting-ip']
+      || req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+      || req.ip;
+    if (!(await verifyTurnstile(turnstileToken, ip))) {
+      return res.status(403).json({ success: false, error: 'Vérification de sécurité échouée. Réessayez.' });
+    }
+  }
+
+  try {
+    const env = kind === 'movie'
+      ? await withCache(`movie-${tmdbId}`, () => fetchMovie(tmdbId))
+      : await withCache(`tv-${tmdbId}`, () => fetchSeries(tmdbId));
+    if (!env) {
+      return res.status(503).json({ success: false, error: 'Catalogue en cours de chargement, réessayez' });
+    }
+
+    const items = kind === 'movie'
+      ? movieMp4Items(env)
+      : episodeMp4Items(env, season, episode);
+    const wanted = Number.isInteger(index) && index >= 0 && index < items.length ? index : 0;
+    const item = items[wanted];
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Aucun fichier disponible' });
+    }
+
+    const vipStatus = await verifyAccessKey(req.headers['x-access-key'] || null);
+    res.json({
+      success: true,
+      url: applyCdnOverride(item.url),
+      ...mp4Meta(item, wanted),
+      is_vip: Boolean(vipStatus && vipStatus.vip),
+    });
+  } catch (err) {
+    console.error(`[SwiftFlux MP4 RESOLVE] ${kind}/${tmdbId}: ${err.message}`);
+    res.status(502).json({ success: false, error: 'Erreur SwiftFlux' });
   }
 });
 

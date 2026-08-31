@@ -1,13 +1,27 @@
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
-import { Play, ShieldAlert, Settings, X } from "lucide-react";
+import { Crown, Play, Puzzle, ShieldAlert, Smartphone, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAdFreePopup } from "../context/AdFreePopupContext";
 import { getAdPopupMode, subscribeToAdPopupModeChanges, type AdPopupMode } from "../utils/adPopupMode";
 import { getAdTargetUrls, isAdultAdsEnabled, subscribeToAdultAdsChanges } from "../utils/adAdultMode";
-import { SCRIPT_AD_MODE_ENABLED, loadAdScript } from "../utils/adScriptMode";
+import {
+  SCRIPT_AD_MODE_ENABLED,
+  getAdScriptState,
+  loadAdScript,
+  subscribeToAdScriptState,
+  type AdScriptState,
+} from "../utils/adScriptMode";
 import { getOverlayPortalRoot } from "@/utils/overlayPortal";
+import { isMobileOrTabletDevice } from "../utils/deviceDetection";
+
+// Interrupteurs build-time des avertissements du popup de pub (constantes de
+// code, pas des réglages utilisateur — même principe que SCRIPT_AD_MODE_ENABLED).
+// SHOW_ADULT_AD_WARNING : encart rouge « contenu explicite +18 ».
+// SHOW_AD_PAGE_WARNING : bandeau jaune « ne clique rien, ne scanne rien, ne télécharge rien ».
+const SHOW_ADULT_AD_WARNING: boolean = false;
+const SHOW_AD_PAGE_WARNING: boolean = false;
 
 interface AdFreePlayerAdsProps {
   onClose?: () => void;
@@ -38,8 +52,11 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
 
   const [hasClicked, setHasClicked] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
+  // Mobile/tablette → on pousse l'appli ; PC/Mac → l'extension navigateur.
+  const isMobile = useMemo(() => isMobileOrTabletDevice(), []);
   const [popupMode, setPopupMode] = useState<AdPopupMode>(() => getAdPopupMode());
   const [adultAdsOn, setAdultAdsOn] = useState<boolean>(() => isAdultAdsEnabled());
+  const [scriptState, setScriptState] = useState<AdScriptState>(() => getAdScriptState());
   const autoFiredRef = useRef(false);
   const scriptAdFiredRef = useRef(false);
   const scriptAcceptTimeoutRef = useRef<number | null>(null);
@@ -47,9 +64,14 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
   // Le mode script ne s'applique qu'au popup normal avec bouton. Les modes auto
   // et click-anywhere gardent le lien direct.
   const scriptAdMode = popupMode === 'normal' && SCRIPT_AD_MODE_ENABLED;
+  // Script réellement utilisable : un bloqueur qui annule son chargement passe
+  // l'état à 'failed' → le clic valide alors directement, sans ouvrir de pub
+  // (ni script ni lien direct) et sans attendre le timer du geste script.
+  const scriptAdActive = scriptAdMode && scriptState !== 'failed';
 
   useEffect(() => subscribeToAdPopupModeChanges(setPopupMode), []);
   useEffect(() => subscribeToAdultAdsChanges(setAdultAdsOn), []);
+  useEffect(() => subscribeToAdScriptState(setScriptState), []);
 
   useEffect(() => {
     // Reset des gardes quand le popup disparaît, pour laisser le suivant se déclencher.
@@ -120,24 +142,17 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
     scriptAcceptTimeoutRef.current = window.setTimeout(completeScriptAdGesture, 700);
   }, [completeScriptAdGesture]);
 
-  // Combine: ouvre les directlinks +18 ET déclenche le popunder réseau (script)
-  // sur le même clic. Liens d'abord (geste frais), popunder ensuite.
-  const handleScriptAdClick = useCallback(() => {
-    openAdLinks();
-    beginScriptAdGesture();
-  }, [openAdLinks, beginScriptAdGesture]);
-
   // Le popunder peut consommer le onClick React. La capture pointerdown prépare
   // la détection avant les listeners document du script.
   useEffect(() => {
-    if (!shouldShow || !scriptAdMode || hasClicked) return;
+    if (!shouldShow || !scriptAdActive || hasClicked) return;
     const onCapturePointer = (e: PointerEvent) => {
       const target = e.target as Element | null;
       if (target && target.closest('[data-ad-view-button]')) beginScriptAdGesture();
     };
     window.addEventListener('pointerdown', onCapturePointer, true);
     return () => window.removeEventListener('pointerdown', onCapturePointer, true);
-  }, [shouldShow, scriptAdMode, hasClicked, beginScriptAdGesture]);
+  }, [shouldShow, scriptAdActive, hasClicked, beginScriptAdGesture]);
 
   // Fermeture avec animation de sortie avant de notifier le parent
   const handleClose = useCallback(() => {
@@ -288,7 +303,7 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
           </div>
 
           {/* Avertissement contenu adulte (visible seulement si pubs +18 actives) */}
-          {!hasClicked && adultAdsOn && (
+          {SHOW_ADULT_AD_WARNING && !hasClicked && adultAdsOn && (
             <div className="mx-4 sm:mx-6 mb-2">
               <div className="text-left bg-red-950/70 border-2 border-red-500 p-3 sm:p-4 rounded-lg shadow-lg">
                 <p className="text-red-300 font-bold text-sm sm:text-base leading-snug">
@@ -308,70 +323,17 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
             </div>
           )}
 
-          {/* Encadré avertissement */}
-          {!hasClicked && (
+          {/* Avertissement compact : ne rien faire sur la page de pub */}
+          {SHOW_AD_PAGE_WARNING && !hasClicked && (
             <div className="mx-4 sm:mx-6 mb-2">
-              <div className="text-left bg-yellow-50 border-2 border-yellow-500 p-4 rounded-lg text-type-text font-bold flex flex-col gap-2 shadow-lg">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-2xl">⚠️</span>
-                  <span className="uppercase text-yellow-700 font-extrabold tracking-wider text-sm sm:text-base">
-                    {t("adBlocker.doNotDo")}
-                  </span>
-                </div>
-                <ul className="list-disc pl-6 text-yellow-900 text-sm sm:text-base font-bold space-y-1">
-                  <li>❌ {t("adBlocker.doNotClickAnywhere")}</li>
-                  <li>❌ {t("adBlocker.doNotScanQr")}</li>
-                  <li>❌ {t("adBlocker.doNotDownloadAnything")}</li>
-                </ul>
-              </div>
-            </div>
-          )}
-
-          {/* Info aide lecteurs - apparaît après avoir cliqué */}
-          {hasClicked && variant !== "download" && variant !== "livetv" && (
-            <div className="mx-4 sm:mx-6 mb-2">
-              <div className="text-left bg-blue-900/30 border border-blue-500/50 p-4 rounded-lg text-blue-100 flex flex-col gap-2">
-                <div className="flex items-center gap-2 mb-1">
-                  <Settings className="w-5 h-5 text-blue-400" />
-                  <span className="font-bold text-blue-200">
-                    {t("adBlocker.hlsTips")}
-                  </span>
-                </div>
-                <ul className="pl-6 space-y-2 text-sm">
-                  <li className="flex flex-col">
-                    <span className="font-semibold text-blue-200">
-                      {t("adBlocker.hlsPlayersTitle")}
-                    </span>
-                    <span>{t("adBlocker.hlsTip1")}</span>
-                    <span>{t("adBlocker.hlsTip2")}</span>
-                    <span>{t("adBlocker.hlsTip3")}</span>
-                  </li>
-                  <li className="flex flex-col">
-                    <span className="font-semibold text-blue-200">
-                      {t("adBlocker.classicPlayersTitle")}
-                    </span>
-                    <span>{t("adBlocker.classicTip1")}</span>
-                    <span>{t("adBlocker.classicTip2")}</span>
-                  </li>
-                </ul>
-              </div>
+              <p className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-2 text-yellow-200 text-xs sm:text-sm font-semibold text-center">
+                ⚠️ {t("adBlocker.adPageWarning")}
+              </p>
             </div>
           )}
 
           {/* Boutons */}
           <div className="flex flex-col items-center gap-2 px-4 sm:px-8 pb-4 sm:pb-8 pt-2">
-            {variant === "player" && (
-              <p className="text-xs text-blue-200 text-center mb-1">
-                {t("adBlocker.withExtension")}
-                <Link
-                  to="/extension"
-                  className="text-blue-400 hover:text-blue-300 underline font-semibold"
-                >
-                  {t("adBlocker.extensionLink")}
-                </Link>
-                {t("adBlocker.otherSourcesAccess")}
-              </p>
-            )}
             {hasClicked ? (
               <button
                 onClick={handleClose}
@@ -384,7 +346,13 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
               <>
                 <button
                   data-ad-view-button
-                  onClick={scriptAdMode ? handleScriptAdClick : handleLinkClick}
+                  onClick={
+                    scriptAdMode
+                      ? scriptAdActive
+                        ? beginScriptAdGesture
+                        : completeScriptAdGesture
+                      : handleLinkClick
+                  }
                   className="flex items-center justify-center font-bold whitespace-nowrap relative overflow-hidden transition-all duration-200 h-12 text-base px-6 rounded-lg bg-blue-600 text-white hover:bg-blue-700 hover:scale-105 active:scale-95 focus:ring-2 focus:ring-blue-400 focus:ring-offset-2 shadow-lg w-full max-w-xs mb-1 cursor-pointer"
                   autoFocus
                 >
@@ -394,6 +362,47 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
                   {t("adBlocker.closeAdTip")}
                 </span>
               </>
+            )}
+
+            {/* Alternatives sans pub : VIP, et extension (PC/Mac) ou appli (mobile) */}
+            {!hasClicked && (
+              <div className="w-full max-w-xs mt-2 pt-3 border-t border-white/10">
+                <p className="text-[11px] text-blue-200/70 text-center mb-2">
+                  {t("adBlocker.noAdsQuestion")}
+                </p>
+                <div className={`grid gap-2 ${variant === "player" ? "grid-cols-2" : "grid-cols-1"}`}>
+                  <Link
+                    to="/vip"
+                    className="flex flex-col items-center justify-center gap-0.5 rounded-lg py-2 px-2 bg-amber-500/15 border border-amber-400/40 text-amber-300 hover:bg-amber-500/25 hover:text-amber-200 transition-colors"
+                  >
+                    <span className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-semibold">
+                      <Crown className="w-4 h-4 flex-shrink-0" />
+                      {t("adBlocker.vipButton")}
+                    </span>
+                    <span className="text-[10px] text-amber-200/70 leading-tight text-center">
+                      {t("adBlocker.vipButtonHint")}
+                    </span>
+                  </Link>
+                  {variant === "player" && (
+                    <Link
+                      to={isMobile ? "/app" : "/extension"}
+                      className="flex flex-col items-center justify-center gap-0.5 rounded-lg py-2 px-2 bg-indigo-500/15 border border-indigo-400/40 text-indigo-300 hover:bg-indigo-500/25 hover:text-indigo-200 transition-colors"
+                    >
+                      <span className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-semibold">
+                        {isMobile ? (
+                          <Smartphone className="w-4 h-4 flex-shrink-0" />
+                        ) : (
+                          <Puzzle className="w-4 h-4 flex-shrink-0" />
+                        )}
+                        {isMobile ? t("adBlocker.appButton") : t("adBlocker.extensionButton")}
+                      </span>
+                      <span className="text-[10px] text-indigo-200/70 leading-tight text-center">
+                        {t("adBlocker.sourcesButtonHint")}
+                      </span>
+                    </Link>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         </DialogPrimitive.Content>

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import axios from 'axios';
@@ -9,11 +10,12 @@ import { getTmdbId, encodeId } from '../../utils/idEncoder';
 import HLSPlayer from '../../components/HLSPlayer';
 import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
-import { getVipHeaders } from '../../utils/authUtils';
+import { serverResolveRequest } from '../../utils/serverResolveRequest';
 import { registerServerResolvedSources } from '../../utils/extractM3u8';
 import { runExtractionPass } from '../../utils/runExtractionPass';
 import { pickAutoSelectedLanguage, sortHostersByPriority } from '../../utils/sourceAutoSelect';
-import { detectHoster, toCanonicalHosterDomain } from '../../utils/hosterRegistry';
+import { detectHoster, toCanonicalHosterDomain, getHosterDisplayName } from '../../utils/hosterRegistry';
+import { getOverlayPortalRoot } from '../../utils/overlayPortal';
 import {
   getSourcePriorityPrefs,
   subscribeToPriorityChanges,
@@ -88,6 +90,13 @@ interface VideoSource {
   label: string;
   isM3u8?: boolean;
   id?: string; // Unique identifier for comparison
+  /**
+   * Id du hoster au sens du registre, indépendant du nom affiché. Une façade
+   * (Ansembed → vidmoly) s'affiche sous sa marque mais doit être classée avec
+   * son hoster réel ; et une URL extraite ne contient plus le nom du hoster,
+   * donc `detectHoster` seul ne suffit pas au tri.
+   */
+  hosterId?: string;
 }
 
 interface ContinueWatchingTvEntry {
@@ -406,13 +415,13 @@ const WatchAnime: React.FC = () => {
 
       // Use the new fallback search logic
       const searchFunction = async (term: string) => {
-        // `resolve` + saison/épisode : le serveur résout les m3u8 de ce seul
-        // épisode. On ne lui envoie que des identifiants — jamais d'URL, il
-        // n'existe plus d'endpoint qui en accepterait une.
-        const response = await axios.get(`${MAIN_API}/anime/search/${encodeURIComponent(term)}?includeSeasons=true&includeEpisodes=true`, {
-          params: { resolve: 1, season, episode },
-          headers: { ...getVipHeaders() }
-        });
+        // Méthode serveur : `resolve` + saison/épisode + clé VIP, le serveur
+        // résout les m3u8 de ce seul épisode. Méthode extension/userscript :
+        // liens bruts, extraction locale. On ne lui envoie que des
+        // identifiants — jamais d'URL, il n'existe plus d'endpoint qui en
+        // accepterait une.
+        const response = await axios.get(`${MAIN_API}/anime/search/${encodeURIComponent(term)}?includeSeasons=true&includeEpisodes=true`,
+          serverResolveRequest({ season, episode }));
         return response.data || [];
       };
 
@@ -695,19 +704,24 @@ const WatchAnime: React.FC = () => {
         if (hoster === 'vidmoly') {
           // L'URL de l'embed garde le domaine servi par anime-sama : c'est le
           // seul dont on sait qu'il est vivant. Seul .to, historiquement mort,
-          // est réécrit, comme le faisait déjà l'ancien code. La normalisation
-          // vers le domaine canonique attendu par le serveur d'extraction se
-          // fait dans extractVidmolyM3u8, donc côté extraction uniquement.
+          // est réécrit. La normalisation vers le domaine canonique attendu par
+          // le serveur d'extraction se fait dans extractVidmolyM3u8, donc côté
+          // extraction uniquement — une façade y voit son hôte entier remplacé.
           const vidmolyUrl = /vidmoly\.to/i.test(playerUrlString)
             ? toCanonicalHosterDomain(playerUrlString, 'vidmoly')
             : playerUrlString;
+
+          // Ansembed reste « Ansembed » dans le menu : l'utilisateur ne doit pas
+          // voir apparaître un nom de lecteur sur lequel il n'a pas cliqué.
+          const displayName = getHosterDisplayName(vidmolyUrl, 'vidmoly');
 
           sources.push({
             language: streamingLink.language,
             quality: 'Auto',
             url: vidmolyUrl,
-            player: 'Vidmoly',
-            label: `${streamingLink.language.toUpperCase()} - Vidmoly`,
+            player: displayName,
+            hosterId: 'vidmoly',
+            label: `${streamingLink.language.toUpperCase()} - ${displayName}`,
             id: `vidmoly-${streamingLink.language}-${vidmolyUrl}`
           });
         }
@@ -717,6 +731,7 @@ const WatchAnime: React.FC = () => {
             quality: 'Auto',
             url: playerUrlString,
             player: 'Sibnet',
+            hosterId: 'sibnet',
             label: `${streamingLink.language.toUpperCase()} - Sibnet`,
             id: `sibnet-${streamingLink.language}-${playerUrlString}`
           });
@@ -729,6 +744,7 @@ const WatchAnime: React.FC = () => {
             quality: 'Auto',
             url: playerUrlString,
             player: 'OneUpload',
+            hosterId: 'oneupload',
             label: `${streamingLink.language.toUpperCase()} - OneUpload`,
             id: `oneupload-${streamingLink.language}-${playerUrlString}`
           });
@@ -793,7 +809,7 @@ const WatchAnime: React.FC = () => {
             label: source.label,
             language: source.language,
             player: source.player,
-            meta: { language: source.language },
+            meta: { language: source.language, displayName: source.player, hosterId: source.hosterId },
           })),
           MAIN_API,
           {
@@ -817,8 +833,14 @@ const WatchAnime: React.FC = () => {
             console.warn('[anime-sama] source extraite sans langue, ignorée:', extracted.url);
             continue;
           }
-          const hosterId = extracted.source.split('-')[0];
-          const playerName = hosterId.charAt(0).toUpperCase() + hosterId.slice(1);
+          // Le rang vient du hoster réel (vidmoly), le libellé de la marque
+          // affichée à côté (Ansembed) — les deux entrées se répondent dans le menu.
+          const hosterId = typeof extracted.meta?.hosterId === 'string' && extracted.meta.hosterId
+            ? extracted.meta.hosterId
+            : extracted.source.split('-')[0];
+          const playerName = typeof extracted.meta?.displayName === 'string' && extracted.meta.displayName
+            ? extracted.meta.displayName
+            : hosterId.charAt(0).toUpperCase() + hosterId.slice(1);
 
           sources.push({
             language,
@@ -829,6 +851,7 @@ const WatchAnime: React.FC = () => {
             // Le tag « HLS » de l'UI signifie « lu nativement », y compris pour
             // les fichiers progressifs : HLSPlayer détecte le MP4 tout seul.
             isM3u8: true,
+            hosterId,
             id: `${hosterId}-hls-${language}-${extracted.url}`,
           });
         }
@@ -846,17 +869,15 @@ const WatchAnime: React.FC = () => {
     // par défaut construit dans buildDefaults si aucun override user n'est présent).
     const prefs = getSourcePriorityPrefs();
     const annotated = sources.map((s) => {
+      // `hosterId` prime : une URL extraite ne contient plus le nom du hoster
+      // (le flux Vidmoly sort sur vmget.online), et une façade porte un nom
+      // affiché qui n'est pas un id du registre.
+      if (s.hosterId) return { source: s, type: s.hosterId };
       const detected = detectHoster(s.url, {
         patternOverrides: prefs.patternOverrides,
         customHosters: prefs.customHosters,
       });
-      // Mapper le nom affiché aux ids du registre pour les hosters anime-specific
-      // (Vidmoly, Sibnet, OneUpload sont détectés par regex → pas de fallback nécessaire).
-      const type = detected ?? (s.player.toLowerCase() === 'vidmoly' ? 'vidmoly'
-        : s.player.toLowerCase() === 'sibnet' ? 'sibnet'
-        : s.player.toLowerCase() === 'oneupload' ? 'oneupload'
-        : s.player.toLowerCase());
-      return { source: s, type };
+      return { source: s, type: detected ?? s.player.toLowerCase() };
     });
     const sorted = sortHostersByPriority(annotated, {
       category: 'anime',
@@ -1568,6 +1589,21 @@ const WatchAnime: React.FC = () => {
             )}
           </AnimatePresence>
 
+          {/* Bouton « Sources » et panneau de sélection.
+            *
+            * Portés dans `#movix-overlay-root` : en plein écran, le lecteur
+            * passe en `.player-fullscreen-fill` avec un z-index de 2147483000,
+            * qui recouvrait ce panneau resté à 10001. Le bouton du lecteur
+            * ouvrait donc bien le panneau, mais on ne le voyait jamais — d'où
+            * l'impression que le bouton ne faisait rien.
+            *
+            * La racine de portail suit l'élément plein écran toute seule et
+            * monte au-dessus du lecteur (cf. `utils/overlayPortal.ts`). Hors
+            * plein écran elle est en `display: contents`, donc le rendu est
+            * strictement identique à avant.
+            */}
+          {createPortal(
+            <>
           {/* Change Source Button */}
           {!showHLSPlayer && (
             <button
@@ -1579,10 +1615,20 @@ const WatchAnime: React.FC = () => {
             </button>
           )}
 
-          {/* Source Selection Panel */}
+          {/* Panneau de sélection des sources.
+            *
+            * Le fond laisse passer les clics vers le lecteur. En plein écran
+            * il faut le dire en style inline : la règle
+            * `#movix-overlay-root[data-fullscreen] > *` de index.css pose
+            * `pointer-events: auto` avec une spécificité (1,1,0) que la classe
+            * utilitaire `pointer-events-none` (0,1,0) ne peut pas battre.
+            */}
           <AnimatePresence>
             {showEmbedQuality && (
-              <div className="fixed inset-0 z-[10001] bg-black/50 flex justify-end pointer-events-none">
+              <div
+                className="fixed inset-0 z-[10001] bg-black/50 flex justify-end"
+                style={{ pointerEvents: 'none' }}
+              >
                 <motion.div
                   key="embed-quality-menu"
                   initial={{ opacity: 0, x: 300 }}
@@ -1724,6 +1770,9 @@ const WatchAnime: React.FC = () => {
               </div>
             )}
           </AnimatePresence>
+            </>,
+            getOverlayPortalRoot(),
+          )}
 
           {/* HLS Player for extracted sources */}
           {showHLSPlayer && hlsPlayerSrc ? (

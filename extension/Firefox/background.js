@@ -752,6 +752,24 @@ async function handleMessage(message) {
   }
 }
 
+// Encodage base64 d'un segment vidéo. La concaténation octet par octet
+// (`binary += String.fromCharCode(bytes[i])`) coûtait des centaines de ms sur
+// un segment HLS de plusieurs Mo et bloquait le background à chaque requête.
+// On prend l'encodeur natif quand il existe, sinon on avance par blocs de
+// 32 Ko.
+function proxyBytesToBase64(bytes) {
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 32768) {
+    binary += String.fromCharCode.apply(
+      null,
+      bytes.subarray(offset, offset + 32768),
+    );
+  }
+  return btoa(binary);
+}
+
 // Helper to proxy HTTP requests via extension (to bypass Mixed Content)
 async function proxyHttpRequest(url, headers = {}) {
   try {
@@ -767,15 +785,7 @@ async function proxyHttpRequest(url, headers = {}) {
 
     const response = await fetch(url, { headers });
     const buffer = await response.arrayBuffer();
-
-    // Convert ArrayBuffer to Base64
-    let binary = "";
-    const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    const base64 = btoa(binary);
+    const base64 = proxyBytesToBase64(new Uint8Array(buffer));
 
     return {
       data: base64,

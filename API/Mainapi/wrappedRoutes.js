@@ -332,16 +332,6 @@ async function initTables() {
             }
         }
 
-        // Migration: index on (year) alone for the global percentile query
-        try {
-            await pool.execute(`CREATE INDEX idx_year ON wrapped_viewing_data (year)`);
-            console.log('[Wrapped] Migration: added idx_year index');
-        } catch (indexErr) {
-            if (indexErr.errno !== 1061) {
-                console.warn('[Wrapped] Migration warning (idx_year):', indexErr.message);
-            }
-        }
-
         // Migration: covering index for generate queries (user_id, year, watch_duration, content_id, content_type)
         try {
             await pool.execute(`

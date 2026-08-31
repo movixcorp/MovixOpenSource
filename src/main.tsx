@@ -7,7 +7,9 @@ import App from './App.tsx'
 import axios from 'axios'
 import { api } from './services/api'
 import { registerBlockDetection } from './services/blockDetection'
+import { initAnalytics } from './utils/analytics'
 import { installHttpCache } from './utils/httpCache'
+import { installSegmentedSeasons } from './utils/segmentedSeasons'
 import './index.css'
 import './styles/light-mode.css'
 
@@ -153,6 +155,13 @@ registerBlockDetection(api)
 installHttpCache(axios)
 installHttpCache(api)
 
+// Séries que TMDB découpe en segments de 11 minutes (« Bienvenue chez les
+// Loud ») : les épisodes sont recollés à la volée pour coller aux fichiers.
+// Posé APRÈS le cache — celui-ci stocke la réponse TMDB brute, la fusion
+// s'applique à chaque lecture. Voir `utils/segmentedSeasons.ts`.
+installSegmentedSeasons(axios)
+installSegmentedSeasons(api)
+
 // ---------------------------------------------------------------------------
 // Resilience patches — run before the app mounts.
 // ---------------------------------------------------------------------------
@@ -208,6 +217,11 @@ if (typeof Node === 'function' && Node.prototype) {
     return originalInsertBefore.call(this, newNode, referenceNode) as T;
   };
 }
+
+// Analytics (Google Analytics ou Plausible, au choix via VITE_ANALYTICS_PROVIDER).
+// Ne charge rien si le fournisseur est "none", si sa config est incomplète, ou
+// si l'utilisateur a coupé la mesure (Do Not Track / opt-out local).
+initAnalytics();
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

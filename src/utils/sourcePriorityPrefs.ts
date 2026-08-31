@@ -24,14 +24,21 @@ const CHANGE_EVENT = 'movix-source-priority-changed';
  * au lieu de uqload/VOSTFR). Migration n'écrase l'ordre stocké QUE si
  * l'ordre des built-ins matche l'ancien default (= user n'a pas reordré).
  * Les `custom_*` sont préservés à leur position relative.
+ *
+ * **v3 → v4** (2026-08-31) : `swiftflux` (lecture directe HLS/MP4) remonte
+ * juste après `nexus_hls` dans l'ordre par défaut, au lieu de passer après
+ * les sources embed (fstream/omega/wiflix/j1f/swiftflow). Migration :
+ * repositionnement inconditionnel (source trop récente pour qu'un ordre
+ * volontaire existe) — voir migrateV3toV4.
  */
-const SCHEMA_VERSION = 3 as const;
-type LegacySourcePriorityPrefs<V extends 1 | 2> = Omit<SourcePriorityPrefs, 'version'> & {
+const SCHEMA_VERSION = 4 as const;
+type LegacySourcePriorityPrefs<V extends 1 | 2 | 3> = Omit<SourcePriorityPrefs, 'version'> & {
   version: V;
 };
 type PersistedSourcePriorityPrefs = SourcePriorityPrefs
   | LegacySourcePriorityPrefs<1>
-  | LegacySourcePriorityPrefs<2>;
+  | LegacySourcePriorityPrefs<2>
+  | LegacySourcePriorityPrefs<3>;
 
 /** Ancien ordre built-in (pré-v3). Sert au comparateur du migrator v2→v3. */
 const V2_DEFAULT_BUILTIN_HOSTER_ORDER: readonly string[] = [
@@ -63,7 +70,7 @@ const V2_DEFAULT_BUILTIN_HOSTER_ORDER: readonly string[] = [
  * les fournissent pas.
  */
 const DEFAULT_MOVIES_TV_ORDER: readonly TopLevelSourceId[] = [
-  'nexus_hls', 'bravo', 'mp4', 'darkino',
+  'nexus_hls', 'swiftflux', 'bravo', 'mp4', 'darkino',
   'fstream', 'omega', 'wiflix', 'j1f', 'swiftflow', 'viper', 'coflix',
   'custom', 'frembed', 'vox', 'kisskh', 'vostfr',
 ];
@@ -121,7 +128,7 @@ export const DEFAULT_SOURCE_PRIORITY_PREFS: SourcePriorityPrefs = buildDefaults(
 function isValidPrefs(obj: unknown): obj is PersistedSourcePriorityPrefs {
   if (!obj || typeof obj !== 'object') return false;
   const p = obj as Partial<Omit<SourcePriorityPrefs, 'version'>> & { version?: unknown };
-  const versionOk = p.version === 1 || p.version === 2 || p.version === 3;
+  const versionOk = p.version === 1 || p.version === 2 || p.version === 3 || p.version === 4;
   return versionOk
     && !!p.categories
     && !!p.categories.moviesTv
@@ -181,7 +188,7 @@ function migrateV1toV2(
  */
 function migrateV2toV3(
   parsed: LegacySourcePriorityPrefs<2>,
-): SourcePriorityPrefs {
+): LegacySourcePriorityPrefs<3> {
   const userOrder = parsed.categories.moviesTv.hosterOrder;
   const builtinsSet = new Set<string>(V2_DEFAULT_BUILTIN_HOSTER_ORDER);
   const builtinsInUserOrder = userOrder.filter((id) => builtinsSet.has(id));
@@ -203,6 +210,44 @@ function migrateV2toV3(
         ...parsed.categories.moviesTv,
         hosterOrder: [...BUILTIN_HOSTER_IDS, ...customsInUserOrder],
       },
+    },
+  };
+}
+
+/**
+ * Migration v3 → v4 : swiftflux (lecture directe) remonte juste après nexus_hls
+ * au lieu de passer derrière les sources embed (fstream/omega/wiflix/j1f/
+ * swiftflow). Repositionnement inconditionnel : swiftflux venait d'être ajouté
+ * au moment de cette migration, donc aucun utilisateur ne l'avait classé
+ * volontairement — soit il était à sa position par défaut, soit absent des
+ * prefs persistées (mergeWithDefaults l'appendait alors en FIN de liste, donc
+ * derrière tous les embeds). On l'insère s'il manque, en préservant son flag
+ * `enabled` s'il existait. Un utilisateur qui le redescend ensuite persiste en
+ * v4 → plus jamais retouché.
+ */
+function migrateV3toV4(
+  parsed: LegacySourcePriorityPrefs<3>,
+): SourcePriorityPrefs {
+  const order = parsed.categories.moviesTv.sourceOrder;
+  const idx = order.findIndex((e) => e.id === 'swiftflux');
+
+  const entry = idx !== -1
+    ? order[idx]
+    : { id: 'swiftflux' as TopLevelSourceId, enabled: true };
+  const without = idx !== -1 ? order.filter((_, i) => i !== idx) : order;
+  const nexusIdx = without.findIndex((e) => e.id === 'nexus_hls');
+  // nexus_hls absent (prefs corrompues) → tête de liste, même intention.
+  const insertAt = nexusIdx === -1 ? 0 : nexusIdx + 1;
+  const sourceOrder = [
+    ...without.slice(0, insertAt), entry, ...without.slice(insertAt),
+  ];
+
+  return {
+    ...parsed,
+    version: 4,
+    categories: {
+      ...parsed.categories,
+      moviesTv: { ...parsed.categories.moviesTv, sourceOrder },
     },
   };
 }
@@ -323,7 +368,11 @@ export function getSourcePriorityPrefs(): SourcePriorityPrefs {
     const v3 = v2.version === 2
       ? migrateV2toV3(v2)
       : v2;
-    return mergeWithDefaults(v3);
+    // Migration v3 → v4 (swiftflux promu juste après nexus_hls)
+    const v4 = v3.version === 3
+      ? migrateV3toV4(v3)
+      : v3;
+    return mergeWithDefaults(v4);
   } catch {
     return buildDefaults();
   }

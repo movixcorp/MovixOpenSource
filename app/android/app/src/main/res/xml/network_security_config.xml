@@ -1,14 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false">
+    <!--
+      Le trafic en clair doit rester autorisé : certaines sources de flux
+      (Vavoo notamment) répartissent leurs edges sur des adresses IP nues, qui
+      n'ont pas de certificat et ne sont donc servies qu'en http. Avec
+      `cleartextTrafficPermitted="false"`, Android refusait ces requêtes en
+      quelques millisecondes — « Network request failed » — et le proxy de
+      l'app ne pouvait jamais aboutir. Cette base-config contredisait aussi
+      `android:usesCleartextTraffic="true"` déjà déclaré dans le manifeste, et
+      c'est elle qui gagnait.
+
+      Les adresses changent à chaque résolution : les lister par domaine est
+      impossible. iOS autorise déjà ces chargements via NSAllowsArbitraryLoads.
+    -->
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!-- Autoriser localhost pour le dev -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">localhost</domain>
-        <domain includeSubdomains="true">127.0.0.1</domain>
-        <domain includeSubdomains="true">10.0.2.2</domain>
-    </domain-config>
 </network-security-config>
