@@ -2426,24 +2426,15 @@ const WIFLIX_FREE_PROXY_URL =
   "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text";
 const WIFLIX_FREE_PROXY_REFRESH_MS = 5 * 60 * 1000; // 5 minutes
 
-// Liste gratuite coupée par défaut quand AUCUN proxy n'est configuré : une
-// installation sans SOCKS5_PROXIES / HTTP_PROXIES / compte ProxyScrape /
-// CLOUDFLARE_WORKERS_PROXIES doit sortir en IP locale, pas via des proxys
-// publics inconnus récupérés silencieusement. Override explicite possible dans
-// les deux sens via WIFLIX_FREE_PROXY_ENABLED=true|false.
-const WIFLIX_FREE_PROXY_ENABLED = (() => {
-  const raw = String(process.env.WIFLIX_FREE_PROXY_ENABLED || "")
+// Liste gratuite ProxyScrape (proxys HTTP publics inconnus) : DÉSACTIVÉE par
+// défaut, opt-in explicite via WIFLIX_FREE_PROXY_ENABLED=true. Sans elle,
+// Wiflix n'utilise que les proxys configurés, puis CF Workers, puis direct
+// en IP locale — et aucun appel réseau n'est fait vers ProxyScrape.
+const WIFLIX_FREE_PROXY_ENABLED = ["1", "true", "yes", "on"].includes(
+  String(process.env.WIFLIX_FREE_PROXY_ENABLED || "")
     .trim()
-    .toLowerCase();
-  if (["1", "true", "yes", "on"].includes(raw)) return true;
-  if (["0", "false", "no", "off"].includes(raw)) return false;
-  return (
-    PROXYSCRAPE_ENABLED ||
-    Boolean(String(process.env.SOCKS5_PROXIES || "").trim()) ||
-    Boolean(String(process.env.HTTP_PROXIES || "").trim()) ||
-    CLOUDFLARE_WORKERS_PROXIES.length > 0
-  );
-})();
+    .toLowerCase(),
+);
 const WIFLIX_FREE_PROXY_MAX_ATTEMPTS = 3; // Try up to 3 proxies per request
 const WIFLIX_FREE_PROXY_TIMEOUT = 5000; // 5s per proxy attempt (fail fast)
 
