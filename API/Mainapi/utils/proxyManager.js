@@ -1317,8 +1317,9 @@ async function makeCpasmalRequest(targetUrl, options = {}) {
 }
 
 // Fonction AnimeSama avec CycleTLS (cloudscraper-style : JA3 Chrome pour bypass Cloudflare).
-// Utilise le SOCKS5_PROXIES env directement (proxies dedies) -- pas le pool ProxyScrape,
-// pas de fallback direct sans proxy.
+// Utilise le SOCKS5_PROXIES env directement (proxies dédiés) -- pas le pool ProxyScrape.
+// Sans SOCKS5_PROXIES configuré : tentative directe en IP locale, comme les autres
+// helpers CycleTLS (Cpasmal, CineStream, 1jour1film).
 const MAX_ANIMESAMA_CYCLETLS_ATTEMPTS = 2;
 const ANIMESAMA_SOCKS5_PROXIES = dedupeProxyEntries(
   parseProxyPayload(process.env.SOCKS5_PROXIES, "socks5")
@@ -1347,12 +1348,6 @@ async function makeAnimeSamaRequest(targetUrl, options = {}) {
     .sort(() => Math.random() - 0.5)
     .slice(0, MAX_ANIMESAMA_CYCLETLS_ATTEMPTS);
 
-  if (pool.length === 0) {
-    throw new Error(
-      "[ANIMESAMA CYCLETLS] aucun proxy SOCKS5 defini dans SOCKS5_PROXIES",
-    );
-  }
-
   const cycleTLS = await getCycleTLS();
 
   const asAxiosLike = (response) => {
@@ -1362,6 +1357,24 @@ async function makeAnimeSamaRequest(targetUrl, options = {}) {
         : JSON.stringify(response.body);
     return { data, status: response.status, headers: response.headers || {} };
   };
+
+  // Aucun proxy SOCKS5 configuré -> tentative directe en IP locale. Avant, on
+  // jetait une erreur ici, ce qui cassait AnimeSama sur toute installation
+  // sans SOCKS5_PROXIES au lieu de dégrader vers une requête directe.
+  if (pool.length === 0) {
+    const response = await cycleTLS(
+      cleanTargetUrl,
+      {
+        body,
+        ja3: CHROME_JA3,
+        userAgent: CHROME_UA,
+        headers: defaultHeaders,
+        timeout,
+      },
+      lowerMethod,
+    );
+    return asAxiosLike(response);
+  }
 
   let lastError = null;
   let lastResult = null;
@@ -2412,6 +2425,25 @@ scheduleProxyScrapeRefresh();
 const WIFLIX_FREE_PROXY_URL =
   "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text";
 const WIFLIX_FREE_PROXY_REFRESH_MS = 5 * 60 * 1000; // 5 minutes
+
+// Liste gratuite coupée par défaut quand AUCUN proxy n'est configuré : une
+// installation sans SOCKS5_PROXIES / HTTP_PROXIES / compte ProxyScrape /
+// CLOUDFLARE_WORKERS_PROXIES doit sortir en IP locale, pas via des proxys
+// publics inconnus récupérés silencieusement. Override explicite possible dans
+// les deux sens via WIFLIX_FREE_PROXY_ENABLED=true|false.
+const WIFLIX_FREE_PROXY_ENABLED = (() => {
+  const raw = String(process.env.WIFLIX_FREE_PROXY_ENABLED || "")
+    .trim()
+    .toLowerCase();
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return (
+    PROXYSCRAPE_ENABLED ||
+    Boolean(String(process.env.SOCKS5_PROXIES || "").trim()) ||
+    Boolean(String(process.env.HTTP_PROXIES || "").trim()) ||
+    CLOUDFLARE_WORKERS_PROXIES.length > 0
+  );
+})();
 const WIFLIX_FREE_PROXY_MAX_ATTEMPTS = 3; // Try up to 3 proxies per request
 const WIFLIX_FREE_PROXY_TIMEOUT = 5000; // 5s per proxy attempt (fail fast)
 
@@ -2440,6 +2472,7 @@ const wiflixProxyTelemetry = createWiflixProxyTelemetry({
 });
 
 async function fetchWiflixFreeProxies() {
+  if (!WIFLIX_FREE_PROXY_ENABLED) return;
   try {
     const res = await axios.get(WIFLIX_FREE_PROXY_URL, { timeout: 15000 });
     const text = typeof res.data === "string" ? res.data : "";
@@ -2718,11 +2751,15 @@ async function makeWiflixSearchRequest(homeUrl, searchUrl, options = {}) {
   });
 }
 
-// Initial fetch + 5-min refresh
-fetchWiflixFreeProxies();
-setInterval(() => {
+// Fetch initial + refresh 5 min — seulement quand la liste gratuite est activée
+// (voir WIFLIX_FREE_PROXY_ENABLED) : sans elle, aucun appel réseau vers
+// ProxyScrape et Wiflix passe direct / CF Workers selon la config.
+if (WIFLIX_FREE_PROXY_ENABLED) {
   fetchWiflixFreeProxies();
-}, WIFLIX_FREE_PROXY_REFRESH_MS).unref();
+  setInterval(() => {
+    fetchWiflixFreeProxies();
+  }, WIFLIX_FREE_PROXY_REFRESH_MS).unref();
+}
 
 // Fonction utilitaire pour choisir aléatoirement un proxy (toujours utiliser un proxy)
 function pickRandomProxyOrNone() {
