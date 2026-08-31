@@ -5656,7 +5656,7 @@
                 ? payload.message
                 : payload?.error || String(payload || "Erreur inconnue"),
           },
-      "*",
+      pageWindow.location.origin,
     );
   }
 

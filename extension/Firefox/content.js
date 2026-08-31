@@ -29,14 +29,14 @@ window.addEventListener("message", async (event) => {
                     messageId,
                     success: false,
                     error: response.error
-                }, "*");
+                }, window.location.origin);
             } else {
                 window.postMessage({
                     source: "MOVIX_EXTENSION",
                     messageId,
                     success: true,
                     data: response
-                }, "*");
+                }, window.location.origin);
             }
         } catch (error) {
             window.postMessage({
@@ -44,7 +44,7 @@ window.addEventListener("message", async (event) => {
                 messageId,
                 success: false,
                 error: error.message
-            }, "*");
+            }, window.location.origin);
         }
     }
 });
@@ -57,6 +57,6 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             source: 'MOVIX_EXTENSION',
             type: 'EXTRACTION_RESULT',
             data: message.data
-        }, '*');
+        }, window.location.origin);
     }
 });

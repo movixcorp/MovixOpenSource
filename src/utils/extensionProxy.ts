@@ -60,7 +60,7 @@ export const fetchFromExtension = <T = unknown>(
             action,
             payload: enrichedPayload,
             messageId
-        }, "*");
+        }, window.location.origin);
 
         // Timeout after 10 seconds
         setTimeout(() => {

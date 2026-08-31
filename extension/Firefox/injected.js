@@ -76,7 +76,7 @@ window.movixExtractM3u8 = function(type, url) {
             action: 'EXTRACT_M3U8',
             messageId,
             payload: { type, url }
-        }, '*');
+        }, window.location.origin);
     });
 };
 
@@ -115,7 +115,7 @@ window.movixExtractAllM3u8 = function(sources) {
             action: 'EXTRACT_ALL_M3U8',
             messageId,
             payload: { sources }
-        }, '*');
+        }, window.location.origin);
     });
 };
 
@@ -144,7 +144,7 @@ window.movixDetectEmbeds = function(sources) {
             action: 'DETECT_EMBEDS',
             messageId,
             payload: { sources }
-        }, '*');
+        }, window.location.origin);
     });
 };
 
@@ -172,6 +172,6 @@ window.movixSetupHeaders = function(type, url) {
             action: 'SETUP_HEADERS',
             messageId,
             payload: { type, url }
-        }, '*');
+        }, window.location.origin);
     });
 };
