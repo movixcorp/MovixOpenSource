@@ -206,6 +206,12 @@ test('sidestore source generator produces a source consistent with its inputs', 
 
     // L'IPA est compilée sans entitlements : la source ne doit en déclarer aucun.
     assert.deepEqual(app.appPermissions, { entitlements: [], privacy: {} });
+
+    // Le domaine du site tourne sous blocage FAI. Le lien n'est lu que par
+    // l'interface du store, mais il ne doit jamais renvoyer vers un domaine
+    // mort : movix.tax ne répond plus depuis longtemps.
+    assert.match(source.website, /^https:\/\//);
+    assert.doesNotMatch(source.website, /movix\.tax/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

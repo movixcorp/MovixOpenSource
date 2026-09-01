@@ -84,7 +84,12 @@ const source = {
     "Source officielle de Movix pour AltStore et SideStore. " +
     "Ajoutez-la pour installer l'application iOS et recevoir ses mises à jour.",
   iconURL,
-  website: 'https://movix.tax',
+  // Le domaine tourne sous blocage FAI : la liste vivante est celle de
+  // VITE_MIRRORS_CONFIG_URL (rentry.co/movix), que l'app et le service worker
+  // relisent au démarrage. On y aligne ce lien à chaque rotation — il n'est
+  // lu que par l'interface du store, jamais par l'installation elle-même,
+  // donc un domaine périmé ici n'empêche personne d'installer l'app.
+  website: 'https://movix.online',
   tintColor: '#8b5cf6',
   apps: [
     {

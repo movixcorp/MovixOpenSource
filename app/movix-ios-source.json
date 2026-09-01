@@ -4,7 +4,7 @@
   "subtitle": "Films et séries en streaming.",
   "description": "Source officielle de Movix pour AltStore et SideStore. Ajoutez-la pour installer l'application iOS et recevoir ses mises à jour.",
   "iconURL": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png",
-  "website": "https://movix.tax",
+  "website": "https://movix.online",
   "tintColor": "#8b5cf6",
   "apps": [
     {
