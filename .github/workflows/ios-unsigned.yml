@@ -243,12 +243,13 @@ jobs:
         working-directory: dist
         run: shasum -a 256 -c Movix-unsigned.ipa.sha256
 
-      # La source AltStore/SideStore est régénérée à chaque publication (les
-      # deux stores lisent le même format JSON). L'URL de téléchargement pointe
-      # sur l'IPA commitée dans le dépôt : IPA et source partent dans le même
-      # commit, donc les deux fichiers servis par raw.githubusercontent restent
+      # Les sources des stores sont régénérées à chaque publication : une pour
+      # AltStore et SideStore (même format JSON pour les deux), une pour
+      # Scarlet, qui a le sien. L'URL de téléchargement pointe sur l'IPA
+      # commitée dans le dépôt : IPA et sources partent dans le même commit,
+      # donc tous les fichiers servis par raw.githubusercontent restent
       # toujours cohérents entre eux, taille comprise.
-      - name: Generate the AltStore and SideStore source
+      - name: Generate the AltStore, SideStore and Scarlet sources
         env:
           IOS_SOURCE_VERSION: ${{ needs.build.outputs.version }}
           IOS_SOURCE_BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
@@ -259,6 +260,7 @@ jobs:
           IOS_SOURCE_ICON_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png
           IOS_SOURCE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
           IOS_SOURCE_OUTPUT: app/movix-ios-source.json
+          IOS_SCARLET_OUTPUT: app/movix-scarlet-source.json
         run: node app/scripts/generate-ios-source.mjs
 
       # L'IPA vit dans le dépôt à côté de movix-android.apk, pour être
@@ -271,9 +273,9 @@ jobs:
           install -m 644 dist/Movix-unsigned.ipa app/movix-ios-unsigner.ipa
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- app/movix-ios-unsigner.ipa app/movix-ios-source.json
+          git add -- app/movix-ios-unsigner.ipa app/movix-ios-source.json app/movix-scarlet-source.json
           if git diff --cached --quiet; then
-            echo "IPA et source identiques à celles déjà publiées, rien à committer."
+            echo "IPA et sources identiques à celles déjà publiées, rien à committer."
             exit 0
           fi
           git commit -F - <<EOF
@@ -283,8 +285,9 @@ jobs:
           L'archive est identique à celle attachée à la release et a été
           vérifiée par son empreinte SHA-256 avant d'être indexée.
 
-          La source AltStore/SideStore (app/movix-ios-source.json) est
-          régénérée dans le même commit : version, taille et URL restent
+          Les sources des stores (app/movix-ios-source.json pour AltStore et
+          SideStore, app/movix-scarlet-source.json pour Scarlet) sont
+          régénérées dans le même commit : version, taille et URL restent
           cohérentes avec l'IPA servie par raw.githubusercontent.
 
           Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
@@ -307,4 +310,4 @@ jobs:
             Movix-unsigned.ipa \
             Movix-unsigned.ipa.sha256 \
             --title "Movix ${{ needs.build.outputs.version }} (iOS, non signee)" \
-            --notes "IPA non signee. Son installation est impossible tant qu'un utilisateur ne l'a pas signee par ses propres moyens. Verifiez l'archive avec: shasum -a 256 -c Movix-unsigned.ipa.sha256 — Source AltStore/SideStore : https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-ios-source.json"
+            --notes "IPA non signee. Son installation est impossible tant qu'un utilisateur ne l'a pas signee par ses propres moyens. Verifiez l'archive avec: shasum -a 256 -c Movix-unsigned.ipa.sha256 — Source AltStore/SideStore : https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-ios-source.json — Source Scarlet : https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-scarlet-source.json"

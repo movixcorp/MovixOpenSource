@@ -59,6 +59,7 @@ const downloadURL = requiredHttps('IOS_SOURCE_DOWNLOAD_URL');
 const iconURL = requiredHttps('IOS_SOURCE_ICON_URL');
 const notesURL = requiredHttps('IOS_SOURCE_NOTES_URL');
 const outputPath = required('IOS_SOURCE_OUTPUT');
+const scarletOutputPath = required('IOS_SCARLET_OUTPUT');
 
 // Date de version : celle du commit taggé quand le workflow la fournit
 // (déterministe par tag), sinon la date du jour en UTC. Le push d'un tag
@@ -72,6 +73,17 @@ const subtitle = 'Films et séries en streaming.';
 const versionDescription =
   `Version ${version} (build ${buildNumber}). Notes de version : ${notesURL}`;
 
+// Le domaine tourne sous blocage FAI : la liste vivante est celle de
+// VITE_MIRRORS_CONFIG_URL (rentry.co/movix), que l'app et le service worker
+// relisent au démarrage. On aligne ce lien à chaque rotation — il n'est lu que
+// par l'interface des stores, jamais par l'installation elle-même, donc un
+// domaine périmé ici n'empêche personne d'installer l'app.
+const website = 'https://movix.online';
+
+const appDescription =
+  "Application iOS officielle de Movix : navigation intégrée, lecture " +
+  "vidéo native, image dans l'image, Chromecast et DNS sécurisé.";
+
 // « identifier » (source) et « bundleIdentifier » (app) ne doivent JAMAIS
 // changer : AltStore et SideStore s'en servent comme clés primaires ; les
 // modifier ferait disparaître Movix chez tous les utilisateurs qui ont déjà
@@ -84,12 +96,7 @@ const source = {
     "Source officielle de Movix pour AltStore et SideStore. " +
     "Ajoutez-la pour installer l'application iOS et recevoir ses mises à jour.",
   iconURL,
-  // Le domaine tourne sous blocage FAI : la liste vivante est celle de
-  // VITE_MIRRORS_CONFIG_URL (rentry.co/movix), que l'app et le service worker
-  // relisent au démarrage. On y aligne ce lien à chaque rotation — il n'est
-  // lu que par l'interface du store, jamais par l'installation elle-même,
-  // donc un domaine périmé ici n'empêche personne d'installer l'app.
-  website: 'https://movix.online',
+  website,
   tintColor: '#8b5cf6',
   apps: [
     {
@@ -98,11 +105,9 @@ const source = {
       developerName: 'Movix',
       subtitle,
       localizedDescription:
-        "Application iOS officielle de Movix : navigation intégrée, lecture " +
-        "vidéo native, image dans l'image, Chromecast et DNS sécurisé. " +
-        "L'IPA distribuée ici n'est pas signée : AltStore ou SideStore la " +
-        "signe automatiquement avec votre identifiant Apple au moment de " +
-        "l'installation.",
+        `${appDescription} L'IPA distribuée ici n'est pas signée : AltStore ` +
+        "ou SideStore la signe automatiquement avec votre identifiant Apple " +
+        "au moment de l'installation.",
       iconURL,
       tintColor: '#8b5cf6',
       // L'IPA est compilée sans entitlements ni signature : la liste vide est
@@ -133,8 +138,44 @@ const source = {
   news: [],
 };
 
+// Scarlet lit un format à lui : un bloc META, puis des seaux par catégorie
+// (« Tweaked », « Jailbreaks », « Emulators », « Other »). Movix n'est ni un
+// tweak ni un émulateur, donc « Other ».
+//
+// Scarlet signe avec un certificat d'entreprise partagé, pas avec le compte
+// Apple de l'utilisateur : rien à payer ni à faire signer côté Movix, mais
+// quand Apple révoque ce certificat, toutes les apps installées par Scarlet
+// cessent de s'ouvrir d'un coup. C'est pourquoi la source AltStore/SideStore
+// reste la voie recommandée, celle-ci n'étant qu'un confort supplémentaire
+// pour qui n'a pas d'ordinateur sous la main.
+const scarletSource = {
+  META: {
+    repoName: 'Movix',
+    repoIcon: iconURL,
+  },
+  Other: [
+    {
+      name: 'Movix',
+      version,
+      // `down` est l'équivalent Scarlet de `downloadURL` : même IPA, même
+      // fichier que celui publié dans la release.
+      down: downloadURL,
+      category: 'Other',
+      description:
+        `${appDescription} L'IPA distribuée ici n'est pas signée : Scarlet ` +
+        "la signe au moment de l'installation. " +
+        versionDescription,
+      bundleID: 'com.movix.app',
+      icon: iconURL,
+      dev: 'Movix',
+      contact: { web: website },
+    },
+  ],
+};
+
 writeFileSync(outputPath, `${JSON.stringify(source, null, 2)}\n`);
+writeFileSync(scarletOutputPath, `${JSON.stringify(scarletSource, null, 2)}\n`);
 console.log(
-  `Source écrite dans ${outputPath} (IPA de ${size} octets, ` +
-    `version ${version}, build ${buildNumber})`,
+  `Sources écrites dans ${outputPath} et ${scarletOutputPath} ` +
+    `(IPA de ${size} octets, version ${version}, build ${buildNumber})`,
 );

@@ -126,6 +126,16 @@ Dans SideStore ou AltStore : **Sources → + → coller cette URL**. Movix appar
 
 L'identifiant de la source (`com.movix.source`) et celui de l'app (`com.movix.app`) ne doivent jamais changer : les stores s'en servent comme clés primaires.
 
+### Scarlet
+
+Scarlet a son propre format ; le même job génère `app/movix-scarlet-source.json`, qui pointe vers la même IPA :
+
+```
+https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-scarlet-source.json
+```
+
+Différence importante : Scarlet signe avec un **certificat d'entreprise partagé**, pas avec le compte Apple de l'utilisateur. Rien à installer sur un ordinateur, aucune limite de 3 apps, aucune re-signature hebdomadaire — mais quand Apple révoque ce certificat, toutes les apps installées via Scarlet cessent de s'ouvrir d'un coup, jusqu'à ce que Scarlet en obtienne un nouveau. SideStore/AltStore reste donc la voie recommandée.
+
 ## DNS 1.1.1.1
 
 ### Android

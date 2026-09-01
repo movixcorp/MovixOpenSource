@@ -180,7 +180,10 @@ test('sidestore source generator produces a source consistent with its inputs', 
   try {
     const output = join(dir, 'movix-ios-source.json');
     execFileSync(process.execPath, [generatorPath], {
-      env: generatorEnv({ IOS_SOURCE_OUTPUT: output }),
+      env: generatorEnv({
+        IOS_SOURCE_OUTPUT: output,
+        IOS_SCARLET_OUTPUT: join(dir, 'movix-scarlet-source.json'),
+      }),
     });
 
     const source = JSON.parse(await readFile(output, 'utf8'));
@@ -217,16 +220,53 @@ test('sidestore source generator produces a source consistent with its inputs', 
   }
 });
 
+test('scarlet source describes the same IPA in scarlet own format', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'movix-scarlet-source-'));
+  try {
+    const scarletOutput = join(dir, 'movix-scarlet-source.json');
+    const output = join(dir, 'movix-ios-source.json');
+    execFileSync(process.execPath, [generatorPath], {
+      env: generatorEnv({
+        IOS_SOURCE_OUTPUT: output,
+        IOS_SCARLET_OUTPUT: scarletOutput,
+      }),
+    });
+
+    const scarlet = JSON.parse(await readFile(scarletOutput, 'utf8'));
+    // Format Scarlet : un bloc META, puis des seaux par catégorie. Movix n'est
+    // ni un tweak ni un émulateur, donc « Other ».
+    assert.equal(scarlet.META.repoName, 'Movix');
+    assert.equal(scarlet.META.repoIcon, 'https://example.test/icon-1024.png');
+    const entry = scarlet.Other[0];
+    assert.equal(entry.name, 'Movix');
+    assert.equal(entry.bundleID, 'com.movix.app');
+    assert.equal(entry.version, '9.9.9');
+    // `down` est l'équivalent Scarlet de `downloadURL` : la même IPA doit être
+    // servie aux deux stores, jamais deux fichiers différents.
+    const altStore = JSON.parse(await readFile(output, 'utf8'));
+    assert.equal(entry.down, altStore.apps[0].versions[0].downloadURL);
+    assert.equal(entry.bundleID, altStore.apps[0].bundleIdentifier);
+    assert.equal(entry.version, altStore.apps[0].versions[0].version);
+    assert.equal(entry.contact.web, altStore.website);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('sidestore source generator refuses malformed or missing inputs', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'movix-ios-source-'));
   try {
     const output = join(dir, 'movix-ios-source.json');
+    const scarlet = join(dir, 'movix-scarlet-source.json');
     const cases = [
-      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_VERSION: 'v9.9.9' },
-      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_BUILD_NUMBER: 'quarante-deux' },
-      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_DOWNLOAD_URL: 'http://example.test/movix.ipa' },
-      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_IPA_PATH: join(dir, 'absent.ipa') },
-      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_NOTES_URL: '' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SCARLET_OUTPUT: scarlet, IOS_SOURCE_VERSION: 'v9.9.9' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SCARLET_OUTPUT: scarlet, IOS_SOURCE_BUILD_NUMBER: 'quarante-deux' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SCARLET_OUTPUT: scarlet, IOS_SOURCE_DOWNLOAD_URL: 'http://example.test/movix.ipa' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SCARLET_OUTPUT: scarlet, IOS_SOURCE_IPA_PATH: join(dir, 'absent.ipa') },
+      { IOS_SOURCE_OUTPUT: output, IOS_SCARLET_OUTPUT: scarlet, IOS_SOURCE_NOTES_URL: '' },
+      // La sortie Scarlet est obligatoire : un oubli côté workflow doit faire
+      // échouer la publication, pas produire une source sur deux.
+      { IOS_SOURCE_OUTPUT: output, IOS_SCARLET_OUTPUT: '' },
     ];
     for (const overrides of cases) {
       assert.throws(
@@ -252,6 +292,14 @@ test('tagged releases regenerate the sidestore source and commit it with the IPA
   assert.match(workflow, /IOS_SOURCE_BUILD_NUMBER: \$\{\{ needs\.build\.outputs\.build_number \}\}/);
   assert.match(workflow, /IOS_SOURCE_MIN_OS: \$\{\{ needs\.build\.outputs\.min_os \}\}/);
   assert.match(workflow, /IOS_SOURCE_IPA_PATH: dist\/Movix-unsigned\.ipa/);
+  // Les deux sources sortent du même run et sont commitées ensemble : jamais
+  // une source à jour à côté d'une autre restée sur la version précédente.
+  assert.match(workflow, /IOS_SOURCE_OUTPUT: app\/movix-ios-source\.json/);
+  assert.match(workflow, /IOS_SCARLET_OUTPUT: app\/movix-scarlet-source\.json/);
+  assert.match(
+    workflow,
+    /git add -- app\/movix-ios-unsigner\.ipa app\/movix-ios-source\.json app\/movix-scarlet-source\.json/,
+  );
   // L'URL de téléchargement pointe sur l'IPA commitée dans le dépôt, pour que
   // source et IPA restent servies depuis le même commit.
   assert.match(
@@ -277,7 +325,9 @@ test('tagged releases regenerate the sidestore source and commit it with the IPA
   );
   // La génération suit la vérification d'empreinte et précède le commit.
   const checksumIndex = workflow.indexOf('Verify the checksum before publishing');
-  const generateIndex = workflow.indexOf('Generate the AltStore and SideStore source');
+  const generateIndex = workflow.indexOf(
+    'Generate the AltStore, SideStore and Scarlet sources',
+  );
   const commitIndex = workflow.indexOf('Commit the IPA next to the Android build');
   assert.ok(checksumIndex > 0 && generateIndex > checksumIndex && commitIndex > generateIndex);
 });

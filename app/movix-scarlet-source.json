@@ -1,0 +1,21 @@
+{
+  "META": {
+    "repoName": "Movix",
+    "repoIcon": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png"
+  },
+  "Other": [
+    {
+      "name": "Movix",
+      "version": "2.5.26",
+      "down": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-ios-unsigner.ipa",
+      "category": "Other",
+      "description": "Application iOS officielle de Movix : navigation intégrée, lecture vidéo native, image dans l'image, Chromecast et DNS sécurisé. L'IPA distribuée ici n'est pas signée : Scarlet la signe au moment de l'installation. Version 2.5.26 (build 35). Notes de version : https://github.com/movixcorp/MovixOpenSource/releases/tag/ios-v2.5.26",
+      "bundleID": "com.movix.app",
+      "icon": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png",
+      "dev": "Movix",
+      "contact": {
+        "web": "https://movix.online"
+      }
+    }
+  ]
+}
