@@ -1,0 +1,42 @@
+{
+  "name": "Movix",
+  "identifier": "com.movix.source",
+  "subtitle": "Films et séries en streaming.",
+  "description": "Source officielle de Movix pour AltStore et SideStore. Ajoutez-la pour installer l'application iOS et recevoir ses mises à jour.",
+  "iconURL": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png",
+  "website": "https://movix.tax",
+  "tintColor": "#8b5cf6",
+  "apps": [
+    {
+      "name": "Movix",
+      "bundleIdentifier": "com.movix.app",
+      "developerName": "Movix",
+      "subtitle": "Films et séries en streaming.",
+      "localizedDescription": "Application iOS officielle de Movix : navigation intégrée, lecture vidéo native, image dans l'image, Chromecast et DNS sécurisé. L'IPA distribuée ici n'est pas signée : AltStore ou SideStore la signe automatiquement avec votre identifiant Apple au moment de l'installation.",
+      "iconURL": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png",
+      "tintColor": "#8b5cf6",
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {}
+      },
+      "versions": [
+        {
+          "version": "2.5.26",
+          "buildVersion": "35",
+          "date": "2026-09-01",
+          "localizedDescription": "Version 2.5.26 (build 35). Notes de version : https://github.com/movixcorp/MovixOpenSource/releases/tag/ios-v2.5.26",
+          "downloadURL": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-ios-unsigner.ipa",
+          "size": 10776956,
+          "minOSVersion": "15.6"
+        }
+      ],
+      "version": "2.5.26",
+      "versionDate": "2026-09-01",
+      "versionDescription": "Version 2.5.26 (build 35). Notes de version : https://github.com/movixcorp/MovixOpenSource/releases/tag/ios-v2.5.26",
+      "downloadURL": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-ios-unsigner.ipa",
+      "size": 10776956,
+      "beta": false
+    }
+  ],
+  "news": []
+}
