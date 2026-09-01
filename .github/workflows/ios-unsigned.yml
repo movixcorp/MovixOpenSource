@@ -23,6 +23,8 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.artifact.outputs.version }}
+      build_number: ${{ steps.artifact.outputs.build_number }}
+      min_os: ${{ steps.validate.outputs.min_os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -67,6 +69,12 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          BUILD_NUMBER="$(node -p "require('./app.json').buildNumber")"
+          if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "app.json buildNumber is not a bare integer: $BUILD_NUMBER" >&2
+            exit 1
+          fi
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
 
       # Les Pods et les objets deja compilees dominent la duree du job. La cle
       # suit le Podfile, le lock npm et les patchs : tout changement de
@@ -148,6 +156,11 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
 
+      # MARKETING_VERSION et CURRENT_PROJECT_VERSION sont imposés depuis
+      # app.json : c'est la seule source de vérité des versions. Sans cela le
+      # pbxproj peut dériver et l'IPA porterait une autre version que celle
+      # annoncée par la source AltStore/SideStore — les stores proposeraient
+      # alors la « mise à jour » en boucle.
       - name: Compile the unsigned device binary
         working-directory: app/ios
         run: |
@@ -157,6 +170,8 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$GITHUB_WORKSPACE/app/build/dd" \
+            MARKETING_VERSION=${{ steps.artifact.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ steps.artifact.outputs.build_number }} \
             COMPILER_INDEX_STORE_ENABLE=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -170,13 +185,19 @@ jobs:
           IOS_OUTPUT_DIR: build/unsigned-ipa
         run: bash scripts/package-unsigned-ios.sh
 
+      # min_os alimente la source AltStore/SideStore : la valeur vient du
+      # binaire réellement compilé, pas d'une constante à maintenir à la main.
       - name: Validate the unsigned IPA
+        id: validate
         working-directory: app
         run: |
           APP="build/dd/Build/Products/Release-iphoneos/Movix.app"
           PAYLOAD="build/unsigned-ipa/Payload/Movix.app"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")"
+          echo "min_os=$MIN_OS" >> "$GITHUB_OUTPUT"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")" = "${{ steps.artifact.outputs.version }}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")" = "${{ steps.artifact.outputs.build_number }}"
           lipo -archs "$APP/Movix" | tr ' ' '\n' | grep -qw arm64
           test ! -e "$PAYLOAD/_CodeSignature"
           test ! -e "$PAYLOAD/embedded.mobileprovision"
@@ -222,9 +243,27 @@ jobs:
         working-directory: dist
         run: shasum -a 256 -c Movix-unsigned.ipa.sha256
 
+      # La source AltStore/SideStore est régénérée à chaque publication (les
+      # deux stores lisent le même format JSON). L'URL de téléchargement pointe
+      # sur l'IPA commitée dans le dépôt : IPA et source partent dans le même
+      # commit, donc les deux fichiers servis par raw.githubusercontent restent
+      # toujours cohérents entre eux, taille comprise.
+      - name: Generate the AltStore and SideStore source
+        env:
+          IOS_SOURCE_VERSION: ${{ needs.build.outputs.version }}
+          IOS_SOURCE_BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
+          IOS_SOURCE_MIN_OS: ${{ needs.build.outputs.min_os }}
+          IOS_SOURCE_IPA_PATH: dist/Movix-unsigned.ipa
+          IOS_SOURCE_DATE: ${{ github.event.head_commit.timestamp }}
+          IOS_SOURCE_DOWNLOAD_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-ios-unsigner.ipa
+          IOS_SOURCE_ICON_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png
+          IOS_SOURCE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+          IOS_SOURCE_OUTPUT: app/movix-ios-source.json
+        run: node app/scripts/generate-ios-source.mjs
+
       # L'IPA vit dans le dépôt à côté de movix-android.apk, pour être
       # téléchargeable en direct depuis raw.githubusercontent comme l'APK.
-      # Seul ce chemin est indexé : dist/ reste non suivi.
+      # Seuls ces chemins sont indexés : dist/ reste non suivi.
       - name: Commit the IPA next to the Android build
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -232,9 +271,9 @@ jobs:
           install -m 644 dist/Movix-unsigned.ipa app/movix-ios-unsigner.ipa
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- app/movix-ios-unsigner.ipa
+          git add -- app/movix-ios-unsigner.ipa app/movix-ios-source.json
           if git diff --cached --quiet; then
-            echo "IPA identique à celle déjà publiée, rien à committer."
+            echo "IPA et source identiques à celles déjà publiées, rien à committer."
             exit 0
           fi
           git commit -F - <<EOF
@@ -243,6 +282,10 @@ jobs:
           Générée par le workflow ios-unsigned depuis le tag ${GITHUB_REF_NAME}.
           L'archive est identique à celle attachée à la release et a été
           vérifiée par son empreinte SHA-256 avant d'être indexée.
+
+          La source AltStore/SideStore (app/movix-ios-source.json) est
+          régénérée dans le même commit : version, taille et URL restent
+          cohérentes avec l'IPA servie par raw.githubusercontent.
 
           Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
           EOF
@@ -264,4 +307,4 @@ jobs:
             Movix-unsigned.ipa \
             Movix-unsigned.ipa.sha256 \
             --title "Movix ${{ needs.build.outputs.version }} (iOS, non signee)" \
-            --notes "IPA non signee. Son installation est impossible tant qu'un utilisateur ne l'a pas signee par ses propres moyens. Verifiez l'archive avec: shasum -a 256 -c Movix-unsigned.ipa.sha256"
+            --notes "IPA non signee. Son installation est impossible tant qu'un utilisateur ne l'a pas signee par ses propres moyens. Verifiez l'archive avec: shasum -a 256 -c Movix-unsigned.ipa.sha256 — Source AltStore/SideStore : https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-ios-source.json"

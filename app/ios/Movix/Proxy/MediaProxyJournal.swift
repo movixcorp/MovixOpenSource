@@ -12,16 +12,35 @@ import os
 /// en-tête qui sépare un 200 d'un 403.
 ///
 /// Parité avec MediaProxyJournal.kt : même format d'entrée, mêmes préfixes
-/// (`~` requête locale du lecteur, `>` émis vers l'amont, `<` reçu), pour que
-/// les deux plateformes se lisent de la même façon.
+/// (`~` requête locale du lecteur, `>` émis vers l'amont, `<` reçu), même
+/// découpe des lignes de journal système, pour que les deux plateformes se
+/// lisent de la même façon.
 enum MediaProxyJournal {
   private static let maximumEntries = 300
-  private static let logger = Logger(subsystem: "tax.movix.app", category: "MovixNet")
-  private static let queue = DispatchQueue(label: "tax.movix.mediaproxy.journal")
 
+  // Une ligne de la console unifiée est tronquée passé quelques milliers
+  // d'octets : on découpe avant que le système le fasse à notre place, au
+  // milieu d'un en-tête. Même valeur que `MAX_LOG_CHUNK` côté Android.
+  private static let maximumLogChunk = 3_000
+
+  // Le sous-système est l'identifiant du bundle, sans quoi
+  // `log stream --predicate 'subsystem == "com.movix.app"'` ne rend rien.
+  private static let logger = Logger(subsystem: "com.movix.app", category: "MovixNet")
+
+  // Un verrou, pas une file série. `record` est appelé depuis les tâches
+  // asynchrones de l'amont média, donc sur les fils du pool coopératif de Swift
+  // Concurrency, et un `sync` sur une DispatchQueue y bloque un fil du pool :
+  // quelques requêtes de segments en parallèle suffisaient à l'assécher, l'app
+  // se figeait et le watchdog la tuait. Un verrou tenu quelques microsecondes
+  // ne fait pas ce saut de fil.
+  private static let lock = NSLock()
+
+  // Les trois sont gardés par `lock`. `timestampFormatter` en particulier :
+  // DateFormatter n'est pas sûr en concurrence, et c'est ce qui plantait
+  // l'application — deux requêtes média simultanées le formataient en même
+  // temps et corrompaient sa mémoire interne.
   private static var entries: [String] = []
   private static var enabledStorage = false
-
   private static let timestampFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.dateFormat = "HH:mm:ss.SSS"
@@ -30,14 +49,16 @@ enum MediaProxyJournal {
   }()
 
   static var isEnabled: Bool {
-    queue.sync { enabledStorage }
+    lock.lock()
+    defer { lock.unlock() }
+    return enabledStorage
   }
 
   static func setEnabled(_ value: Bool) {
-    queue.sync {
-      enabledStorage = value
-      if !value { entries.removeAll() }
-    }
+    lock.lock()
+    defer { lock.unlock() }
+    enabledStorage = value
+    if !value { entries.removeAll() }
   }
 
   static func record(
@@ -56,50 +77,73 @@ enum MediaProxyJournal {
   ) {
     guard isEnabled else { return }
 
-    var entry = "[\(timestampFormatter.string(from: Date()))] \(phase) "
+    // Horodatage capturé ici, mis en forme sous le verrou : l'entrée porte
+    // l'instant de la requête, pas celui où le verrou a été obtenu.
+    let capturedAt = Date()
+
+    var body = "\(phase) "
     if let statusCode = statusCode {
-      entry += "\(statusCode) "
+      body += "\(statusCode) "
     } else if error != nil {
-      entry += "ERR "
+      body += "ERR "
     } else {
-      entry += "… "
+      body += "… "
     }
-    entry += "\(method) \(url)\n"
+    body += "\(method) \(url)\n"
     // Ordre stable : deux journaux du même incident doivent se comparer ligne
     // à ligne, ce qu'un ordre de dictionnaire interdirait.
     for (name, value) in (localRequestHeaders ?? [:]).sorted(by: { $0.key < $1.key }) {
-      entry += "  ~ \(name): \(value)\n"
+      body += "  ~ \(name): \(value)\n"
     }
     for (name, value) in requestHeaders.sorted(by: { $0.key < $1.key }) {
-      entry += "  > \(name): \(value)\n"
+      body += "  > \(name): \(value)\n"
     }
     for (name, value) in (responseHeaders ?? [:]).sorted(by: { $0.key < $1.key }) {
-      entry += "  < \(name): \(value)\n"
+      body += "  < \(name): \(value)\n"
     }
     if let bodySnippet = bodySnippet, !bodySnippet.isEmpty {
-      entry += "  corps: \(bodySnippet.trimmingCharacters(in: .whitespacesAndNewlines))\n"
+      body += "  corps: \(bodySnippet.trimmingCharacters(in: .whitespacesAndNewlines))\n"
     }
     if let error = error, !error.isEmpty {
-      entry += "  erreur: \(error)\n"
+      body += "  erreur: \(error)\n"
     }
 
-    queue.sync {
-      entries.append(entry)
-      if entries.count > maximumEntries {
-        entries.removeFirst(entries.count - maximumEntries)
-      }
+    lock.lock()
+    // Relecture sous le verrou : la capture a pu être coupée pendant la mise en
+    // forme, et une entrée qui arrive après `setEnabled(false)` ressusciterait
+    // un tampon que l'utilisateur croit vidé.
+    guard enabledStorage else {
+      lock.unlock()
+      return
     }
+    let entry = "[\(timestampFormatter.string(from: capturedAt))] " + body
+    entries.append(entry)
+    if entries.count > maximumEntries {
+      entries.removeFirst(entries.count - maximumEntries)
+    }
+    lock.unlock()
+
     // `privacy: .public` est délibéré : un journal de diagnostic caviardé en
     // « <private> » ne diagnostique rien. Il ne part qu'en mémoire et sur
     // demande explicite de l'utilisateur.
-    logger.info("\(entry, privacy: .public)")
+    var offset = entry.startIndex
+    while offset < entry.endIndex {
+      let end = entry.index(offset, offsetBy: maximumLogChunk, limitedBy: entry.endIndex)
+        ?? entry.endIndex
+      logger.info("\(String(entry[offset..<end]), privacy: .public)")
+      offset = end
+    }
   }
 
   static func snapshot() -> [String] {
-    queue.sync { entries }
+    lock.lock()
+    defer { lock.unlock() }
+    return entries
   }
 
   static func clear() {
-    queue.sync { entries.removeAll() }
+    lock.lock()
+    defer { lock.unlock() }
+    entries.removeAll()
   }
 }

@@ -142,6 +142,61 @@ test('iOS media proxy journal is compiled by the app target', async () => {
   for (const prefix of ['  ~ ', '  > ', '  < ', '  corps: ', '  erreur: ']) {
     assert.ok(journal.includes(prefix), `préfixe de journal attendu : ${prefix}`);
   }
+  // Le sous-système doit être l'identifiant du bundle, sinon un filtre
+  // `log stream --predicate 'subsystem == "com.movix.app"'` ne rend rien.
+  assert.match(journal, /Logger\(subsystem: "com\.movix\.app", category: "MovixNet"\)/);
+  // Découpe des lignes système, comme MAX_LOG_CHUNK côté Android.
+  assert.match(journal, /maximumLogChunk = 3_000/);
+});
+
+test('the iOS media proxy journal is safe to call from concurrent media requests', async () => {
+  const journal = await text('../ios/Movix/Proxy/MediaProxyJournal.swift');
+
+  // Deux défauts rendaient l'application inouvrable dès que la capture était
+  // active, et aucun compilateur ne les voit : ce contrat les fige.
+  //
+  // 1. DateFormatter n'est pas sûr en concurrence. `record` est appelé depuis
+  //    les tâches asynchrones de l'amont média, donc en parallèle : deux
+  //    requêtes le formatant en même temps corrompaient sa mémoire interne.
+  //    Sa seule utilisation doit rester entre `lock.lock()` et `lock.unlock()`.
+  assert.match(journal, /private static let lock = NSLock\(\)/);
+  const formatterUses = [...journal.matchAll(/timestampFormatter\.string\(/g)];
+  assert.equal(formatterUses.length, 1, 'un seul point de mise en forme');
+  const lockedSection = journal.slice(
+    journal.lastIndexOf('lock.lock()', formatterUses[0].index),
+    journal.indexOf('lock.unlock()', formatterUses[0].index),
+  );
+  assert.ok(
+    lockedSection.includes('timestampFormatter.string('),
+    'le DateFormatter doit rester sous le verrou',
+  );
+
+  // 2. Un `sync` sur une DispatchQueue bloque un fil du pool coopératif de
+  //    Swift Concurrency. Quelques segments HLS en parallèle suffisaient à
+  //    l'assécher : l'app se figeait et le watchdog la tuait.
+  assert.doesNotMatch(journal, /DispatchQueue\(/);
+  assert.doesNotMatch(journal, /\bqueue\.sync\b/);
+
+  // La capture peut être coupée pendant la mise en forme : sans relecture sous
+  // le verrou, une entrée en vol ressuscite un tampon déjà vidé.
+  assert.match(journal, /lock\.lock\(\)\s*\n[\s\S]{0,400}?guard enabledStorage else \{/);
+});
+
+test('the network journal toggle never survives a restart', async () => {
+  const service = await text('../src/services/networkJournal.ts');
+
+  // Une capture retenue en mémoire morte relançait le même plantage à chaque
+  // démarrage : l'app devenait inouvrable et seule une réinstallation en
+  // sortait. Un réglage de débogage ne doit jamais pouvoir condamner l'app —
+  // et l'écran de réglages promet déjà que le journal disparaît à la fermeture.
+  assert.doesNotMatch(service, /AsyncStorage/);
+  assert.doesNotMatch(service, /STORAGE_KEY/);
+  assert.match(service, /let enabled = false;/);
+  // La bascule ne doit jamais rejeter jusqu'à l'interface.
+  assert.match(
+    service,
+    /export async function setNetworkJournalEnabled[\s\S]*?try \{[\s\S]*?setJournalEnabled\?\.\(value\);[\s\S]*?\} catch \{/,
+  );
 });
 
 test('iOS custom media scheme is compiled, registered, and named identically everywhere', async () => {

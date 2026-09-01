@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 test('unsigned IPA packager validates inputs and produces the unsigned artifacts', async () => {
@@ -149,6 +153,127 @@ test('tagged releases commit the IPA next to the Android build', async () => {
   // Une exécution concurrente ne doit pas faire échouer la publication.
   assert.match(workflow, /git pull --rebase origin "\$\{DEFAULT_BRANCH\}"/);
   assert.match(workflow, /git push origin "HEAD:\$\{DEFAULT_BRANCH\}"/);
+});
+
+const generatorPath = fileURLToPath(
+  new URL('../scripts/generate-ios-source.mjs', import.meta.url),
+);
+
+function generatorEnv(overrides = {}) {
+  return {
+    ...process.env,
+    IOS_SOURCE_VERSION: '9.9.9',
+    IOS_SOURCE_BUILD_NUMBER: '42',
+    IOS_SOURCE_MIN_OS: '15.1',
+    // N'importe quel fichier lisible fait office d'IPA pour la taille.
+    IOS_SOURCE_IPA_PATH: generatorPath,
+    IOS_SOURCE_DATE: '2026-01-02T03:04:05+02:00',
+    IOS_SOURCE_DOWNLOAD_URL: 'https://example.test/movix-ios-unsigner.ipa',
+    IOS_SOURCE_ICON_URL: 'https://example.test/icon-1024.png',
+    IOS_SOURCE_NOTES_URL: 'https://example.test/releases/tag/ios-v9.9.9',
+    ...overrides,
+  };
+}
+
+test('sidestore source generator produces a source consistent with its inputs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'movix-ios-source-'));
+  try {
+    const output = join(dir, 'movix-ios-source.json');
+    execFileSync(process.execPath, [generatorPath], {
+      env: generatorEnv({ IOS_SOURCE_OUTPUT: output }),
+    });
+
+    const source = JSON.parse(await readFile(output, 'utf8'));
+    // Clés primaires des stores : figées pour toujours.
+    assert.equal(source.identifier, 'com.movix.source');
+    const app = source.apps[0];
+    assert.equal(app.bundleIdentifier, 'com.movix.app');
+
+    const latest = app.versions[0];
+    assert.equal(latest.version, '9.9.9');
+    assert.equal(latest.buildVersion, '42');
+    assert.equal(latest.date, '2026-01-02');
+    assert.equal(latest.minOSVersion, '15.1');
+    assert.equal(latest.downloadURL, 'https://example.test/movix-ios-unsigner.ipa');
+    assert.equal(latest.size, (await stat(generatorPath)).size);
+
+    // Champs hérités du premier format : duplication exacte de la dernière
+    // version, pour les anciens AltStore.
+    assert.equal(app.version, latest.version);
+    assert.equal(app.versionDate, latest.date);
+    assert.equal(app.downloadURL, latest.downloadURL);
+    assert.equal(app.size, latest.size);
+
+    // L'IPA est compilée sans entitlements : la source ne doit en déclarer aucun.
+    assert.deepEqual(app.appPermissions, { entitlements: [], privacy: {} });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('sidestore source generator refuses malformed or missing inputs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'movix-ios-source-'));
+  try {
+    const output = join(dir, 'movix-ios-source.json');
+    const cases = [
+      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_VERSION: 'v9.9.9' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_BUILD_NUMBER: 'quarante-deux' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_DOWNLOAD_URL: 'http://example.test/movix.ipa' },
+      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_IPA_PATH: join(dir, 'absent.ipa') },
+      { IOS_SOURCE_OUTPUT: output, IOS_SOURCE_NOTES_URL: '' },
+    ];
+    for (const overrides of cases) {
+      assert.throws(
+        () => execFileSync(process.execPath, [generatorPath], {
+          env: generatorEnv(overrides),
+          stdio: 'pipe',
+        }),
+        undefined,
+        `should reject ${JSON.stringify(overrides)}`,
+      );
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('tagged releases regenerate the sidestore source and commit it with the IPA', async () => {
+  const workflow = await readWorkflow();
+
+  assert.match(workflow, /run: node app\/scripts\/generate-ios-source\.mjs/);
+  // Les métadonnées viennent du job de build, jamais d'une saisie humaine.
+  assert.match(workflow, /IOS_SOURCE_VERSION: \$\{\{ needs\.build\.outputs\.version \}\}/);
+  assert.match(workflow, /IOS_SOURCE_BUILD_NUMBER: \$\{\{ needs\.build\.outputs\.build_number \}\}/);
+  assert.match(workflow, /IOS_SOURCE_MIN_OS: \$\{\{ needs\.build\.outputs\.min_os \}\}/);
+  assert.match(workflow, /IOS_SOURCE_IPA_PATH: dist\/Movix-unsigned\.ipa/);
+  // L'URL de téléchargement pointe sur l'IPA commitée dans le dépôt, pour que
+  // source et IPA restent servies depuis le même commit.
+  assert.match(
+    workflow,
+    /IOS_SOURCE_DOWNLOAD_URL: https:\/\/raw\.githubusercontent\.com\/\$\{\{ github\.repository \}\}\/\$\{\{ github\.event\.repository\.default_branch \}\}\/app\/movix-ios-unsigner\.ipa/,
+  );
+  assert.match(workflow, /git add -- app\/movix-ios-unsigner\.ipa app\/movix-ios-source\.json/);
+  // min_os sort du binaire réellement compilé, côté build.
+  assert.match(workflow, /min_os=\$MIN_OS/);
+  assert.match(workflow, /min_os: \$\{\{ steps\.validate\.outputs\.min_os \}\}/);
+  assert.match(workflow, /build_number=\$BUILD_NUMBER/);
+  // Le build estampille l'IPA depuis app.json et la validation vérifie que le
+  // binaire porte bien ces versions : la source ne peut pas diverger de l'IPA.
+  assert.match(workflow, /MARKETING_VERSION=\$\{\{ steps\.artifact\.outputs\.version \}\}/);
+  assert.match(workflow, /CURRENT_PROJECT_VERSION=\$\{\{ steps\.artifact\.outputs\.build_number \}\}/);
+  assert.match(
+    workflow,
+    /test "\$\(\/usr\/libexec\/PlistBuddy -c 'Print :CFBundleShortVersionString' "\$APP\/Info\.plist"\)" = "\$\{\{ steps\.artifact\.outputs\.version \}\}"/,
+  );
+  assert.match(
+    workflow,
+    /test "\$\(\/usr\/libexec\/PlistBuddy -c 'Print :CFBundleVersion' "\$APP\/Info\.plist"\)" = "\$\{\{ steps\.artifact\.outputs\.build_number \}\}"/,
+  );
+  // La génération suit la vérification d'empreinte et précède le commit.
+  const checksumIndex = workflow.indexOf('Verify the checksum before publishing');
+  const generateIndex = workflow.indexOf('Generate the AltStore and SideStore source');
+  const commitIndex = workflow.indexOf('Commit the IPA next to the Android build');
+  assert.ok(checksumIndex > 0 && generateIndex > checksumIndex && commitIndex > generateIndex);
 });
 
 test('README explains how to download, verify, and externally sign the unsigned IPA', async () => {

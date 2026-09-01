@@ -1,4 +1,3 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { NativeModules } from 'react-native';
 
 /**
@@ -9,12 +8,17 @@ import { NativeModules } from 'react-native';
  * classent leurs clients (LuluStream, Veev, Fsvid…) refusent sur un seul
  * en-tête — sans voir ce qui est réellement émis, un 403 est indébogable.
  *
- * Le tampon vit côté natif (MediaProxyJournal.kt) pour que les entrées du pont
- * et celles de l'amont s'ordonnent dans un seul fil. Tout est en mémoire, effacé
- * à l'extinction, et la capture est éteinte par défaut.
+ * Le tampon vit côté natif (MediaProxyJournal.kt / .swift) pour que les entrées
+ * du pont et celles de l'amont s'ordonnent dans un seul fil. Tout est en
+ * mémoire, effacé à l'extinction, et la capture est éteinte par défaut.
+ *
+ * La bascule n'est délibérément PAS persistée. C'est ce que l'écran de réglages
+ * promet déjà (« le journal disparaît en coupant l'interrupteur ou en fermant
+ * l'app »), et c'est surtout ce qui empêche un défaut du chemin de diagnostic
+ * de rendre l'application inouvrable : une capture retenue en mémoire morte
+ * relançait le même plantage à chaque démarrage, et seule une réinstallation
+ * en sortait. Un réglage de débogage ne doit jamais pouvoir condamner l'app.
  */
-
-const STORAGE_KEY = 'debug:networkJournal';
 
 interface MediaProxyJournalModule {
   setJournalEnabled?: (enabled: boolean) => Promise<boolean>;
@@ -58,26 +62,30 @@ export function subscribeNetworkJournal(
   };
 }
 
+/**
+ * Aligne le natif sur l'état de la session. Rien n'est relu d'un stockage : au
+ * démarrage la capture est éteinte, toujours, et cet appel le fait dire aussi
+ * au module natif — un module survivant à un rechargement JS pourrait sinon
+ * rester armé sans que rien dans l'interface ne le montre.
+ */
 export async function loadNetworkJournalPreference(): Promise<boolean> {
-  try {
-    const stored = await AsyncStorage.getItem(STORAGE_KEY);
-    await setNetworkJournalEnabled(stored === '1');
-  } catch {
-    enabled = false;
-  }
+  await setNetworkJournalEnabled(enabled);
   return enabled;
 }
 
+/**
+ * Ne rejette jamais : un réglage de débogage qui remonte une exception jusqu'à
+ * l'interface est exactement ce qui a rendu l'application inouvrable.
+ */
 export async function setNetworkJournalEnabled(value: boolean): Promise<void> {
   const changed = enabled !== value;
   enabled = value;
   if (changed) listeners.forEach(listener => listener(value));
   try {
-    await AsyncStorage.setItem(STORAGE_KEY, value ? '1' : '0');
+    await nativeJournal()?.setJournalEnabled?.(value);
   } catch {
-    // Une préférence de débogage non persistée n'empêche pas la capture.
+    // Module natif absent ou en échec : la capture côté pont reste utilisable.
   }
-  await nativeJournal()?.setJournalEnabled?.(value);
 }
 
 /**
