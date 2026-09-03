@@ -539,6 +539,7 @@ async function setupRules() {
           "movix.date",
           "movix.fun",
           "movix.show",
+          "movix.men",
         ],
         resourceTypes: [
           "xmlhttprequest",

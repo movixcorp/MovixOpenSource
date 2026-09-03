@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.5.1
+// @version      1.5.2
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -28,6 +28,8 @@
 // @match        https://*.movix.fun/*
 // @match        https://movix.show/*
 // @match        https://*.movix.show/*
+// @match        https://movix.men/*
+// @match        https://*.movix.men/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -4513,6 +4515,7 @@
             "movix.date",
             "movix.fun",
             "movix.show",
+            "movix.men",
           ],
           resourceTypes: [
             "xmlhttprequest",
@@ -5027,6 +5030,8 @@
         currentHostname.endsWith(".movix.fun") ||
         currentHostname === "movix.show" ||
         currentHostname.endsWith(".movix.show") ||
+        currentHostname === "movix.men" ||
+        currentHostname.endsWith(".movix.men") ||
         currentHostname.endsWith(".movix.golf")
       ) {
         return (currentOrigin || "https://movix.fun").replace(/\/$/, "");

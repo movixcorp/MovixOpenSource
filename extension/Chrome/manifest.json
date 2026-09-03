@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Movix Proxy Extension",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
@@ -57,7 +57,9 @@
       "*://movix.fun/*",
       "*://*.movix.fun/*",
       "*://movix.show/*",
-      "*://*.movix.show/*"
+      "*://*.movix.show/*",
+      "*://movix.men/*",
+      "*://*.movix.men/*"
     ]
   },
   "web_accessible_resources": [
