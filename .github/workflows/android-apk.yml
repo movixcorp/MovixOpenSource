@@ -1,0 +1,42 @@
+name: Android APK (release non signee)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compiler l'APK Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Installer les dependances JavaScript
+        working-directory: app
+        run: npm ci
+
+      - name: Generer le userscript injecte
+        working-directory: app
+        run: npm run build:userscript
+
+      - name: Compiler l'APK release
+        working-directory: app/android
+        run: ./gradlew assembleRelease
+
+      - name: Publier l'APK comme artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Movix-apk-${{ github.run_number }}
+          path: app/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
